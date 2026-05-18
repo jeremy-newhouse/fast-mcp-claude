@@ -1,0 +1,33 @@
+{
+  "name": "Fast MCP Claude (Remote Control)",
+  "version": "0.1.0",
+  "fastmcp": ">=3.0.0",
+  "description": "Peer-to-peer remote control between Claude Code sessions over HTTP",
+  "env_vars": [
+    {
+      "name": "PEER_NAME",
+      "display_name": "Peer Name",
+      "required": true,
+      "description": "Friendly name for this machine"
+    },
+    {
+      "name": "MCP_API_KEY",
+      "display_name": "MCP API Key",
+      "required": false,
+      "sensitive": true,
+      "description": "Bearer token required from clients (REQUIRED for non-localhost)"
+    },
+    {
+      "name": "PEERS",
+      "display_name": "Peer Registry",
+      "required": false,
+      "description": "JSON array of remote peers this server can call out to"
+    },
+    {
+      "name": "WORKSPACE_ROOTS",
+      "display_name": "Workspace Roots",
+      "required": false,
+      "description": "Colon-separated allowlist of directories exposed via the file bridge"
+    }
+  ]
+}

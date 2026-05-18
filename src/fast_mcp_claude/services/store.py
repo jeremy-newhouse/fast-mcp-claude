@@ -1,0 +1,563 @@
+"""SQLite-backed persistent store for the remote-control server.
+
+Tables:
+    messages   — controller → worker prompts; worker replies via response field
+    approvals  — PreToolUse hook requests waiting for a controller decision
+    pubsub     — broadcast channel messages (subscribers track their own cursor)
+    interrupts — pending interrupt flags per session
+
+All long-polling tools go through this module:
+    wait_for_instruction / wait_for_completion / await_decision / subscribe
+each call `wait_for(key, timeout)` and re-check the DB on wakeup. Cross-process
+or cross-event-loop notifications are NOT supported (single asyncio loop per
+server process) — that's fine because each peer machine runs its own server.
+"""
+
+import asyncio
+import json
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Awaitable, Callable, TypeVar
+
+import aiosqlite
+
+from ..config import Settings
+from ..logging_config import get_logger
+
+logger = get_logger(__name__)
+
+T = TypeVar("T")
+
+# Message lifecycle
+STATUS_QUEUED = "queued"          # in inbox, no worker has picked up yet
+STATUS_DELIVERED = "delivered"    # wait_for_instruction handed it to a worker
+STATUS_REPLIED = "replied"        # worker called reply()
+STATUS_CANCELLED = "cancelled"    # controller called interrupt() or similar
+STATUS_EXPIRED = "expired"        # TTL cleanup
+
+# Approval lifecycle
+DECISION_ALLOW = "allow"
+DECISION_DENY = "deny"
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages (
+    id                  TEXT PRIMARY KEY,
+    sender              TEXT NOT NULL,
+    recipient_session   TEXT,
+    prompt              TEXT NOT NULL,
+    metadata            TEXT,
+    status              TEXT NOT NULL,
+    response            TEXT,
+    created_at          REAL NOT NULL,
+    delivered_at        REAL,
+    replied_at          REAL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_session, status, created_at);
+
+CREATE TABLE IF NOT EXISTS approvals (
+    id              TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    tool_name       TEXT NOT NULL,
+    tool_input      TEXT NOT NULL,
+    decision        TEXT,
+    reason          TEXT,
+    created_at      REAL NOT NULL,
+    decided_at      REAL
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_pending ON approvals(decision, created_at);
+
+CREATE TABLE IF NOT EXISTS pubsub (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel     TEXT NOT NULL,
+    sender      TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pubsub_channel ON pubsub(channel, id);
+
+CREATE TABLE IF NOT EXISTS interrupts (
+    session_id      TEXT PRIMARY KEY,
+    requested_at    REAL NOT NULL
+);
+"""
+
+
+class Notifier:
+    """Per-key asyncio.Event registry for waking long-poll waiters.
+
+    On notify(): set the existing event (waking any current waiters) and
+    replace it with a fresh one so subsequent waits block again.
+    """
+
+    def __init__(self) -> None:
+        self._events: dict[str, asyncio.Event] = {}
+
+    def _get(self, key: str) -> asyncio.Event:
+        ev = self._events.get(key)
+        if ev is None:
+            ev = asyncio.Event()
+            self._events[key] = ev
+        return ev
+
+    def notify(self, key: str) -> None:
+        ev = self._events.get(key)
+        if ev is not None:
+            ev.set()
+            self._events[key] = asyncio.Event()
+
+    async def wait_for(
+        self,
+        key: str,
+        check: Callable[[], Awaitable[T | None]],
+        timeout: float,
+    ) -> T | None:
+        """Long-poll pattern: check DB now; if empty, wait on the event then re-check.
+
+        Returns the first non-None result from `check()`, or None on timeout.
+        """
+        # Capture the event reference BEFORE checking DB so we don't miss a
+        # notification that arrives between check and wait.
+        ev = self._get(key)
+
+        result = await check()
+        if result is not None:
+            return result
+
+        if timeout <= 0:
+            return None
+
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+
+        return await check()
+
+
+class Store:
+    """SQLite store + notification hub. One instance per server process."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self._db: aiosqlite.Connection | None = None
+        self._db_lock = asyncio.Lock()
+        self._notifier = Notifier()
+        self._cleanup_task: asyncio.Task | None = None
+
+    # ------------------------------------------------------------------ lifecycle
+
+    async def initialize(self) -> None:
+        path = self.settings.db_full_path
+        self._db = await aiosqlite.connect(str(path))
+        self._db.row_factory = aiosqlite.Row
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("PRAGMA synchronous=NORMAL")
+        await self._db.executescript(SCHEMA)
+        await self._db.commit()
+
+        self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+
+    async def close(self) -> None:
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._db is not None:
+            await self._db.close()
+            self._db = None
+
+    @property
+    def db(self) -> aiosqlite.Connection:
+        if self._db is None:
+            raise RuntimeError("Store not initialized")
+        return self._db
+
+    # ------------------------------------------------------------------ messages
+
+    async def enqueue_message(
+        self,
+        sender: str,
+        prompt: str,
+        recipient_session: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        message_id = uuid.uuid4().hex
+        now = time.time()
+        await self.db.execute(
+            "INSERT INTO messages (id, sender, recipient_session, prompt, metadata, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                message_id,
+                sender,
+                recipient_session,
+                prompt,
+                json.dumps(metadata) if metadata else None,
+                STATUS_QUEUED,
+                now,
+            ),
+        )
+        await self.db.commit()
+        # Wake any wait_for_instruction blocked on this recipient (or wildcard).
+        self._notifier.notify(self._inbox_key(recipient_session))
+        if recipient_session is not None:
+            self._notifier.notify(self._inbox_key(None))
+        return message_id
+
+    async def pop_next_for_worker(self, recipient_session: str | None) -> dict[str, Any] | None:
+        """Atomically claim the oldest queued message addressed to this worker.
+
+        A NULL recipient_session message is delivered to ANY worker (broadcast).
+        A worker calling with session="foo" gets either messages addressed to
+        "foo" OR unaddressed (NULL) ones.
+        """
+        async with self._db_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                if recipient_session is None:
+                    cur = await self.db.execute(
+                        "SELECT * FROM messages WHERE status=? AND recipient_session IS NULL "
+                        "ORDER BY created_at ASC LIMIT 1",
+                        (STATUS_QUEUED,),
+                    )
+                else:
+                    cur = await self.db.execute(
+                        "SELECT * FROM messages WHERE status=? AND "
+                        "(recipient_session=? OR recipient_session IS NULL) "
+                        "ORDER BY created_at ASC LIMIT 1",
+                        (STATUS_QUEUED, recipient_session),
+                    )
+                row = await cur.fetchone()
+                await cur.close()
+                if row is None:
+                    await self.db.execute("ROLLBACK")
+                    return None
+
+                now = time.time()
+                await self.db.execute(
+                    "UPDATE messages SET status=?, delivered_at=? WHERE id=?",
+                    (STATUS_DELIVERED, now, row["id"]),
+                )
+                await self.db.commit()
+                msg = _row_to_message(row, delivered_at=now)
+                msg["status"] = STATUS_DELIVERED
+                return msg
+            except Exception:
+                await self.db.execute("ROLLBACK")
+                raise
+
+    async def wait_for_next_for_worker(
+        self,
+        recipient_session: str | None,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        """Long-poll: return next message for this worker, or None on timeout."""
+        return await self._notifier.wait_for(
+            self._inbox_key(recipient_session),
+            lambda: self.pop_next_for_worker(recipient_session),
+            timeout,
+        )
+
+    async def record_reply(self, message_id: str, response: str) -> bool:
+        async with self._db_lock:
+            now = time.time()
+            cur = await self.db.execute(
+                "UPDATE messages SET status=?, response=?, replied_at=? "
+                "WHERE id=? AND status IN (?, ?)",
+                (STATUS_REPLIED, response, now, message_id, STATUS_QUEUED, STATUS_DELIVERED),
+            )
+            await self.db.commit()
+            updated = cur.rowcount
+            await cur.close()
+        if updated:
+            self._notifier.notify(self._outbox_key(message_id))
+            return True
+        return False
+
+    async def get_message(self, message_id: str) -> dict[str, Any] | None:
+        cur = await self.db.execute("SELECT * FROM messages WHERE id=?", (message_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        return _row_to_message(row) if row else None
+
+    async def wait_for_reply(self, message_id: str, timeout: float) -> dict[str, Any] | None:
+        async def check() -> dict[str, Any] | None:
+            msg = await self.get_message(message_id)
+            if msg is None:
+                return None
+            if msg["status"] in (STATUS_REPLIED, STATUS_CANCELLED, STATUS_EXPIRED):
+                return msg
+            return None
+
+        return await self._notifier.wait_for(
+            self._outbox_key(message_id), check, timeout,
+        )
+
+    async def cancel_message(self, message_id: str) -> bool:
+        async with self._db_lock:
+            cur = await self.db.execute(
+                "UPDATE messages SET status=? WHERE id=? AND status IN (?, ?)",
+                (STATUS_CANCELLED, message_id, STATUS_QUEUED, STATUS_DELIVERED),
+            )
+            await self.db.commit()
+            updated = cur.rowcount
+            await cur.close()
+        if updated:
+            self._notifier.notify(self._outbox_key(message_id))
+            return True
+        return False
+
+    async def list_messages(
+        self,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        if status:
+            cur = await self.db.execute(
+                "SELECT * FROM messages WHERE status=? ORDER BY created_at DESC LIMIT ?",
+                (status, limit),
+            )
+        else:
+            cur = await self.db.execute(
+                "SELECT * FROM messages ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [_row_to_message(r) for r in rows]
+
+    # ---------------------------------------------------------------- interrupts
+
+    async def request_interrupt(self, session_id: str) -> None:
+        await self.db.execute(
+            "INSERT OR REPLACE INTO interrupts (session_id, requested_at) VALUES (?, ?)",
+            (session_id, time.time()),
+        )
+        await self.db.commit()
+
+    async def consume_interrupt(self, session_id: str) -> bool:
+        async with self._db_lock:
+            cur = await self.db.execute(
+                "DELETE FROM interrupts WHERE session_id=?",
+                (session_id,),
+            )
+            await self.db.commit()
+            had_one = cur.rowcount > 0
+            await cur.close()
+        return had_one
+
+    # ------------------------------------------------------------------ approvals
+
+    async def create_approval(
+        self,
+        session_id: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+    ) -> str:
+        approval_id = uuid.uuid4().hex
+        await self.db.execute(
+            "INSERT INTO approvals (id, session_id, tool_name, tool_input, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (approval_id, session_id, tool_name, json.dumps(tool_input), time.time()),
+        )
+        await self.db.commit()
+        self._notifier.notify(self._approval_queue_key())
+        return approval_id
+
+    async def decide_approval(self, approval_id: str, decision: str, reason: str | None) -> bool:
+        if decision not in (DECISION_ALLOW, DECISION_DENY):
+            raise ValueError(f"decision must be 'allow' or 'deny', got {decision!r}")
+        async with self._db_lock:
+            cur = await self.db.execute(
+                "UPDATE approvals SET decision=?, reason=?, decided_at=? "
+                "WHERE id=? AND decision IS NULL",
+                (decision, reason, time.time(), approval_id),
+            )
+            await self.db.commit()
+            updated = cur.rowcount
+            await cur.close()
+        if updated:
+            self._notifier.notify(self._approval_key(approval_id))
+            return True
+        return False
+
+    async def get_approval(self, approval_id: str) -> dict[str, Any] | None:
+        cur = await self.db.execute("SELECT * FROM approvals WHERE id=?", (approval_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        return _row_to_approval(row) if row else None
+
+    async def wait_for_approval_decision(
+        self, approval_id: str, timeout: float
+    ) -> dict[str, Any] | None:
+        async def check() -> dict[str, Any] | None:
+            a = await self.get_approval(approval_id)
+            if a is None or a["decision"] is None:
+                return None
+            return a
+
+        return await self._notifier.wait_for(
+            self._approval_key(approval_id), check, timeout,
+        )
+
+    async def list_pending_approvals(self, limit: int = 50) -> list[dict[str, Any]]:
+        cur = await self.db.execute(
+            "SELECT * FROM approvals WHERE decision IS NULL ORDER BY created_at ASC LIMIT ?",
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [_row_to_approval(r) for r in rows]
+
+    # ------------------------------------------------------------------- pub/sub
+
+    async def publish(self, channel: str, sender: str, payload: dict[str, Any]) -> int:
+        cur = await self.db.execute(
+            "INSERT INTO pubsub (channel, sender, payload, created_at) VALUES (?, ?, ?, ?)",
+            (channel, sender, json.dumps(payload), time.time()),
+        )
+        await self.db.commit()
+        new_id = cur.lastrowid
+        await cur.close()
+        self._notifier.notify(self._pubsub_key(channel))
+        return new_id or 0
+
+    async def read_pubsub_after(
+        self, channel: str, after_id: int, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        cur = await self.db.execute(
+            "SELECT * FROM pubsub WHERE channel=? AND id>? ORDER BY id ASC LIMIT ?",
+            (channel, after_id, limit),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [_row_to_pubsub(r) for r in rows]
+
+    async def wait_for_pubsub(
+        self, channel: str, after_id: int, timeout: float
+    ) -> list[dict[str, Any]]:
+        async def check() -> list[dict[str, Any]] | None:
+            msgs = await self.read_pubsub_after(channel, after_id)
+            return msgs if msgs else None
+
+        result = await self._notifier.wait_for(
+            self._pubsub_key(channel), check, timeout,
+        )
+        return result or []
+
+    # ------------------------------------------------------------- notifier keys
+
+    @staticmethod
+    def _inbox_key(session: str | None) -> str:
+        return f"inbox:{session or '*'}"
+
+    @staticmethod
+    def _outbox_key(message_id: str) -> str:
+        return f"outbox:{message_id}"
+
+    @staticmethod
+    def _approval_key(approval_id: str) -> str:
+        return f"approval:{approval_id}"
+
+    @staticmethod
+    def _approval_queue_key() -> str:
+        return "approvals:any"
+
+    @staticmethod
+    def _pubsub_key(channel: str) -> str:
+        return f"pubsub:{channel}"
+
+    # ------------------------------------------------------------------- cleanup
+
+    async def _periodic_cleanup(self) -> None:
+        """Background task — expires old queued messages and prunes ancient rows."""
+        ttl = self.settings.store_ttl_seconds
+        while True:
+            try:
+                await asyncio.sleep(min(3600, ttl // 4 or 60))
+                cutoff = time.time() - ttl
+                async with self._db_lock:
+                    # Mark old queued/delivered as expired so wait_for_completion unblocks
+                    await self.db.execute(
+                        "UPDATE messages SET status=? WHERE status IN (?, ?) AND created_at<?",
+                        (STATUS_EXPIRED, STATUS_QUEUED, STATUS_DELIVERED, cutoff),
+                    )
+                    # Delete fully-resolved old rows
+                    await self.db.execute(
+                        "DELETE FROM messages WHERE status IN (?, ?, ?) AND created_at<?",
+                        (STATUS_REPLIED, STATUS_CANCELLED, STATUS_EXPIRED, cutoff),
+                    )
+                    await self.db.execute(
+                        "DELETE FROM approvals WHERE decision IS NOT NULL AND created_at<?",
+                        (cutoff,),
+                    )
+                    await self.db.execute(
+                        "DELETE FROM pubsub WHERE created_at<?", (cutoff,),
+                    )
+                    await self.db.commit()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Periodic cleanup failed")
+
+
+# ---------------------------------------------------------------- row converters
+
+
+def _row_to_message(row: aiosqlite.Row, delivered_at: float | None = None) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "sender": row["sender"],
+        "recipient_session": row["recipient_session"],
+        "prompt": row["prompt"],
+        "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
+        "status": row["status"],
+        "response": row["response"],
+        "created_at": row["created_at"],
+        "delivered_at": delivered_at if delivered_at is not None else row["delivered_at"],
+        "replied_at": row["replied_at"],
+    }
+
+
+def _row_to_approval(row: aiosqlite.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "tool_name": row["tool_name"],
+        "tool_input": json.loads(row["tool_input"]),
+        "decision": row["decision"],
+        "reason": row["reason"],
+        "created_at": row["created_at"],
+        "decided_at": row["decided_at"],
+    }
+
+
+def _row_to_pubsub(row: aiosqlite.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "channel": row["channel"],
+        "sender": row["sender"],
+        "payload": json.loads(row["payload"]),
+        "created_at": row["created_at"],
+    }
+
+
+__all__ = [
+    "Store",
+    "Notifier",
+    "STATUS_QUEUED",
+    "STATUS_DELIVERED",
+    "STATUS_REPLIED",
+    "STATUS_CANCELLED",
+    "STATUS_EXPIRED",
+    "DECISION_ALLOW",
+    "DECISION_DENY",
+]
+
+
+# Silence unused-import linter for Path
+_ = Path

@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy to .mcp.json and customize. The 'claude-local' entry is THIS machine's server; add 'claude-peer-<name>' entries for each remote you want to control.",
+  "mcpServers": {
+    "claude-local": {
+      "type": "http",
+      "url": "http://localhost:5473/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MCP_API_KEY}"
+      }
+    },
+    "claude-peer-laptop": {
+      "type": "http",
+      "url": "https://laptop.example.ts.net:5473/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PEER_LAPTOP_API_KEY}"
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "_comment": "Copy to .claude/settings.json in the project where you run the WORKER Claude session. The hook relays each PreToolUse decision to the remote controller via fast-mcp-claude.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "fast-mcp-claude-hook"
+          }
+        ]
+      }
+    ]
+  }
+}

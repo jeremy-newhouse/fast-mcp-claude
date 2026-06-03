@@ -38,14 +38,23 @@ logger = get_logger(__name__)
     )
 )
 async def send_prompt(
-    prompt: Annotated[str, Field(description="The user-message text to inject into the remote session")],
+    prompt: Annotated[
+        str,
+        Field(description="The user-message text to inject into the remote session"),
+    ],
     sender: Annotated[
         str | None,
         Field(description="Friendly name of the calling peer (for traceability)"),
     ] = None,
     recipient_session: Annotated[
         str | None,
-        Field(description="If set, only a worker running with this session_id will pick it up; otherwise the next idle worker gets it"),
+        Field(
+            description=(
+                "Address a specific peer by its identity (from who()) or a "
+                "session_id; only that recipient — or a broadcast listener — "
+                "picks it up. Omit to let the next idle worker take it."
+            ),
+        ),
     ] = None,
     metadata: Annotated[
         dict[str, Any] | None,
@@ -176,10 +185,13 @@ async def cancel(
         message_id = validate_message_id(message_id)
         ok = await store.cancel_message(message_id)
         if not ok:
-            return {"success": False, "error": {
-                "message": "Message not found or already finalized",
-                "code": "NOT_CANCELLABLE",
-            }}
+            return {
+                "success": False,
+                "error": {
+                    "message": "Message not found or already finalized",
+                    "code": "NOT_CANCELLABLE",
+                },
+            }
         return {"success": True, "message_id": message_id}
     except ValidationError as e:
         return format_error_response(e)
@@ -226,7 +238,13 @@ async def list_messages(
 async def wait_for_instruction(
     recipient_session: Annotated[
         str | None,
-        Field(description="Only pull messages addressed to this session_id (or unaddressed/broadcast). Default: receive any."),
+        Field(
+            description=(
+                "Only pull messages addressed to this identity/session_id (plus "
+                "broadcast). The channel adapter passes the peer's identity here. "
+                "Default: receive any."
+            ),
+        ),
     ] = None,
     timeout: Annotated[
         float | None,
@@ -260,10 +278,13 @@ async def reply(
         response = validate_response(response)
         ok = await store.record_reply(message_id, response)
         if not ok:
-            return {"success": False, "error": {
-                "message": "Message not found or already finalized",
-                "code": "NOT_REPLIABLE",
-            }}
+            return {
+                "success": False,
+                "error": {
+                    "message": "Message not found or already finalized",
+                    "code": "NOT_REPLIABLE",
+                },
+            }
         return {"success": True, "message_id": message_id}
     except ValidationError as e:
         return format_error_response(e)

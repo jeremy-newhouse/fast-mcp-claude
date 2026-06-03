@@ -18,11 +18,11 @@ MESSAGE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 APPROVAL_ID_RE = MESSAGE_ID_RE
 
 # Body-size caps (prevent abuse)
-MAX_PROMPT_BYTES = 1_000_000           # 1 MB
-MAX_RESPONSE_BYTES = 4_000_000         # 4 MB
-MAX_FILE_BYTES = 10_000_000            # 10 MB
+MAX_PROMPT_BYTES = 1_000_000  # 1 MB
+MAX_RESPONSE_BYTES = 4_000_000  # 4 MB
+MAX_FILE_BYTES = 10_000_000  # 10 MB
 MAX_FILE_LIST_ENTRIES = 1000
-MAX_PUBSUB_PAYLOAD_BYTES = 256_000     # 256 KB
+MAX_PUBSUB_PAYLOAD_BYTES = 256_000  # 256 KB
 
 
 def validate_session_id(value: str | None, *, field: str = "session_id") -> str | None:
@@ -32,7 +32,24 @@ def validate_session_id(value: str | None, *, field: str = "session_id") -> str 
         raise ValidationError(f"{field} must be a string", field=field)
     if not SESSION_RE.match(value):
         raise ValidationError(
-            f"{field} must match {SESSION_RE.pattern}", field=field,
+            f"{field} must match {SESSION_RE.pattern}",
+            field=field,
+        )
+    return value
+
+
+def validate_identity(value: str, *, field: str = "identity") -> str:
+    """A peer/developer identity — same charset as a session id, but required.
+
+    Doubles as a mailbox key: send_prompt(recipient_session=<identity>) routes to
+    the worker whose channel adapter long-polls with that identity.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValidationError(f"{field} is required", field=field)
+    if not SESSION_RE.match(value):
+        raise ValidationError(
+            f"{field} must match {SESSION_RE.pattern}",
+            field=field,
         )
     return value
 
@@ -42,7 +59,8 @@ def validate_channel(value: str, *, field: str = "channel") -> str:
         raise ValidationError(f"{field} is required", field=field)
     if not CHANNEL_RE.match(value):
         raise ValidationError(
-            f"{field} must match {CHANNEL_RE.pattern}", field=field,
+            f"{field} must match {CHANNEL_RE.pattern}",
+            field=field,
         )
     return value
 
@@ -52,7 +70,8 @@ def validate_peer_name(value: str, *, field: str = "peer") -> str:
         raise ValidationError(f"{field} is required", field=field)
     if not PEER_NAME_RE.match(value):
         raise ValidationError(
-            f"{field} must match {PEER_NAME_RE.pattern}", field=field,
+            f"{field} must match {PEER_NAME_RE.pattern}",
+            field=field,
         )
     return value
 
@@ -74,7 +93,8 @@ def validate_prompt(value: str, *, field: str = "prompt") -> str:
         raise ValidationError(f"{field} must be a non-empty string", field=field)
     if len(value.encode("utf-8")) > MAX_PROMPT_BYTES:
         raise ValidationError(
-            f"{field} exceeds {MAX_PROMPT_BYTES} bytes", field=field,
+            f"{field} exceeds {MAX_PROMPT_BYTES} bytes",
+            field=field,
         )
     return value
 
@@ -84,7 +104,8 @@ def validate_response(value: str, *, field: str = "response") -> str:
         raise ValidationError(f"{field} must be a string", field=field)
     if len(value.encode("utf-8")) > MAX_RESPONSE_BYTES:
         raise ValidationError(
-            f"{field} exceeds {MAX_RESPONSE_BYTES} bytes", field=field,
+            f"{field} exceeds {MAX_RESPONSE_BYTES} bytes",
+            field=field,
         )
     return value
 
@@ -129,7 +150,8 @@ def validate_workspace_path(
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
         raise ValidationError(
-            f"{field} must be an absolute path", field=field,
+            f"{field} must be an absolute path",
+            field=field,
         )
 
     # Resolve to canonical form (follows symlinks where they exist).
@@ -156,9 +178,11 @@ def validate_pubsub_payload(payload: dict, *, field: str = "payload") -> dict:
     if not isinstance(payload, dict):
         raise ValidationError(f"{field} must be a JSON object", field=field)
     import json
+
     encoded = json.dumps(payload).encode("utf-8")
     if len(encoded) > MAX_PUBSUB_PAYLOAD_BYTES:
         raise ValidationError(
-            f"{field} exceeds {MAX_PUBSUB_PAYLOAD_BYTES} bytes", field=field,
+            f"{field} exceeds {MAX_PUBSUB_PAYLOAD_BYTES} bytes",
+            field=field,
         )
     return payload

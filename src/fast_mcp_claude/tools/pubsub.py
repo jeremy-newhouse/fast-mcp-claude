@@ -63,7 +63,12 @@ async def subscribe(
     channel: Annotated[str, Field(description="Channel name to listen on")],
     after_id: Annotated[
         int,
-        Field(description="Return messages with id > this. Use 0 to start from the beginning of the retained window."),
+        Field(
+            description=(
+                "Return messages with id > this. Use 0 to start from the "
+                "beginning of the retained window."
+            ),
+        ),
     ] = 0,
     timeout: Annotated[
         float | None,

@@ -65,7 +65,9 @@ def main() -> None:
     # Truncate session_id to validator's max
     session_id = str(session_id)[:128]
 
-    auto_pass = {t.strip() for t in os.environ.get("CRM_AUTO_PASS_TOOLS", "").split(",") if t.strip()}
+    auto_pass = {
+        t.strip() for t in os.environ.get("CRM_AUTO_PASS_TOOLS", "").split(",") if t.strip()
+    }
     if tool_name in auto_pass:
         _debug(f"auto-pass: {tool_name}")
         _emit("ask", f"crm relay skipped for {tool_name} (auto-pass)")

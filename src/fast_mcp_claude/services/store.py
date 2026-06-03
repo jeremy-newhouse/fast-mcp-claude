@@ -30,11 +30,11 @@ logger = get_logger(__name__)
 T = TypeVar("T")
 
 # Message lifecycle
-STATUS_QUEUED = "queued"          # in inbox, no worker has picked up yet
-STATUS_DELIVERED = "delivered"    # wait_for_instruction handed it to a worker
-STATUS_REPLIED = "replied"        # worker called reply()
-STATUS_CANCELLED = "cancelled"    # controller called interrupt() or similar
-STATUS_EXPIRED = "expired"        # TTL cleanup
+STATUS_QUEUED = "queued"  # in inbox, no worker has picked up yet
+STATUS_DELIVERED = "delivered"  # wait_for_instruction handed it to a worker
+STATUS_REPLIED = "replied"  # worker called reply()
+STATUS_CANCELLED = "cancelled"  # controller called interrupt() or similar
+STATUS_EXPIRED = "expired"  # TTL cleanup
 
 # Approval lifecycle
 DECISION_ALLOW = "allow"
@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS messages (
     replied_at          REAL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status, created_at);
-CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_session, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_recipient
+    ON messages(recipient_session, status, created_at);
 
 CREATE TABLE IF NOT EXISTS approvals (
     id              TEXT PRIMARY KEY,
@@ -82,6 +83,14 @@ CREATE TABLE IF NOT EXISTS interrupts (
     session_id      TEXT PRIMARY KEY,
     requested_at    REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS presence (
+    identity    TEXT PRIMARY KEY,
+    summary     TEXT,
+    metadata    TEXT,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_presence_updated ON presence(updated_at);
 """
 
 
@@ -189,7 +198,8 @@ class Store:
         message_id = uuid.uuid4().hex
         now = time.time()
         await self.db.execute(
-            "INSERT INTO messages (id, sender, recipient_session, prompt, metadata, status, created_at) "
+            "INSERT INTO messages "
+            "(id, sender, recipient_session, prompt, metadata, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 message_id,
@@ -294,7 +304,9 @@ class Store:
             return None
 
         return await self._notifier.wait_for(
-            self._outbox_key(message_id), check, timeout,
+            self._outbox_key(message_id),
+            check,
+            timeout,
         )
 
     async def cancel_message(self, message_id: str) -> bool:
@@ -401,7 +413,9 @@ class Store:
             return a
 
         return await self._notifier.wait_for(
-            self._approval_key(approval_id), check, timeout,
+            self._approval_key(approval_id),
+            check,
+            timeout,
         )
 
     async def list_pending_approvals(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -445,9 +459,55 @@ class Store:
             return msgs if msgs else None
 
         result = await self._notifier.wait_for(
-            self._pubsub_key(channel), check, timeout,
+            self._pubsub_key(channel),
+            check,
+            timeout,
         )
         return result or []
+
+    # ------------------------------------------------------------------ presence
+
+    async def announce(
+        self,
+        identity: str,
+        summary: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Upsert a peer's presence row (identity + what it's doing + heartbeat)."""
+        await self.db.execute(
+            "INSERT INTO presence (identity, summary, metadata, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(identity) DO UPDATE SET "
+            "summary=excluded.summary, metadata=excluded.metadata, updated_at=excluded.updated_at",
+            (
+                identity,
+                summary,
+                json.dumps(metadata) if metadata else None,
+                time.time(),
+            ),
+        )
+        await self.db.commit()
+        self._notifier.notify(self._presence_key())
+
+    async def list_presence(self, stale_after: float | None = None) -> list[dict[str, Any]]:
+        """Return known peers, freshest first. If stale_after is set, drop rows
+        whose last heartbeat is older than that many seconds."""
+        cur = await self.db.execute("SELECT * FROM presence ORDER BY updated_at DESC")
+        rows = await cur.fetchall()
+        await cur.close()
+        now = time.time()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            if stale_after is not None and (now - r["updated_at"]) > stale_after:
+                continue
+            out.append(_row_to_presence(r, now))
+        return out
+
+    async def forget_presence(self, identity: str) -> None:
+        """Drop a peer's presence row (called on adapter shutdown)."""
+        await self.db.execute("DELETE FROM presence WHERE identity=?", (identity,))
+        await self.db.commit()
+        self._notifier.notify(self._presence_key())
 
     # ------------------------------------------------------------- notifier keys
 
@@ -470,6 +530,10 @@ class Store:
     @staticmethod
     def _pubsub_key(channel: str) -> str:
         return f"pubsub:{channel}"
+
+    @staticmethod
+    def _presence_key() -> str:
+        return "presence:any"
 
     # ------------------------------------------------------------------- cleanup
 
@@ -496,7 +560,14 @@ class Store:
                         (cutoff,),
                     )
                     await self.db.execute(
-                        "DELETE FROM pubsub WHERE created_at<?", (cutoff,),
+                        "DELETE FROM pubsub WHERE created_at<?",
+                        (cutoff,),
+                    )
+                    # Backstop only — `who` filters freshness via stale_after; a
+                    # live adapter re-announces on every heartbeat.
+                    await self.db.execute(
+                        "DELETE FROM presence WHERE updated_at<?",
+                        (cutoff,),
                     )
                     await self.db.commit()
             except asyncio.CancelledError:
@@ -543,6 +614,16 @@ def _row_to_pubsub(row: aiosqlite.Row) -> dict[str, Any]:
         "sender": row["sender"],
         "payload": json.loads(row["payload"]),
         "created_at": row["created_at"],
+    }
+
+
+def _row_to_presence(row: aiosqlite.Row, now: float) -> dict[str, Any]:
+    return {
+        "identity": row["identity"],
+        "summary": row["summary"],
+        "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
+        "updated_at": row["updated_at"],
+        "age_seconds": round(now - row["updated_at"], 1),
     }
 
 

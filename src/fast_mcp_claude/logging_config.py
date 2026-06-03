@@ -65,10 +65,28 @@ class StructuredFormatter(logging.Formatter):
             log_data["correlation_id"] = correlation_id
 
         standard_attrs = {
-            "name", "msg", "args", "created", "filename", "funcName", "levelname",
-            "levelno", "lineno", "module", "msecs", "pathname", "process", "processName",
-            "relativeCreated", "stack_info", "exc_info", "exc_text", "thread", "threadName",
-            "taskName", "message",
+            "name",
+            "msg",
+            "args",
+            "created",
+            "filename",
+            "funcName",
+            "levelname",
+            "levelno",
+            "lineno",
+            "module",
+            "msecs",
+            "pathname",
+            "process",
+            "processName",
+            "relativeCreated",
+            "stack_info",
+            "exc_info",
+            "exc_text",
+            "thread",
+            "threadName",
+            "taskName",
+            "message",
         }
         for key, value in record.__dict__.items():
             if key not in standard_attrs and not key.startswith("_"):
@@ -162,7 +180,8 @@ def timed(func: Callable[..., T]) -> Callable[..., T]:
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.debug(
                 "%s completed in %.2fms",
-                func.__name__, elapsed_ms,
+                func.__name__,
+                elapsed_ms,
                 extra={"timing_ms": elapsed_ms, "function": func.__name__},
             )
             return result
@@ -170,7 +189,8 @@ def timed(func: Callable[..., T]) -> Callable[..., T]:
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.debug(
                 "%s failed after %.2fms",
-                func.__name__, elapsed_ms,
+                func.__name__,
+                elapsed_ms,
                 extra={"timing_ms": elapsed_ms, "function": func.__name__},
             )
             raise
@@ -183,7 +203,8 @@ def timed(func: Callable[..., T]) -> Callable[..., T]:
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.debug(
                 "%s completed in %.2fms",
-                func.__name__, elapsed_ms,
+                func.__name__,
+                elapsed_ms,
                 extra={"timing_ms": elapsed_ms, "function": func.__name__},
             )
             return result
@@ -191,7 +212,8 @@ def timed(func: Callable[..., T]) -> Callable[..., T]:
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.debug(
                 "%s failed after %.2fms",
-                func.__name__, elapsed_ms,
+                func.__name__,
+                elapsed_ms,
                 extra={"timing_ms": elapsed_ms, "function": func.__name__},
             )
             raise

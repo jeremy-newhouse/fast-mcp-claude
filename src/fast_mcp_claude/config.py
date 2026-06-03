@@ -74,6 +74,17 @@ class Settings(BaseSettings):
     poll_max_wait_s: int = 25
     poll_heartbeat_s: int = 20
 
+    # Channel adapter (fast-mcp-claude-channel) — STRICT opt-in. Default off so a
+    # configured-but-unintended adapter stays inert (handshake only) and never
+    # claims inbox messages out from under /worker loop mode. Arming the push
+    # bridge requires BOTH channel_enabled=true AND launching the session with
+    # `--dangerously-load-development-channels`.
+    channel_enabled: bool = False
+    # Adapter identity / presence mailbox (falls back to peer_name when unset).
+    channel_identity: str | None = None
+    # One-line presence blurb the adapter heartbeats via announce().
+    channel_summary: str | None = None
+
     # Logging
     log_level: str = "INFO"
     log_format: str = "console"

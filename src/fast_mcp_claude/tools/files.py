@@ -44,14 +44,17 @@ async def list_files(
                     continue
                 try:
                     stat = de.stat(follow_symlinks=False)
-                    entries.append({
-                        "name": de.name,
-                        "path": str(resolved / de.name),
-                        "type": "dir" if de.is_dir(follow_symlinks=False)
-                                 else ("symlink" if de.is_symlink() else "file"),
-                        "size": stat.st_size if de.is_file(follow_symlinks=False) else None,
-                        "modified": stat.st_mtime,
-                    })
+                    entries.append(
+                        {
+                            "name": de.name,
+                            "path": str(resolved / de.name),
+                            "type": "dir"
+                            if de.is_dir(follow_symlinks=False)
+                            else ("symlink" if de.is_symlink() else "file"),
+                            "size": stat.st_size if de.is_file(follow_symlinks=False) else None,
+                            "modified": stat.st_mtime,
+                        }
+                    )
                 except OSError:
                     continue
                 if len(entries) >= MAX_FILE_LIST_ENTRIES:
@@ -66,8 +69,7 @@ async def list_files(
 
 @mcp.tool(
     description=(
-        "[Controller] Read a text file from this peer's workspace. Refuses files "
-        "larger than ~10MB."
+        "[Controller] Read a text file from this peer's workspace. Refuses files larger than ~10MB."
     )
 )
 async def read_file(
@@ -82,7 +84,8 @@ async def read_file(
         size = resolved.stat().st_size
         if size > MAX_FILE_BYTES:
             raise ValidationError(
-                f"file too large ({size} > {MAX_FILE_BYTES})", field="path",
+                f"file too large ({size} > {MAX_FILE_BYTES})",
+                field="path",
             )
 
         try:
@@ -114,7 +117,10 @@ async def read_file(
 async def write_file(
     path: Annotated[str, Field(description="Absolute file path within WORKSPACE_ROOTS")],
     content: Annotated[str, Field(description="Full file contents (UTF-8 text)")],
-    overwrite: Annotated[bool, Field(description="If false, refuse to overwrite existing files")] = True,
+    overwrite: Annotated[
+        bool,
+        Field(description="If false, refuse to overwrite existing files"),
+    ] = True,
 ) -> dict[str, Any]:
     try:
         if not isinstance(content, str):
@@ -122,7 +128,8 @@ async def write_file(
         encoded = content.encode("utf-8")
         if len(encoded) > MAX_FILE_BYTES:
             raise ValidationError(
-                f"content too large ({len(encoded)} > {MAX_FILE_BYTES})", field="content",
+                f"content too large ({len(encoded)} > {MAX_FILE_BYTES})",
+                field="content",
             )
 
         roots = settings.workspace_roots_resolved
@@ -134,7 +141,8 @@ async def write_file(
             )
         if resolved.exists() and not resolved.is_file():
             raise ValidationError(
-                f"path exists and is not a regular file: {resolved}", field="path",
+                f"path exists and is not a regular file: {resolved}",
+                field="path",
             )
 
         resolved.parent.mkdir(parents=True, exist_ok=True)

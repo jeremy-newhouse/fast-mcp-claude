@@ -77,7 +77,9 @@ mcp = FastMCP(
         "              wait_for_pending_approval, approve_tool, await_decision\n"
         "  Files:      list_files, read_file, write_file  (sandboxed to\n"
         "              WORKSPACE_ROOTS)\n"
-        "  Pub/sub:    publish, subscribe\n\n"
+        "  Pub/sub:    publish, subscribe\n"
+        "  Presence:   announce, who  (N-way peer discovery; address a peer by\n"
+        "              passing its identity as recipient_session)\n\n"
         "message_id is the correlation key for send_prompt <-> reply <-> wait_for_completion."
     ),
     auth=auth_provider,
@@ -86,4 +88,4 @@ mcp = FastMCP(
 
 
 # Import tool modules for side-effect registration via @mcp.tool decorators
-from .tools import files, messaging, permissions, pubsub  # noqa: E402, F401
+from .tools import files, messaging, permissions, presence, pubsub  # noqa: E402, F401

@@ -1,6 +1,6 @@
 [project]
 name = "fast-mcp-claude"
-version = "0.1.0"
+version = "0.2.0"
 description = "FastMCP server for peer-to-peer remote control between Claude Code sessions"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,6 +22,7 @@ dev = [
 [project.scripts]
 fast-mcp-claude = "fast_mcp_claude.__main__:main"
 fast-mcp-claude-hook = "fast_mcp_claude.hook:main"
+fast-mcp-claude-channel = "fast_mcp_claude.channel:main"
 
 [build-system]
 requires = ["hatchling"]

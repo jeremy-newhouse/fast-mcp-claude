@@ -127,6 +127,7 @@ async def wait_for_pending_approval(
         wait_s = validate_timeout(timeout, default=settings.poll_max_wait_s, cap=300.0)
         # Reuse the approval-queue key: anything new wakes us.
         from ..services.store import Notifier  # noqa: F401  (re-import for clarity)
+
         # Use the store's internal notifier by waiting on the well-known key.
         # We don't have direct access, so we use list_pending_approvals + wait via
         # the existing notify points: request_approval notifies approvals:any.
@@ -166,7 +167,8 @@ async def approve_tool(
         approval_id = validate_approval_id(approval_id)
         if decision not in (DECISION_ALLOW, DECISION_DENY):
             raise ValidationError(
-                "decision must be 'allow' or 'deny'", field="decision",
+                "decision must be 'allow' or 'deny'",
+                field="decision",
             )
         if reason is not None and not isinstance(reason, str):
             raise ValidationError("reason must be a string", field="reason")
@@ -175,10 +177,13 @@ async def approve_tool(
 
         ok = await store.decide_approval(approval_id, decision, reason)
         if not ok:
-            return {"success": False, "error": {
-                "message": "Approval not found or already decided",
-                "code": "NOT_DECIDABLE",
-            }}
+            return {
+                "success": False,
+                "error": {
+                    "message": "Approval not found or already decided",
+                    "code": "NOT_DECIDABLE",
+                },
+            }
         return {"success": True, "approval_id": approval_id, "decision": decision}
     except ValidationError as e:
         return format_error_response(e)

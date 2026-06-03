@@ -35,17 +35,19 @@ uv run ruff format src/ tests/
 
 - `src/fast_mcp_claude/__main__.py` — CLI entry: setup logging, import `server.mcp`, run HTTP transport.
 - `src/fast_mcp_claude/server.py` — Creates the `FastMCP` instance (`mcp`), `Store` instance (`store`), optional `ApiKeyVerifier`. Side-effect imports each `tools/` module at the bottom so their `@mcp.tool` decorators register.
-- `src/fast_mcp_claude/config.py` — `Settings` (pydantic-settings) loaded from `.env`. Includes `PeerConfig` (per-peer URL+key), `workspace_roots_resolved` (sandbox), `poll_max_wait_s` etc.
+- `src/fast_mcp_claude/config.py` — `Settings` (pydantic-settings) loaded from `.env`. Includes `PeerConfig` (per-peer URL+key), `workspace_roots_resolved` (sandbox), `poll_max_wait_s`, and the channel-adapter opt-in (`channel_enabled` default `False`, `channel_identity`, `channel_summary`).
 - `src/fast_mcp_claude/auth.py` — `ApiKeyVerifier` + `AuthRateLimiter` (timing-safe compare, lockout after N failures).
 - `src/fast_mcp_claude/errors.py` — Error hierarchy (`ClaudeRemoteError`, `ValidationError`, `NotFoundError`, `PeerError`, `PermissionDeniedError`), `format_error_response()`, `build_response()`.
 - `src/fast_mcp_claude/logging_config.py` — Dual formatters (JSON for prod, colored console for dev), redaction of sensitive field names, `@timed` decorator.
-- `src/fast_mcp_claude/services/store.py` — SQLite-backed inbox/outbox/approvals/pubsub. Contains the `Notifier` class (per-key `asyncio.Event`) that powers all long-poll tools.
+- `src/fast_mcp_claude/services/store.py` — SQLite-backed inbox/outbox/approvals/pubsub/presence. Contains the `Notifier` class (per-key `asyncio.Event`) that powers all long-poll tools.
 - `src/fast_mcp_claude/tools/messaging.py` — `send_prompt`, `wait_for_completion`, `get_status`, `interrupt`, `cancel`, `list_messages`, `wait_for_instruction`, `reply`, `consume_interrupt`.
 - `src/fast_mcp_claude/tools/permissions.py` — `request_approval` (hook-internal), `await_decision`, `pending_approvals`, `wait_for_pending_approval`, `approve_tool`.
 - `src/fast_mcp_claude/tools/files.py` — `list_files`, `read_file`, `write_file` sandboxed to `WORKSPACE_ROOTS`.
 - `src/fast_mcp_claude/tools/pubsub.py` — `publish`, `subscribe`.
-- `src/fast_mcp_claude/utils/validation.py` — Format validators (session_id, message_id, channel, peer_name), `validate_workspace_path` (sandbox + symlink-escape guard), body-size caps.
+- `src/fast_mcp_claude/tools/presence.py` — `announce`, `who` (N-way peer discovery / roster; presence rows are heartbeated by the channel adapter).
+- `src/fast_mcp_claude/utils/validation.py` — Format validators (session_id, identity, message_id, channel, peer_name), `validate_workspace_path` (sandbox + symlink-escape guard), body-size caps.
 - `src/fast_mcp_claude/hook.py` — `fast-mcp-claude-hook` CLI; PreToolUse hook entry that talks to the local server via `fastmcp.Client`.
+- `src/fast_mcp_claude/channel.py` — `fast-mcp-claude-channel` CLI; a Claude Code **channel** adapter (stdio, low-level `mcp.server.Server`) that long-polls the local server's inbox and PUSHES each prompt as a `notifications/claude/channel` event into the live worker session. Reply still flows through the `reply` tool.
 
 ### Tool pattern
 
@@ -101,6 +103,19 @@ Producers call `self._notifier.notify(key)` after writing to the DB. The notifie
 
 If the controller doesn't respond before `CRM_DECISION_TIMEOUT` (default 300s), the hook falls back to `"ask"` so the local user retains control.
 
+### Channel push flow (`fast-mcp-claude-channel`)
+
+The channel adapter removes the need to prime/poll a worker. It is a separate stdio process Claude Code spawns (worker launched with `--dangerously-load-development-channels server:claude-channel`):
+
+1. Adapter starts a low-level `mcp.server.Server` over stdio and declares `experimental: {"claude/channel": {}}`. It opens a `fastmcp.Client` to the LOCAL HTTP server (same auth as the hook).
+2. Adapter long-polls `wait_for_instruction(recipient_session=<identity>)` in its own process — the MCP idle timeout does not apply — and heartbeats `announce(identity, summary)`.
+3. On a message it writes a `notifications/claude/channel` notification straight to the stdio write stream → the prompt appears in the live session as `<channel source="fast-mcp-claude" message_id=... sender=...>`.
+4. The worker's Claude acts and calls `reply(message_id, ...)` on the local server → the controller's `wait_for_completion` unblocks. Channel pushes are unacknowledged, so `reply`/outbox stays the delivery source of truth.
+
+Permissions are NOT relayed over the channel: Claude Code's `claude/channel/permission` relay is an *inbound* custom notification, and the Python MCP SDK validates incoming notifications against the `ClientNotification` union and drops unknown methods. The PreToolUse hook remains the permission path; channel permission relay is future work.
+
+**Coexistence & safety.** Channel mode is strict opt-in: `_resolve_config` resolves `enabled` as CLI `--enabled/--no-enabled` > `CHANNEL_ENABLED` env > `Settings.channel_enabled` (default `False`). When **disabled**, `_serve` still runs `_server.run(...)` so the MCP handshake succeeds (Claude Code spawns the adapter for any wired `.mcp.json` entry, even without `--dangerously-load-development-channels`), but it does **not** start `_bridge` — no `wait_for_instruction` poll, no inbox claim, no push. This is the key invariant: a wired-but-disabled adapter must never `pop_next_for_worker` and silently eat a message destined for `/worker` loop mode (controller's `wait_for_completion` would then hang until TTL). Channel and loop modes read the same inbox via the same atomic claim, so they coexist with no server change — but never double-arm one worker (channel adapter **and** `/worker` for the same identity). Arming the channel requires BOTH `channel_enabled=true` AND the `--dangerously-load-development-channels` launch flag. Identity precedence mirrors enabled: `--identity` > `CRM_IDENTITY` > `Settings.channel_identity` > `Settings.peer_name`.
+
 ## Security model
 
 - **Mutual bearer auth**: each peer's `MCP_API_KEY` is shared with the other(s) via their `.mcp.json` / `PEERS` config. Timing-safe comparison; lockout after 5 failures in 5 minutes.
@@ -111,7 +126,8 @@ If the controller doesn't respond before `CRM_DECISION_TIMEOUT` (default 300s), 
 
 ## Known limitations (v1)
 
-- Single-process notification only — `Notifier` won't wake another process or machine. Each peer is its own asyncio loop.
-- The worker loop must be primed via a slash command (`/worker`) — Claude doesn't auto-poll without instruction.
-- Mid-turn stdin injections in Claude Code's headless mode are not persisted to the session JSONL (anthropics/claude-code#41230). This server uses the `send_prompt` tool path, not stdin, so it isn't affected — but the implication is that we cannot resume a `wait_for_instruction` inside the same Claude turn that received a message; replies must complete the turn.
-- MCP idle timeout (~30s for stdio; longer for streamable-http) means `wait_for_instruction(timeout=300)` may be silently killed. Tune `POLL_MAX_WAIT_S` and have the worker loop call repeatedly.
+- Single-process notification only — `Notifier` won't wake another process or machine. Each peer is its own asyncio loop. (Unnecessary in mesh; in a hub deployment everyone shares the one process anyway.)
+- Worker priming: in **loop mode** the worker must be primed via `/worker`. **Channel mode** (`fast-mcp-claude-channel` + `--dangerously-load-development-channels`) removes this — tasks push in automatically — and is the recommended path.
+- MCP idle timeout (~30s for stdio; longer for streamable-http) can silently kill a long `wait_for_instruction`. In loop mode keep `POLL_MAX_WAIT_S` ≤25s and call repeatedly; channel mode sidesteps it (the wait lives in the adapter process).
+- Channels are a **research preview** (Claude Code ≥ v2.1.80) and need `--dangerously-load-development-channels` for a custom server; the notification API may change. Permission relay over `claude/channel/permission` is not yet implemented (inbound custom-notification gap in the Python MCP SDK) — the PreToolUse hook covers approvals.
+- Mid-turn stdin injections in Claude Code's headless mode are not persisted to the session JSONL (anthropics/claude-code#41230). This server uses the `send_prompt`/channel paths, not stdin, so it isn't affected — but we complete a turn per reply rather than resuming `wait_for_instruction` inside the same turn.

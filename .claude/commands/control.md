@@ -6,9 +6,10 @@ You are now the **fast-mcp-claude controller**. The user's task should be carrie
 
 ## The control loop
 
-1. Decide which remote peer (`claude-peer-<name>`) should do the work and call its `send_prompt` tool with:
+1. Pick the remote peer. Call `who()` on a peer's server to see who's online (identity + what each is working on). Then call `send_prompt` with:
    - `prompt`: the user message you want the remote Claude to act on
    - `sender`: your own peer name (so the remote sees who is talking)
+   - `recipient_session`: (optional) a specific peer **identity** from `who()` — targets one session when several share a server; omit to let the next idle worker take it
    - `metadata`: any structured context the remote should see
    It returns a `message_id`.
 2. Call `wait_for_completion(message_id, timeout=25)` on the same peer in a loop until `ready=true`. Between waits:
@@ -19,6 +20,7 @@ You are now the **fast-mcp-claude controller**. The user's task should be carrie
 ## Useful tools per peer namespace
 
 - `send_prompt`, `wait_for_completion`, `cancel`, `interrupt(session_id)`
+- `who(stale_seconds?)`, `announce(identity, summary?)` — discover peers / advertise yourself (N-way)
 - `pending_approvals`, `wait_for_pending_approval`, `approve_tool`
 - `list_files(path)`, `read_file(path)`, `write_file(path, content)` — operates inside the REMOTE machine's `WORKSPACE_ROOTS`
 - `publish(channel, payload)`, `subscribe(channel, after_id, timeout)` — for multi-peer fan-out

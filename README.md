@@ -8,7 +8,7 @@ A FastMCP server that lets two (or more) Claude Code sessions on **different mac
 Machine A (controller)                       Machine B (worker)
 +--------------------------+                 +--------------------------+
 | claude (interactive)     |                 | claude (interactive,     |
-|  .mcp.json:              |                 |  primed by /worker)      |
+|  .mcp.json:              |                 |  channel-pushed)         |
 |    claude-local  → A     |                 |  .mcp.json:              |
 |    claude-peer-b → B     |                 |    claude-local  → B     |
 +--------------------------+                 +--------------------------+
@@ -23,7 +23,7 @@ The controller calls tools like `send_prompt`, `wait_for_completion`, `approve_t
 
 ## Status
 
-v0.1 — initial usable cut. Working: peer-to-peer messaging, permission relay via PreToolUse hook, file bridge (sandboxed), pub/sub channels, bearer auth with rate-limit lockout. Not yet: Channels-plugin facade, end-to-end integration tests against real Claude Code sessions.
+v0.2 — adds Claude Code **Channels** push mode and **N-way** peer presence. Working: peer-to-peer messaging, prompt **push** via a channel adapter (no `/worker` priming, no idle-timeout), identity addressing + presence/roster (`who`), permission relay via PreToolUse hook, file bridge (sandboxed), pub/sub channels, bearer auth with rate-limit lockout. Not yet: permission relay over the native `claude/channel/permission` protocol (needs inbound custom-notification support the Python MCP SDK lacks today — the hook covers approvals meanwhile), end-to-end integration tests against real Claude Code sessions.
 
 ## Install
 
@@ -129,6 +129,39 @@ Please ask the laptop to summarize what's in ~/repos/notes/today.md
 
 The session will call `claude-peer-laptop:send_prompt`, then `wait_for_completion`, and surface the result.
 
+## Channels: push mode (recommended)
+
+[Claude Code Channels](https://code.claude.com/docs/en/channels) (research preview, requires Claude Code ≥ v2.1.80) let an MCP server **push** events into a live session instead of the session polling for them. `fast-mcp-claude-channel` is a tiny stdio adapter that bridges your local server's inbox into the running worker session — so a remote controller's `send_prompt` surfaces automatically, with **no `/worker` priming and no MCP idle-timeout**.
+
+Channel mode is **strict opt-in** and arming it takes two switches, by design:
+
+1. Set `CHANNEL_ENABLED=true` in the worker's `.env` (it defaults to `false`).
+2. Launch the worker with the dev-channel flag:
+
+```bash
+claude --dangerously-load-development-channels server:claude-channel
+```
+
+Add the `claude-channel` entry from `.mcp.json.example` and install the CLI (`uv tool install .`) so the adapter binary is on PATH. Prompts then arrive as `<channel source="fast-mcp-claude" message_id="..." sender="...">` events; the worker does the task and calls `reply(message_id, ...)`. Channel pushes are fire-and-forget, so the `reply`/outbox path remains the source of truth for delivery (this is the lesson from claude-peers-mcp's silent-message-loss bugs).
+
+**Coexistence & safety.** Channel mode and the `/worker` long-poll loop read the *same* inbox and coexist with no server change — pick one **per worker launch**, and different peers in a fleet can mix modes freely. The `CHANNEL_ENABLED` switch exists because Claude Code spawns the `claude-channel` adapter whenever it's wired into `.mcp.json`, even when you launched *without* `--dangerously-load-development-channels`. With `CHANNEL_ENABLED=false` (the default) such a wired-but-unintended adapter completes the MCP handshake and then stays **inert** — it never polls, claims, or pushes — so it's safe to leave configured alongside loop mode. Were it to poll while disabled, it would mark inbox messages "delivered" and push them into a channel nobody is listening to: the prompt would vanish and the controller's `wait_for_completion` would hang until TTL. For the same reason, never **double-arm** a single worker — run the channel adapter *or* `/worker` for a given identity, not both.
+
+> Permissions are **not** relayed over the channel yet — Claude Code's native `claude/channel/permission` relay is an inbound custom notification the Python MCP SDK doesn't surface. Keep using the PreToolUse hook (next section) for approvals.
+
+## N-way peer mode (many sessions / many developers)
+
+Controller/worker is only a convention — every server is symmetric, so any number of sessions can address each other. Each session's channel adapter runs with a stable identity (`--identity`, else `CHANNEL_IDENTITY`, else `PEER_NAME`), and that identity doubles as a mailbox:
+
+- **Discover** peers: `who()` → `[{identity, summary, age_seconds}, ...]` — populated by the heartbeated `announce` from each **armed** channel adapter (`CHANNEL_ENABLED=true`). A disabled/inert adapter does not announce, so it won't appear in the roster.
+- **Address** a peer: `send_prompt(prompt, recipient_session="<identity>")` routes only to that peer; omit it to let any idle worker take it.
+
+You do **not** need a central hub:
+
+- **Mesh** (small / trusted team): each dev runs their own server; everyone's `.mcp.json` lists the others. Pair with **Tailscale/WireGuard** so every machine has a stable private URL with no public exposure.
+- **Hub** (larger team, easy onboarding, team-wide `who`): run **one** instance as the shared server and point everyone's adapter and peer entries at it. Spokes dial out, so NAT "just works," and presence/pub-sub become a team roster/broadcast.
+
+The same binary is mesh node *or* hub — it's a deployment choice, not a code change. Start mesh-over-Tailscale; adopt a hub later by repointing adapters, with no rewrite.
+
 ## Permission relay (optional)
 
 If you want the controller to approve/deny tool calls on the worker, install the `fast-mcp-claude-hook` (see Install above) and add a `PreToolUse` hook to the **worker** project's `.claude/settings.json`. Template is in `.claude/settings.example.json`:
@@ -173,6 +206,8 @@ If the controller doesn't respond within `CRM_DECISION_TIMEOUT` (default 300s), 
 | `write_file(path, content, overwrite?)` | Controller | Write text file |
 | `publish(channel, payload, sender?)` | Either | Broadcast on a channel |
 | `subscribe(channel, after_id, timeout?)` | Either | Long-poll for new channel messages |
+| `announce(identity, summary?, metadata?)` | Any | Heartbeat presence (channel adapter does this) |
+| `who(stale_seconds?)` | Any | List peers present on this server |
 
 All tools return `{"success": bool, ...}` or `{"success": false, "error": {"message": ..., "code": ...}}`.
 
@@ -189,9 +224,9 @@ All tools return `{"success": bool, ...}` or `{"success": false, "error": {"mess
 See [CLAUDE.md](CLAUDE.md) for the deep-dive on module layout, the long-poll notifier pattern, and the permission-relay protocol. Highlights:
 
 - **In-process notifier only**: each peer machine has one server process, so cross-process notification is unnecessary.
-- **Long-poll, not push**: the server does not push events to Claude Code. The model's worker loop must call `wait_for_instruction` repeatedly. The bundled `/worker` slash command sets that up.
-- **MCP idle timeout**: the default `POLL_MAX_WAIT_S` is 25s to stay below Claude Code's MCP idle limit. Tune for your transport.
-- **Future-aligned**: this design intentionally mirrors what Anthropic's [Channels](https://docs.claude.com/en/docs/claude-code/channels) feature is heading toward (push events into a running session, permission relay capability). When Channels stabilizes, a thin facade over this server can register as a channel plugin without changing the storage/tool layer.
+- **Push or poll**: the HTTP server is long-poll (the `/worker` loop calls `wait_for_instruction`), but `fast-mcp-claude-channel` adds true push — it long-polls the server out-of-band and emits `notifications/claude/channel` into the live session, so the model never blocks on a tool call to receive work.
+- **MCP idle timeout**: `POLL_MAX_WAIT_S` defaults to 25s to stay below Claude Code's MCP idle limit on the long-poll path. Channel push sidesteps the limit entirely (the wait happens in the adapter process, not a Claude tool call).
+- **Channels (research preview)**: implemented for prompt delivery (see [Channels: push mode](#channels-push-mode-recommended)). The design mirrors Anthropic's [Channels](https://code.claude.com/docs/en/channels) — the channel adapter is exactly the "thin facade" this section once anticipated. Permission relay over the native `claude/channel/permission` protocol remains future work pending inbound custom-notification support in the Python MCP SDK; the PreToolUse hook covers approvals today.
 
 ## Reference architecture
 

@@ -109,12 +109,39 @@ class Settings(BaseSettings):
     # controller until the 7-day TTL). result + stderr_tail are head/tail truncated
     # to fit this on the ENCODED size.
     launcher_reply_max_bytes: int = 262144  # 256 KB
-    # Passed to claude --setting-sources for each spawned task. Default "" = load NO
-    # settings so the worker runs bare. "project" would let an allowlisted repo's
-    # .claude/settings.json hooks execute arbitrary commands on this machine,
-    # BYPASSING the tools ceiling (hooks are not gated by tool restrictions). Phase 3
-    # will deliberately flip this to arm the approval hook; until then workers run bare.
+    # Passed to claude --setting-sources for each spawned task. KEEP "" FOREVER = load
+    # NO settings so the worker runs bare. "project" would let an allowlisted repo's
+    # .claude/settings.json hooks execute arbitrary commands on this machine, BYPASSING
+    # the tools ceiling (hooks are not gated by tool restrictions). Phase 3 arms the
+    # approval hook via the INDEPENDENT --settings flag (launcher_approval_hook_enabled)
+    # WITHOUT touching this — so repo settings/hooks are never loaded.
     launcher_setting_sources: str = ""
+    # Phase 3 approval bridge: arm a launcher-controlled PreToolUse hook on every spawned
+    # worker via claude's --settings flag (an INLINE JSON object, independent of
+    # --setting-sources which stays ""). The hook relays each gated tool call to the
+    # LOCAL fast-mcp-claude server (request_approval/await_decision); the eca-brain daemon
+    # decides it via Teams. STRICT opt-in (default off): when off, workers spawn ungated
+    # exactly as in Phase 2. The hook command is built from launcher-resolved values only
+    # (never the repo), so an allowlisted repo cannot inject hook commands.
+    launcher_approval_hook_enabled: bool = False
+    # Seconds the worker's hook waits for a controller decision before falling back to a
+    # local "ask" (passed to the hook as CRM_DECISION_TIMEOUT).
+    launcher_approval_decision_timeout_s: float = 300.0
+    # Comma-separated tools the hook lets through WITHOUT a controller round-trip (passed
+    # as CRM_AUTO_PASS_TOOLS). Read-only tools by default so only consequential calls
+    # (Bash/Edit/Write/...) prompt the operator in Teams.
+    launcher_approval_auto_pass_tools: str = "Read,Glob,Grep"
+    # When the approval hook is enabled, prove at startup that a --settings PreToolUse
+    # hook actually FIRES under --setting-sources "" (claude silently ignores a --settings
+    # object that fails validation, which would disarm the gate). On failure the launcher
+    # refuses to arm (fail-closed). Set false only if the self-test proves flaky.
+    launcher_approval_hook_selftest: bool = True
+    # Unix-domain socket the spawned worker's hook talks to for approvals. The launcher
+    # (which holds the mesh bearer) listens here and relays request_approval/await_decision
+    # to the local server on the hook's behalf, so the WORKER never receives any mesh
+    # credential (closing the argv/file leak that would let it self-approve). The path is
+    # NOT a secret. Empty -> defaults to ~/.fast-mcp-claude/launcher-approval.sock.
+    launcher_approval_socket_path: str = ""
     # The claude CLI binary; resolved via shutil.which at startup (hard-fail/idle if
     # missing — a claim we can't run would be lost work).
     launcher_claude_bin: str = "claude"

@@ -485,6 +485,200 @@ def test_build_cmd_always_passes_strict_mcp_config():
     assert "--strict-mcp-config" in L._build_cmd(env, cfg)
 
 
+# ============================================================ approval hook (Phase 3)
+
+
+def test_build_cmd_no_settings_flag_when_hook_disabled():
+    """Default (Phase-2) posture: no approval hook => the argv carries NO --settings flag
+    and --setting-sources stays "" (no repo settings, no hooks)."""
+    cfg = _cfg(approval_hook_enabled=False)
+    env = L.TaskEnvelope(task="x", cwd="/tmp", allowed_tools=["Read"], model=None, timeout_s=60.0)
+    cmd = L._build_cmd(env, cfg)
+    assert "--settings" not in cmd
+    assert _flag_value(cmd, "--setting-sources") == ""
+
+
+def test_build_cmd_no_settings_when_enabled_but_cmd_unresolved():
+    """Fail-safe: enabled but the hook path didn't resolve => NO --settings injected (the
+    _serve guard idles the launcher instead of spawning ungated workers)."""
+    cfg = _cfg(approval_hook_enabled=True, approval_hook_cmd=None)
+    env = L.TaskEnvelope(task="x", cwd="/tmp", allowed_tools=["Bash"], model=None, timeout_s=60.0)
+    assert "--settings" not in L._build_cmd(env, cfg)
+
+
+def test_build_cmd_arms_approval_hook_via_settings_not_setting_sources():
+    """When armed, the hook rides on --settings (additive) while --setting-sources stays ""
+    so a repo's .claude/settings.json is never loaded. The injected PreToolUse command carries
+    the launcher-resolved hook path + the SOCKET PATH (not a secret) — never the mesh bearer."""
+    cfg = _cfg(
+        approval_hook_enabled=True,
+        approval_hook_cmd="/abs/bin/fast-mcp-claude-hook",
+        approval_auto_pass_tools="Read,Glob,Grep",
+        approval_socket_path="/run/eca/launcher-approval.sock",
+        api_key="secret-bearer",
+        local_url="http://127.0.0.1:5499/mcp",
+    )
+    env = L.TaskEnvelope(
+        task="x", cwd="/tmp", allowed_tools=["Bash(uv run*)"], model=None, timeout_s=60.0
+    )
+    cmd = L._build_cmd(env, cfg)
+    # repo settings still NOT loaded
+    assert _flag_value(cmd, "--setting-sources") == ""
+    assert "--strict-mcp-config" in cmd
+    settings = json.loads(_flag_value(cmd, "--settings"))
+    pre = settings["hooks"]["PreToolUse"]
+    assert len(pre) == 1 and pre[0]["matcher"] == "*"
+    command = pre[0]["hooks"][0]["command"]
+    assert command.endswith("/abs/bin/fast-mcp-claude-hook")
+    assert "CRM_HOOK_SOCKET=/run/eca/launcher-approval.sock" in command
+    assert "CRM_AUTO_PASS_TOOLS=Read,Glob,Grep" in command
+    assert "CRM_DECISION_TIMEOUT=300" in command
+
+
+def test_build_cmd_NEVER_puts_mesh_bearer_on_worker_argv():
+    """REGRESSION (review finding #1): the mesh bearer must NEVER appear anywhere in the
+    spawned worker's argv — only the launcher-owned socket path. A worker can read its own
+    argv (same uid), so a leaked bearer would let it self-approve."""
+    cfg = _cfg(
+        approval_hook_enabled=True,
+        approval_hook_cmd="/abs/bin/fast-mcp-claude-hook",
+        approval_socket_path="/run/eca/launcher-approval.sock",
+        api_key="SECRET-MESH-BEARER-9f8e",
+        local_url="http://127.0.0.1:5499/mcp",
+    )
+    env = L.TaskEnvelope(task="x", cwd="/tmp", allowed_tools=["Bash"], model=None, timeout_s=60.0)
+    joined = "\x00".join(L._build_cmd(env, cfg))
+    assert "SECRET-MESH-BEARER-9f8e" not in joined
+    assert "MCP_API_KEY" not in joined
+    assert "CRM_LOCAL_URL" not in joined
+
+
+def test_approval_hook_settings_shell_quotes_tricky_socket_path():
+    """The socket path is shlex-quoted into the hook command so a path with metacharacters
+    can't break out (defense in depth — values are launcher-controlled, not repo)."""
+    cfg = _cfg(
+        approval_hook_enabled=True,
+        approval_hook_cmd="/abs/hook",
+        approval_socket_path="/tmp/a b;rm -rf /.sock",
+    )
+    settings = json.loads(L._approval_hook_settings(cfg))
+    command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "'/tmp/a b;rm -rf /.sock'" in command
+
+
+def test_resolve_config_resolves_hook_path_when_enabled(env, fake_settings, monkeypatch):
+    """_resolve_config resolves fast-mcp-claude-hook ONCE via shutil.which when the hook is
+    enabled."""
+    fake_settings(launcher_approval_hook_enabled=True, mcp_api_key="k", mcp_auth_enabled=True)
+    monkeypatch.setattr(
+        L.shutil, "which", lambda name: "/v/bin/fast-mcp-claude-hook" if "hook" in name else None
+    )
+    cfg = L._resolve_config([])
+    assert cfg.approval_hook_enabled is True
+    assert cfg.approval_hook_cmd == "/v/bin/fast-mcp-claude-hook"
+
+
+def test_resolve_config_hook_cmd_none_when_unresolvable(env, fake_settings, monkeypatch):
+    """If the hook can't be resolved, approval_hook_cmd stays None (the _serve guard then
+    refuses to arm — fail-closed, never spawn ungated workers)."""
+    fake_settings(launcher_approval_hook_enabled=True, mcp_api_key="k", mcp_auth_enabled=True)
+    monkeypatch.setattr(L.shutil, "which", lambda name: None)
+    cfg = L._resolve_config([])
+    assert cfg.approval_hook_enabled is True
+    assert cfg.approval_hook_cmd is None
+
+
+# ---------------------------------------------------------------- approval relay
+
+
+class _FakeReader:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    async def readline(self):
+        return self._data
+
+
+class _FakeWriter:
+    def __init__(self):
+        self.buf = b""
+        self.closed = False
+
+    def write(self, b):
+        self.buf += b
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+async def test_relay_handler_relays_request_and_returns_decision(monkeypatch):
+    captured = {}
+
+    async def fake_relay(cfg, session_id, tool_name, tool_input):
+        captured.update(session_id=session_id, tool_name=tool_name, tool_input=tool_input)
+        return "allow", "approved by jeremy"
+
+    monkeypatch.setattr(L, "_relay_decision", fake_relay)
+    cfg = _cfg(approval_hook_enabled=True, approval_socket_path="/tmp/x.sock", api_key="k")
+    req = json.dumps({"session_id": "s9", "tool_name": "Bash", "tool_input": {"command": "echo"}})
+    writer = _FakeWriter()
+    await L._handle_relay_conn(_FakeReader(req.encode() + b"\n"), writer, cfg, asyncio.Semaphore(2))
+    assert captured == {"session_id": "s9", "tool_name": "Bash", "tool_input": {"command": "echo"}}
+    assert json.loads(writer.buf.decode()) == {"decision": "allow", "reason": "approved by jeremy"}
+    assert writer.closed is True
+
+
+async def test_relay_handler_falls_back_to_ask_on_error(monkeypatch):
+    async def boom(*a, **k):
+        raise RuntimeError("mesh down")
+
+    monkeypatch.setattr(L, "_relay_decision", boom)
+    cfg = _cfg(approval_hook_enabled=True, approval_socket_path="/tmp/x.sock", api_key="k")
+    req = json.dumps({"session_id": "s", "tool_name": "Bash", "tool_input": {}})
+    writer = _FakeWriter()
+    await L._handle_relay_conn(_FakeReader(req.encode() + b"\n"), writer, cfg, asyncio.Semaphore(2))
+    resp = json.loads(writer.buf.decode())
+    assert resp["decision"] == "ask"
+    assert "mesh down" in resp["reason"]
+
+
+async def test_relay_socket_roundtrip_hook_to_launcher(monkeypatch):
+    """End-to-end over a REAL unix socket: the worker hook (_relay_via_socket) talks to the
+    launcher relay server, which relays a stubbed decision back. Exercises the actual socket
+    plumbing of the security-critical path (worker gets no credential, only this socket)."""
+    from fast_mcp_claude import hook as H
+
+    # Short /tmp path: a unix socket path must stay under the platform cap (~104 on macOS),
+    # which pytest's tmp_path exceeds.
+    sock = f"/tmp/eca_relay_rt_{os.getpid()}.sock"
+
+    async def fake_relay(cfg, session_id, tool_name, tool_input):
+        assert (session_id, tool_name) == ("s1", "Bash")
+        return ("deny", "nope from operator")
+
+    monkeypatch.setattr(L, "_relay_decision", fake_relay)
+    cfg = _cfg(approval_hook_enabled=True, approval_socket_path=sock, api_key="k", max_concurrent=2)
+    stop = asyncio.Event()
+    server_task = asyncio.create_task(_approval_relay_server_with_sem(cfg, stop))
+    try:
+        async with asyncio.timeout(3):
+            while not os.path.exists(sock):
+                await asyncio.sleep(0.01)
+        decision, reason = await H._relay_via_socket(sock, "s1", "Bash", {"command": "echo"}, 5.0)
+        assert decision == "deny"
+        assert reason == "nope from operator"
+    finally:
+        stop.set()
+        await server_task
+
+
+async def _approval_relay_server_with_sem(cfg, stop):
+    await L._approval_relay_server(cfg, stop, asyncio.Semaphore(cfg.max_concurrent))
+
+
 # ================================================================ scrubbed env
 
 

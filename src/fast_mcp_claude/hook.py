@@ -10,14 +10,19 @@ Wiring:
      allow/deny/ask.
 
 Env vars consumed:
-    CRM_LOCAL_URL        local server URL (default http://127.0.0.1:5473/mcp)
-    MCP_API_KEY          bearer token for the local server (REQUIRED if set on server)
+    CRM_HOOK_SOCKET      preferred: path to the launcher's approval relay unix socket. When
+                         set, the hook asks the LAUNCHER (which holds the bearer) for a
+                         decision and never touches a mesh credential itself (so a worker
+                         that reads its own argv cannot self-approve).
+    CRM_LOCAL_URL        fallback (no socket): local server URL (default http://127.0.0.1:5473/mcp)
+    MCP_API_KEY          fallback (no socket): bearer for the local server
     CRM_DECISION_TIMEOUT total seconds to wait for a controller decision (default 300)
     CRM_AUTO_PASS_TOOLS  comma-separated tool names to skip relay for (e.g. "Read,Glob")
     CRM_HOOK_DEBUG       if "1", write debug info to stderr
 
 Failure mode: any error (server down, timeout) falls through to permissionDecision="ask",
-so Claude Code's normal permission UI takes over — never silently deny or allow.
+so Claude Code's normal permission UI / the --tools ceiling takes over — never silently
+deny or allow.
 """
 
 import asyncio
@@ -69,27 +74,67 @@ def main() -> None:
         t.strip() for t in os.environ.get("CRM_AUTO_PASS_TOOLS", "").split(",") if t.strip()
     }
     if tool_name in auto_pass:
+        # ALLOW (not "ask"): auto-pass means "let this read-only tool run without a
+        # controller round-trip". Emitting "ask" here would BLOCK it in headless mode.
         _debug(f"auto-pass: {tool_name}")
-        _emit("ask", f"crm relay skipped for {tool_name} (auto-pass)")
+        _emit("allow", f"crm relay skipped for {tool_name} (auto-pass)")
         return
 
-    url = os.environ.get("CRM_LOCAL_URL", "http://127.0.0.1:5473/mcp")
-    api_key = os.environ.get("MCP_API_KEY")
     try:
         total_timeout = float(os.environ.get("CRM_DECISION_TIMEOUT", "300"))
     except ValueError:
         total_timeout = 300.0
 
+    sock = os.environ.get("CRM_HOOK_SOCKET")
     try:
-        decision, reason = asyncio.run(
-            _relay(url, api_key, session_id, tool_name, tool_input, total_timeout)
-        )
+        if sock:
+            decision, reason = asyncio.run(
+                _relay_via_socket(sock, session_id, tool_name, tool_input, total_timeout)
+            )
+        else:
+            url = os.environ.get("CRM_LOCAL_URL", "http://127.0.0.1:5473/mcp")
+            api_key = os.environ.get("MCP_API_KEY")
+            decision, reason = asyncio.run(
+                _relay(url, api_key, session_id, tool_name, tool_input, total_timeout)
+            )
     except Exception as e:
         _debug(f"relay error: {e}\n{traceback.format_exc()}")
         _fallback_ask(str(e))
         return
 
     _emit(decision, reason)
+
+
+async def _relay_via_socket(
+    sock_path: str,
+    session_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    total_timeout: float,
+) -> tuple[str, str]:
+    """Ask the launcher (over its unix socket) for a decision; the launcher holds the bearer
+    and runs request_approval/await_decision, so this hook never sees a mesh credential."""
+    reader, writer = await asyncio.open_unix_connection(sock_path)
+    try:
+        payload = json.dumps(
+            {"session_id": session_id, "tool_name": tool_name, "tool_input": tool_input}
+        )
+        writer.write((payload + "\n").encode("utf-8"))
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=total_timeout + 30.0)
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    if not line:
+        return ("ask", "launcher relay closed without a decision")
+    resp = json.loads(line.decode("utf-8"))
+    decision = resp.get("decision") or "ask"
+    if decision not in ("allow", "deny", "ask"):
+        decision = "ask"
+    reason = (resp.get("reason") or "").strip()
+    return (decision, reason or f"relay: {decision}")
 
 
 async def _relay(

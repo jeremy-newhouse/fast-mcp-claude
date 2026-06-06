@@ -49,9 +49,11 @@ import argparse
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import signal
 import sys
+import tempfile
 import time
 import traceback
 from dataclasses import dataclass
@@ -108,6 +110,18 @@ class LauncherConfig:
     # a missing-Settings boot does not accidentally pass the guard.
     mcp_auth_enabled: bool
     mcp_api_key_present: bool
+    # Phase 3 approval hook (defaulted so existing constructions stay valid). When armed,
+    # _build_cmd injects a launcher-controlled --settings PreToolUse hook. approval_hook_cmd
+    # is the absolute path to fast-mcp-claude-hook resolved ONCE at startup (None => the
+    # hook is left disabled rather than injecting a broken command).
+    approval_hook_enabled: bool = False
+    approval_hook_cmd: str | None = None
+    approval_decision_timeout_s: float = 300.0
+    approval_auto_pass_tools: str = "Read,Glob,Grep"
+    approval_hook_selftest: bool = True
+    # Unix socket the worker hook talks to; the launcher relays approvals over it so the
+    # worker never gets the mesh bearer. Path only (not a secret) appears in the worker argv.
+    approval_socket_path: str = ""
 
 
 def _env_float(name: str, default: float) -> float:
@@ -165,6 +179,11 @@ def _resolve_config(argv: list[str]) -> LauncherConfig:
     task_timeout_s = 900.0
     reply_max_bytes = 262144
     setting_sources = ""
+    approval_hook_enabled = False
+    approval_decision_timeout_s = 300.0
+    approval_auto_pass_tools = "Read,Glob,Grep"
+    approval_hook_selftest = True
+    approval_socket_path = ""
     # Safe defaults for the auth guard: assume auth-ON so a missing-Settings boot does
     # NOT accidentally pass the unauthenticated-mesh guard and arm.
     mcp_auth_enabled = True
@@ -185,6 +204,11 @@ def _resolve_config(argv: list[str]) -> LauncherConfig:
         task_timeout_s = float(s.launcher_task_timeout_s)
         reply_max_bytes = int(s.launcher_reply_max_bytes)
         setting_sources = s.launcher_setting_sources
+        approval_hook_enabled = bool(s.launcher_approval_hook_enabled)
+        approval_decision_timeout_s = float(s.launcher_approval_decision_timeout_s)
+        approval_auto_pass_tools = s.launcher_approval_auto_pass_tools
+        approval_hook_selftest = bool(s.launcher_approval_hook_selftest)
+        approval_socket_path = s.launcher_approval_socket_path
         mcp_auth_enabled = bool(s.mcp_auth_enabled)
     except Exception as e:  # bad/missing .env shouldn't crash the launcher boot
         _log(f"settings unavailable, using bare defaults: {e}")
@@ -204,6 +228,23 @@ def _resolve_config(argv: list[str]) -> LauncherConfig:
         if args.enabled is not None
         else _env_bool("LAUNCHER_ENABLED", launcher_enabled)
     )
+    # Resolve the approval-hook entry point ONCE, here at startup, from the launcher's
+    # OWN PATH (never the repo). None when enabled => _serve refuses to arm (fail-closed):
+    # we never silently spawn UNGATED workers when the operator asked for the gate.
+    approval_hook_cmd: str | None = None
+    if approval_hook_enabled:
+        approval_hook_cmd = shutil.which("fast-mcp-claude-hook")
+        if approval_hook_cmd is None:
+            _log(
+                "APPROVAL HOOK ENABLED but 'fast-mcp-claude-hook' is not on PATH; the "
+                "launcher will REFUSE TO ARM (fail-closed) rather than spawn ungated "
+                "workers. Install the package / fix PATH, then restart."
+            )
+    approval_socket_path = (
+        os.environ.get("CRM_APPROVAL_SOCKET")
+        or approval_socket_path
+        or os.path.expanduser("~/.fast-mcp-claude/launcher-approval.sock")
+    )
     return LauncherConfig(
         identity=identity,
         local_url=local_url,
@@ -220,6 +261,12 @@ def _resolve_config(argv: list[str]) -> LauncherConfig:
         setting_sources=setting_sources,
         mcp_auth_enabled=mcp_auth_enabled,
         mcp_api_key_present=bool(api_key),
+        approval_hook_enabled=approval_hook_enabled,
+        approval_hook_cmd=approval_hook_cmd,
+        approval_decision_timeout_s=approval_decision_timeout_s,
+        approval_auto_pass_tools=approval_auto_pass_tools,
+        approval_hook_selftest=approval_hook_selftest,
+        approval_socket_path=approval_socket_path,
     )
 
 
@@ -565,6 +612,37 @@ def _base_tool_names(grants: list[str]) -> list[str]:
     return out
 
 
+def _approval_hook_settings(cfg: LauncherConfig) -> str:
+    """Build the --settings JSON that arms the launcher-controlled PreToolUse approval hook.
+
+    SECURITY: the hook command carries NO mesh credential — only the launcher-owned approval
+    SOCKET PATH (not a secret). The worker's hook talks to that socket; the LAUNCHER (which
+    holds the bearer) relays request_approval/await_decision to the mesh. So even though the
+    worker can read its own argv (same uid), it never obtains a credential it could use to
+    self-approve or spoof the mesh. The hook path comes from shutil.which (launcher-resolved),
+    the socket path is launcher-controlled — the repo at env.cwd has ZERO influence (this rides
+    on --settings, NOT --setting-sources which stays "", so repo .claude/settings.json never
+    loads). matcher "*" gates every tool; CRM_AUTO_PASS_TOOLS lets read-only ones skip the relay.
+    Always json.dumps (never hand-format): claude SILENTLY IGNORES a --settings object that fails
+    validation, which would disarm the gate.
+    """
+    hook_cmd = (
+        f"CRM_HOOK_SOCKET={shlex.quote(cfg.approval_socket_path)} "
+        f"CRM_DECISION_TIMEOUT={cfg.approval_decision_timeout_s:g} "
+        f"CRM_AUTO_PASS_TOOLS={shlex.quote(cfg.approval_auto_pass_tools)} "
+        f"{shlex.quote(cfg.approval_hook_cmd or '')}"
+    )
+    return json.dumps(
+        {
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "*", "hooks": [{"type": "command", "command": hook_cmd}]}
+                ]
+            }
+        }
+    )
+
+
 def _build_cmd(env: TaskEnvelope, cfg: LauncherConfig) -> list[str]:
     cmd = [
         cfg.claude_bin,
@@ -590,6 +668,10 @@ def _build_cmd(env: TaskEnvelope, cfg: LauncherConfig) -> list[str]:
         cmd += ["--allowedTools", ",".join(env.allowed_tools)]
     if env.model:
         cmd += ["--model", env.model]
+    if cfg.approval_hook_enabled and cfg.approval_hook_cmd:
+        # Arm the launcher-controlled approval hook via the INDEPENDENT --settings flag
+        # (additive to --setting-sources "", which stays empty so NO repo hooks load).
+        cmd += ["--settings", _approval_hook_settings(cfg)]
     return cmd
 
 
@@ -1038,6 +1120,204 @@ async def _preflight(cfg: LauncherConfig) -> Preflight:
     return Preflight(ok=True, bin_path=bin_path, version=version)
 
 
+async def _selftest_approval_hook(cfg: LauncherConfig, bin_path: str) -> bool:
+    """Prove a --settings PreToolUse hook FIRES under --setting-sources "" before arming.
+
+    Spawns a THROWAWAY `claude -p` whose hook touches a marker file and DENIES the tool;
+    if the marker appears, --settings hooks execute and the gate is real. claude silently
+    ignores a --settings object that fails validation (green exit, NO hook), so this is the
+    only way to catch a disarmed gate. The hook DENIES, so the forced `echo` never runs (no
+    side effects). Two attempts (the model must actually call the tool); returns True iff the
+    hook fired. The caller idles (fail-closed) on False.
+    """
+    deny = json.dumps(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "launcher self-test",
+            }
+        }
+    )
+    for attempt in (1, 2):
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                marker = Path(td) / "fired"
+                hook = Path(td) / "selftest_hook.sh"
+                hook.write_text(
+                    "#!/bin/sh\n"
+                    f"touch {shlex.quote(str(marker))}\n"
+                    f"printf '%s' {shlex.quote(deny)}\n"
+                )
+                hook.chmod(0o700)
+                settings = json.dumps(
+                    {
+                        "hooks": {
+                            "PreToolUse": [
+                                {
+                                    "matcher": "*",
+                                    "hooks": [{"type": "command", "command": str(hook)}],
+                                }
+                            ]
+                        }
+                    }
+                )
+                cmd = [
+                    bin_path,
+                    "-p",
+                    "Use the Bash tool to run exactly this command: echo CRM_SELFTEST",
+                    "--output-format",
+                    "json",
+                    "--setting-sources",
+                    "",
+                    "--strict-mcp-config",
+                    "--tools",
+                    "Bash",
+                    "--allowedTools",
+                    "Bash",
+                    "--settings",
+                    settings,
+                ]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=td,
+                    env=_scrubbed_env(),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    await asyncio.wait_for(proc.communicate(), timeout=90.0)
+                except asyncio.TimeoutError:
+                    _log(f"approval-hook self-test attempt {attempt} timed out; killing")
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await _drain(proc)
+                if marker.exists():
+                    return True
+                _log(f"approval-hook self-test attempt {attempt}: hook did NOT fire")
+        except Exception as e:
+            _log(f"approval-hook self-test attempt {attempt} errored: {e}")
+    return False
+
+
+# ---------------------------------------------------------------- approval relay
+
+
+async def _relay_decision(
+    cfg: LauncherConfig, session_id: str, tool_name: str, tool_input: dict[str, Any]
+) -> tuple[str, str]:
+    """Run the request_approval -> await_decision loop on the mesh with the LAUNCHER's bearer.
+
+    This is the worker hook's old job, moved here so the bearer never leaves the trusted
+    launcher process. Returns (decision, reason); on any error falls through to "ask" so the
+    worker defers to its --tools ceiling rather than silently allowing/denying.
+    """
+    from fastmcp import Client
+
+    client_kwargs: dict[str, Any] = {}
+    if cfg.api_key:
+        client_kwargs["auth"] = cfg.api_key
+    total = cfg.approval_decision_timeout_s
+    async with Client(cfg.local_url, **client_kwargs) as c:
+        req = await c.call_tool(
+            "request_approval",
+            {"session_id": session_id, "tool_name": tool_name, "tool_input": tool_input},
+        )
+        data = _result_data(req)
+        if not data.get("success"):
+            msg = (data.get("error") or {}).get("message", "request_approval failed")
+            return "ask", f"crm: {msg}"
+        approval_id = data["approval_id"]
+        elapsed = 0.0
+        while elapsed < total:
+            chunk = min(25.0, total - elapsed)
+            res = await c.call_tool(
+                "await_decision", {"approval_id": approval_id, "timeout": chunk}
+            )
+            rdata = _result_data(res)
+            if not rdata.get("success"):
+                msg = (rdata.get("error") or {}).get("message", "await_decision failed")
+                return "ask", f"crm: {msg}"
+            if rdata.get("ready"):
+                approval = rdata["approval"]
+                decision = approval.get("decision") or "ask"
+                reason = (approval.get("reason") or "").strip()
+                if decision not in ("allow", "deny"):
+                    decision = "ask"
+                return decision, reason or f"controller decided: {decision}"
+            elapsed += chunk
+    return "ask", f"controller did not decide within {total:.0f}s"
+
+
+async def _handle_relay_conn(
+    reader: Any, writer: Any, cfg: LauncherConfig, sem: "asyncio.Semaphore"
+) -> None:
+    """One worker-hook connection: read the request, relay to the mesh, write the decision.
+
+    The socket exposes ONLY this request/await capability (never approve_tool/reply), so a
+    same-uid worker connecting directly can at most ask for approvals it can't grant. A
+    semaphore (sized to max_concurrent, BEFORE we create any approval row) caps a malicious or
+    buggy worker to the same ceiling that bounds every other worker-initiated mesh action, so
+    it can't flood the local approval table or the operator's Teams DMs. Honest workers run
+    PreToolUse synchronously (one in-flight hook each), so the cap is transparent to them."""
+    async with sem:
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=15.0)
+            req = json.loads(line.decode("utf-8"))
+            session_id = str(req.get("session_id") or "default")[:128]
+            tool_name = str(req.get("tool_name") or "")
+            tool_input = req.get("tool_input")
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+            decision, reason = await _relay_decision(cfg, session_id, tool_name, tool_input)
+        except Exception as e:
+            decision, reason = "ask", f"launcher relay error: {e}"
+        try:
+            writer.write((json.dumps({"decision": decision, "reason": reason}) + "\n").encode())
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+
+async def _approval_relay_server(
+    cfg: LauncherConfig, stop: "asyncio.Event", sem: "asyncio.Semaphore"
+) -> None:
+    """Listen on the launcher-owned unix socket and relay worker-hook approvals until stop."""
+    sock_path = cfg.approval_socket_path
+    Path(sock_path).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.unlink(sock_path)  # clear a stale socket from a prior run
+    except FileNotFoundError:
+        pass
+    server = await asyncio.start_unix_server(
+        lambda r, w: _handle_relay_conn(r, w, cfg, sem), path=sock_path
+    )
+    try:
+        os.chmod(sock_path, 0o600)
+    except OSError:
+        pass
+    _log(f"approval relay listening on {sock_path}")
+    try:
+        await stop.wait()
+    finally:
+        server.close()
+        try:
+            await server.wait_closed()
+        except Exception:
+            pass
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+
+
 # ----------------------------------------------------------------- serve / main
 
 
@@ -1083,6 +1363,31 @@ async def _serve(cfg: LauncherConfig) -> None:
         )
         return
 
+    # APPROVAL-GATE GUARD (Phase 3, fail-closed): if the operator armed the approval hook
+    # but we couldn't resolve fast-mcp-claude-hook, refuse to arm rather than spawn UNGATED
+    # workers under a falsely-believed gate.
+    if cfg.approval_hook_enabled and not cfg.approval_hook_cmd:
+        await _idle_forever(
+            "LAUNCHER REFUSING TO ARM: approval hook enabled but 'fast-mcp-claude-hook' "
+            "is not resolvable on PATH; refusing to spawn UNGATED workers. Fix PATH/install, "
+            "then restart."
+        )
+        return
+    # And prove the --settings PreToolUse hook actually FIRES before trusting it (claude
+    # silently ignores a --settings object that fails validation — a green exit with NO
+    # gate). Fail-closed: idle if it can't be proven.
+    if cfg.approval_hook_enabled and cfg.approval_hook_selftest:
+        if not await _selftest_approval_hook(cfg, pf.bin_path or cfg.claude_bin):
+            await _idle_forever(
+                "LAUNCHER REFUSING TO ARM: approval-hook self-test FAILED (a --settings "
+                'PreToolUse hook did not fire under --setting-sources ""). The approval gate '
+                "cannot be proven, so workers are NOT spawned. Check the claude CLI version / "
+                "--settings handling, or set LAUNCHER_APPROVAL_HOOK_SELFTEST=false to bypass, "
+                "then restart."
+            )
+            return
+        _log("approval-hook self-test PASSED: --settings PreToolUse gate is armed")
+
     _log(
         f"starting launcher (identity={cfg.identity!r}, local={cfg.local_url}, "
         f"claude={pf.bin_path} version={pf.version!r}, max_concurrent={cfg.max_concurrent}, "
@@ -1090,9 +1395,14 @@ async def _serve(cfg: LauncherConfig) -> None:
     )
 
     loop = asyncio.get_running_loop()
-    bridge_task = asyncio.create_task(_bridge(cfg))
-
     stop = asyncio.Event()
+    bridge_task = asyncio.create_task(_bridge(cfg))
+    # Approval relay: the launcher (holding the bearer) serves the worker-hook socket so the
+    # worker never receives a mesh credential it could use to self-approve.
+    relay_task: asyncio.Task | None = None
+    if cfg.approval_hook_enabled:
+        relay_sem = asyncio.Semaphore(cfg.max_concurrent)
+        relay_task = asyncio.create_task(_approval_relay_server(cfg, stop, relay_sem))
 
     def _request_stop() -> None:
         stop.set()
@@ -1107,10 +1417,15 @@ async def _serve(cfg: LauncherConfig) -> None:
         await stop.wait()
     finally:
         bridge_task.cancel()
-        try:
-            await bridge_task
-        except asyncio.CancelledError:
-            pass
+        if relay_task is not None:
+            relay_task.cancel()
+        for t in (bridge_task, relay_task):
+            if t is None:
+                continue
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
 
 def main() -> None:

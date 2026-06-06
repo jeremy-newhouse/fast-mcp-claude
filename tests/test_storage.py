@@ -158,3 +158,16 @@ async def test_double_decision_rejected(store: Store):
     aid = await store.create_approval(session_id="s", tool_name="X", tool_input={})
     assert await store.decide_approval(aid, DECISION_ALLOW, None) is True
     assert await store.decide_approval(aid, DECISION_DENY, None) is False
+
+
+@pytest.mark.asyncio
+async def test_list_messages_filters_by_recipient_session(store: Store):
+    """The live-session sidecar relies on this exact, index-backed per-identity filter
+    so a busy hub can't push its messages out of the newest-N window (notify-loss)."""
+    await store.enqueue_message(sender="brain", prompt="for A", recipient_session="mini2.a")
+    await store.enqueue_message(sender="brain", prompt="for B", recipient_session="mini2.b")
+    await store.enqueue_message(sender="brain", prompt="broadcast", recipient_session=None)
+    only_a = await store.list_messages(status="queued", recipient_session="mini2.a")
+    assert [m["prompt"] for m in only_a] == ["for A"]
+    # unfiltered still returns the whole queue (backward compatible)
+    assert len(await store.list_messages(status="queued")) == 3

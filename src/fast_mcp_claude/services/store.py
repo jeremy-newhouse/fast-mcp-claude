@@ -340,17 +340,25 @@ class Store:
         self,
         status: str | None = None,
         limit: int = 50,
+        recipient_session: str | None = None,
     ) -> list[dict[str, Any]]:
+        # Optional recipient_session filter is index-backed alongside status
+        # (idx_messages on recipient_session, status, created_at) so a per-session
+        # inbox query stays exact even when the global queue exceeds the limit window.
+        clauses: list[str] = []
+        params: list[Any] = []
         if status:
-            cur = await self.db.execute(
-                "SELECT * FROM messages WHERE status=? ORDER BY created_at DESC LIMIT ?",
-                (status, limit),
-            )
-        else:
-            cur = await self.db.execute(
-                "SELECT * FROM messages ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            )
+            clauses.append("status=?")
+            params.append(status)
+        if recipient_session is not None:
+            clauses.append("recipient_session=?")
+            params.append(recipient_session)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        cur = await self.db.execute(
+            f"SELECT * FROM messages{where} ORDER BY created_at DESC LIMIT ?",
+            tuple(params),
+        )
         rows = await cur.fetchall()
         await cur.close()
         return [_row_to_message(r) for r in rows]

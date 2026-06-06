@@ -24,6 +24,8 @@ fast-mcp-claude = "fast_mcp_claude.__main__:main"
 fast-mcp-claude-hook = "fast_mcp_claude.hook:main"
 fast-mcp-claude-channel = "fast_mcp_claude.channel:main"
 fast-mcp-claude-launcher = "fast_mcp_claude.launcher:main"
+fast-mcp-claude-session = "fast_mcp_claude.session:main"
+fast-mcp-claude-session-hook = "fast_mcp_claude.session_hook:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -85,6 +85,28 @@ class Settings(BaseSettings):
     # One-line presence blurb the adapter heartbeats via announce().
     channel_summary: str | None = None
 
+    # Live-session sidecar (fast-mcp-claude-session) — STRICT opt-in, default off. The
+    # launch wrapper starts ONE per interactive dev session. It is the SOLE announcer of
+    # that session's presence (role="live-session"), heartbeating announce() with a status
+    # summary it reads from a local status file the CC hooks write — routing hook status
+    # through the single announcer avoids the announce() upsert clobber (announce overwrites
+    # summary AND metadata wholesale; two announcers on one identity would erase each other).
+    # It also watches the LOCAL inbox for queued messages addressed to this session and
+    # surfaces each as a macOS notification + statusline badge WITHOUT claiming it (notify+
+    # pull: the operator's /fleet-inbox pull claims + replies). It NEVER pushes into the
+    # session (Claude Code 2.1.x dropped the dev-channel push path) and NEVER spawns anything.
+    # Identity is "{peer_name}.{repo}" (a live session), distinct from "{peer_name}_launcher".
+    session_enabled: bool = False
+    # JSON status file the session hooks write and the sidecar reads (the wrapper sets it
+    # explicitly; empty -> ~/.fast-mcp-claude/sessions/<identity>.json).
+    session_status_file: str = ""
+    # Fire a macOS notification (osascript) when a new inbox message arrives for this session.
+    session_notify: bool = True
+    # Inbox poll + presence heartbeat cadence (seconds). Heartbeat stays under who()'s
+    # default stale window (poll_heartbeat_s*3) so a live session shows as fresh.
+    session_poll_s: int = 10
+    session_heartbeat_s: int = 15
+
     # Launcher sidecar (fast-mcp-claude-launcher) — STRICT opt-in, default off so a
     # configured-but-unintended sidecar stays inert and never claims a task it can't
     # run. Identity is f"{peer_name}_launcher". When armed it long-polls the LOCAL

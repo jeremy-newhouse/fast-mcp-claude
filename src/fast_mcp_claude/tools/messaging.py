@@ -211,12 +211,20 @@ async def list_messages(
         Field(description="Filter: queued, delivered, replied, cancelled, expired"),
     ] = None,
     limit: Annotated[int, Field(description="Max rows (1-200)")] = 50,
+    recipient_session: Annotated[
+        str | None,
+        Field(description="Filter to messages addressed to this session identity (mailbox)"),
+    ] = None,
 ) -> dict[str, Any]:
     try:
         if status and status not in {"queued", "delivered", "replied", "cancelled", "expired"}:
             raise ValidationError(f"unknown status: {status}", field="status")
+        if recipient_session is not None:
+            recipient_session = validate_session_id(recipient_session, field="recipient_session")
         limit = max(1, min(int(limit), 200))
-        rows = await store.list_messages(status=status, limit=limit)
+        rows = await store.list_messages(
+            status=status, limit=limit, recipient_session=recipient_session
+        )
         return {"success": True, "messages": rows, "count": len(rows)}
     except ValidationError as e:
         return format_error_response(e)

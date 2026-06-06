@@ -228,18 +228,25 @@ async def _push(write_stream: Any, msg: dict[str, Any]) -> None:
 async def _bridge(write_stream: Any, cfg: ChannelConfig) -> None:
     """Connect to the local server and pump inbox -> channel until cancelled."""
     from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
 
     await asyncio.sleep(INIT_GRACE_S)
 
-    client_kwargs: dict[str, Any] = {}
-    if cfg.api_key:
-        client_kwargs["headers"] = {"Authorization": f"Bearer {cfg.api_key}"}
+    def _make_client() -> Client:
+        # fastmcp 3.x: Client() no longer takes a `headers=` kwarg; the bearer rides
+        # on the transport (mirrors eca-brain fleet.py + launcher.py).
+        if cfg.api_key:
+            transport = StreamableHttpTransport(
+                cfg.local_url, headers={"Authorization": f"Bearer {cfg.api_key}"}
+            )
+            return Client(transport)
+        return Client(cfg.local_url)
 
     backoff = 1.0
     last_announce = 0.0
     while True:
         try:
-            async with Client(cfg.local_url, **client_kwargs) as c:
+            async with _make_client() as c:
                 backoff = 1.0
                 _log(f"connected to {cfg.local_url} as identity={cfg.identity!r}")
                 while True:

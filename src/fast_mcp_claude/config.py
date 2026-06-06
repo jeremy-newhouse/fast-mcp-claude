@@ -85,6 +85,40 @@ class Settings(BaseSettings):
     # One-line presence blurb the adapter heartbeats via announce().
     channel_summary: str | None = None
 
+    # Launcher sidecar (fast-mcp-claude-launcher) — STRICT opt-in, default off so a
+    # configured-but-unintended sidecar stays inert and never claims a task it can't
+    # run. Identity is f"{peer_name}_launcher". When armed it long-polls the LOCAL
+    # server's inbox for headless `claude -p` tasks and spawns them in an allowlisted
+    # cwd with a tools ceiling. See launcher.py.
+    launcher_enabled: bool = False
+    # Colon-separated allowlist of directory roots a task's cwd may resolve under
+    # (same syntax as workspace_roots / $PATH). Default "" = nothing allowed, so
+    # every task is rejected until an operator opts cwds in.
+    launcher_cwd_allowlist: str = ""
+    # Comma-separated tool-spec ceiling passed to claude --allowedTools. A task's
+    # allowed_tools must be a subset; an omitted allowed_tools uses this whole set.
+    # Default "" = no tools auto-approved.
+    launcher_tools_ceiling: str = ""
+    # Max tasks to spawn concurrently (concurrency slot acquired BEFORE each claim).
+    launcher_max_concurrent: int = 2
+    # Hard wall-clock cap per task in seconds; also the default when the envelope
+    # omits timeout_s. An envelope timeout_s above this is clamped down.
+    launcher_task_timeout_s: float = 900.0
+    # Byte budget for the JSON-encoded reply. Far below the server's 4 MB
+    # validate_response cap so a reply is never rejected (which would hang the
+    # controller until the 7-day TTL). result + stderr_tail are head/tail truncated
+    # to fit this on the ENCODED size.
+    launcher_reply_max_bytes: int = 262144  # 256 KB
+    # Passed to claude --setting-sources for each spawned task. Default "" = load NO
+    # settings so the worker runs bare. "project" would let an allowlisted repo's
+    # .claude/settings.json hooks execute arbitrary commands on this machine,
+    # BYPASSING the tools ceiling (hooks are not gated by tool restrictions). Phase 3
+    # will deliberately flip this to arm the approval hook; until then workers run bare.
+    launcher_setting_sources: str = ""
+    # The claude CLI binary; resolved via shutil.which at startup (hard-fail/idle if
+    # missing — a claim we can't run would be lost work).
+    launcher_claude_bin: str = "claude"
+
     # Logging
     log_level: str = "INFO"
     log_format: str = "console"
@@ -106,6 +140,21 @@ class Settings(BaseSettings):
             return []
         out: list[Path] = []
         for part in self.workspace_roots.split(":"):
+            part = part.strip()
+            if not part:
+                continue
+            p = Path(os.path.expanduser(part)).resolve()
+            out.append(p)
+        return out
+
+    @property
+    def launcher_cwd_allowlist_resolved(self) -> list[Path]:
+        """Parse LAUNCHER_CWD_ALLOWLIST into resolved Path objects (mirrors
+        workspace_roots_resolved: colon-split, expanduser, resolve/follow-symlinks)."""
+        if not self.launcher_cwd_allowlist.strip():
+            return []
+        out: list[Path] = []
+        for part in self.launcher_cwd_allowlist.split(":"):
             part = part.strip()
             if not part:
                 continue

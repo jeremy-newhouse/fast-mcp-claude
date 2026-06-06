@@ -160,7 +160,13 @@ class Store:
 
     async def initialize(self) -> None:
         path = self.settings.db_full_path
-        self._db = await aiosqlite.connect(str(path))
+        # isolation_level=None (autocommit): every method here is a single-
+        # statement write (no method opens an explicit transaction — see
+        # pop_next_for_worker for why claim-uniqueness rides on _db_lock instead).
+        # In autocommit each write applies immediately, so on this single shared
+        # connection there is never an open transaction for a concurrent commit()
+        # to interfere with. The remaining db.commit() calls are harmless no-ops.
+        self._db = await aiosqlite.connect(str(path), isolation_level=None)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
@@ -224,41 +230,48 @@ class Store:
         A NULL recipient_session message is delivered to ANY worker (broadcast).
         A worker calling with session="foo" gets either messages addressed to
         "foo" OR unaddressed (NULL) ones.
+
+        Atomicity note: claim-uniqueness (no two workers grab the same row) is
+        provided by `_db_lock` — the single-process mutex this class already
+        relies on for record_reply/cancel/cleanup. We deliberately do NOT wrap
+        the SELECT+UPDATE in an explicit BEGIN IMMEDIATE/ROLLBACK. This is a
+        single shared aiosqlite connection: `commit()` is global, so a concurrent
+        commit() from an UNLOCKED writer (announce/enqueue/publish/...) would
+        commit this method's open transaction out from under it, making the
+        empty-path ROLLBACK misfire with "cannot rollback - no transaction is
+        active" (the exact failure the launcher hit polling an empty inbox while
+        heartbeating announce). In autocommit mode (isolation_level=None) each
+        statement below applies immediately; no statement here opens a
+        transaction, so nothing can misfire and no stray commit() can corrupt it.
         """
         async with self._db_lock:
-            await self.db.execute("BEGIN IMMEDIATE")
-            try:
-                if recipient_session is None:
-                    cur = await self.db.execute(
-                        "SELECT * FROM messages WHERE status=? AND recipient_session IS NULL "
-                        "ORDER BY created_at ASC LIMIT 1",
-                        (STATUS_QUEUED,),
-                    )
-                else:
-                    cur = await self.db.execute(
-                        "SELECT * FROM messages WHERE status=? AND "
-                        "(recipient_session=? OR recipient_session IS NULL) "
-                        "ORDER BY created_at ASC LIMIT 1",
-                        (STATUS_QUEUED, recipient_session),
-                    )
-                row = await cur.fetchone()
-                await cur.close()
-                if row is None:
-                    await self.db.execute("ROLLBACK")
-                    return None
-
-                now = time.time()
-                await self.db.execute(
-                    "UPDATE messages SET status=?, delivered_at=? WHERE id=?",
-                    (STATUS_DELIVERED, now, row["id"]),
+            if recipient_session is None:
+                cur = await self.db.execute(
+                    "SELECT * FROM messages WHERE status=? AND recipient_session IS NULL "
+                    "ORDER BY created_at ASC LIMIT 1",
+                    (STATUS_QUEUED,),
                 )
-                await self.db.commit()
-                msg = _row_to_message(row, delivered_at=now)
-                msg["status"] = STATUS_DELIVERED
-                return msg
-            except Exception:
-                await self.db.execute("ROLLBACK")
-                raise
+            else:
+                cur = await self.db.execute(
+                    "SELECT * FROM messages WHERE status=? AND "
+                    "(recipient_session=? OR recipient_session IS NULL) "
+                    "ORDER BY created_at ASC LIMIT 1",
+                    (STATUS_QUEUED, recipient_session),
+                )
+            row = await cur.fetchone()
+            await cur.close()
+            if row is None:
+                return None
+
+            now = time.time()
+            await self.db.execute(
+                "UPDATE messages SET status=?, delivered_at=? WHERE id=?",
+                (STATUS_DELIVERED, now, row["id"]),
+            )
+            await self.db.commit()
+            msg = _row_to_message(row, delivered_at=now)
+            msg["status"] = STATUS_DELIVERED
+            return msg
 
     async def wait_for_next_for_worker(
         self,

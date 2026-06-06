@@ -23,6 +23,7 @@ dev = [
 fast-mcp-claude = "fast_mcp_claude.__main__:main"
 fast-mcp-claude-hook = "fast_mcp_claude.hook:main"
 fast-mcp-claude-channel = "fast_mcp_claude.channel:main"
+fast-mcp-claude-launcher = "fast_mcp_claude.launcher:main"
 
 [build-system]
 requires = ["hatchling"]

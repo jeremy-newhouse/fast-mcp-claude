@@ -29,6 +29,37 @@ async def test_pop_returns_none_when_empty(store: Store):
 
 
 @pytest.mark.asyncio
+async def test_empty_pop_survives_concurrent_commits(store: Store):
+    """Regression: empty-inbox pop must not raise when another method commits
+    concurrently on the shared connection.
+
+    The launcher polls an empty inbox (pop_next_for_worker) while heartbeating
+    announce() (a commit). When pop wrapped its SELECT in an explicit
+    BEGIN IMMEDIATE, a concurrent commit() would commit pop's open transaction,
+    so the empty-path ROLLBACK raised "cannot rollback - no transaction is
+    active". Hammer the exact interleave; it must stay clean and keep returning
+    None. (Reliably reproduced the old bug well under this iteration count.)"""
+    iters = 500
+    errors: list[str] = []
+
+    async def popper():
+        for _ in range(iters):
+            try:
+                assert await store.pop_next_for_worker("mini2_launcher") is None
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"pop raised: {type(exc).__name__}: {exc}")
+                return
+
+    async def committer():
+        for i in range(iters):
+            await store.announce("mini2_launcher", summary=f"beat {i}")
+            await asyncio.sleep(0)
+
+    await asyncio.gather(popper(), committer())
+    assert not errors, errors[0]
+
+
+@pytest.mark.asyncio
 async def test_wait_for_instruction_wakes_on_enqueue(store: Store):
     """A blocked wait_for_next_for_worker should wake when a message is enqueued."""
 

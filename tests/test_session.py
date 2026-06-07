@@ -116,14 +116,14 @@ def test_notify_can_be_disabled_via_cli(env, fake_settings):
 def test_build_presence_from_status_file(tmp_path):
     sf = tmp_path / "s.json"
     sf.write_text(json.dumps({
-        "machine": "mini2", "repo": "eca-brain", "cwd": "/r/eca-brain",
+        "machine": "mini2", "repo": "evolv-coder-agent", "cwd": "/r/evolv-coder-agent",
         "branch": "main", "status": "working", "last": "build phase 4",
         "updated_at": 123.0,
     }))
     summary, meta = session_mod._build_presence(_cfg(status_file=str(sf)))
-    assert "eca-brain" in summary and "working" in summary and "build phase 4" in summary
+    assert "evolv-coder-agent" in summary and "working" in summary and "build phase 4" in summary
     assert meta["role"] == "live-session"
-    assert meta["machine"] == "mini2" and meta["repo"] == "eca-brain"
+    assert meta["machine"] == "mini2" and meta["repo"] == "evolv-coder-agent"
     assert meta["status"] == "working" and meta["last"] == "build phase 4"
 
 
@@ -152,7 +152,7 @@ class _FakeClient:
         )
 
 
-def _msg(mid, ident, sender="eca-brain", prompt="hello"):
+def _msg(mid, ident, sender="evolv-coder-agent", prompt="hello"):
     return {"id": mid, "recipient_session": ident, "sender": sender, "prompt": prompt,
             "status": "queued"}
 

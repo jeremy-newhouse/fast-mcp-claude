@@ -8,7 +8,7 @@ the existing `reply` tool. It mirrors channel.py's structure (fastmcp Client to 
 LOCAL server, reconnect-with-backoff, announce heartbeat, CLI>env>Settings precedence,
 strict opt-in inertness) but the leg is *exec* instead of *push*.
 
-Why a separate process (the eca-brain daemon lesson): the server stays zero-exec —
+Why a separate process (the evolv-coder-agent daemon lesson): the server stays zero-exec —
 no tool ever spawns a subprocess. All execution lives here, behind a strict opt-in,
 an allowlisted cwd, and a tools ceiling, so the MCP server's network surface keeps no
 RCE primitive.

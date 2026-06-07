@@ -354,7 +354,7 @@ async def _check_inbox(c: Any, cfg: SessionConfig, watch: _Watch) -> None:
     new = [m for m in mine if str(m.get("id")) not in watch.seen]
     watch.seen = ids  # drop ids that left the queue (claimed/replied/expired)
     for m in new:
-        sender = m.get("sender") or "eca-brain"
+        sender = m.get("sender") or "evolv-coder-agent"
         preview = (m.get("prompt") or "").strip().replace("\n", " ")[:120]
         _log(f"new inbox message {m.get('id')} from {sender}: {preview!r}")
         if cfg.notify:

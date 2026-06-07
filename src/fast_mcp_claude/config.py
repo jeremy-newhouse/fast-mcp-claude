@@ -141,7 +141,7 @@ class Settings(BaseSettings):
     # Phase 3 approval bridge: arm a launcher-controlled PreToolUse hook on every spawned
     # worker via claude's --settings flag (an INLINE JSON object, independent of
     # --setting-sources which stays ""). The hook relays each gated tool call to the
-    # LOCAL fast-mcp-claude server (request_approval/await_decision); the eca-brain daemon
+    # LOCAL fast-mcp-claude server (request_approval/await_decision); the evolv-coder-agent daemon
     # decides it via Teams. STRICT opt-in (default off): when off, workers spawn ungated
     # exactly as in Phase 2. The hook command is built from launcher-resolved values only
     # (never the repo), so an allowlisted repo cannot inject hook commands.

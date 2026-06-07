@@ -234,7 +234,7 @@ async def _bridge(write_stream: Any, cfg: ChannelConfig) -> None:
 
     def _make_client() -> Client:
         # fastmcp 3.x: Client() no longer takes a `headers=` kwarg; the bearer rides
-        # on the transport (mirrors eca-brain fleet.py + launcher.py).
+        # on the transport (mirrors evolv-coder-agent fleet.py + launcher.py).
         if cfg.api_key:
             transport = StreamableHttpTransport(
                 cfg.local_url, headers={"Authorization": f"Bearer {cfg.api_key}"}

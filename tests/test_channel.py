@@ -459,10 +459,10 @@ def send_teams_rig(monkeypatch):
 
     async def fake_mesh_send_teams(cfg, text, target, metadata):
         calls.append((text, target, metadata))
-        # Simulate the hub: it posts only for admin-triggered requests.
-        if metadata.get("triggering_admin"):
+        # Simulate the hub: it posts for admin-triggered OR operator-direct requests.
+        if metadata.get("triggering_admin") or metadata.get("operator_direct"):
             return {"ok": True, "detail": f"delivered to '{target or 'origin'}'"}
-        return {"ok": False, "detail": "refused: not an admin-triggered session"}
+        return {"ok": False, "detail": "refused: neither admin-triggered nor operator-direct"}
 
     monkeypatch.setattr(channel_mod, "_mesh_send_teams", fake_mesh_send_teams)
 
@@ -510,12 +510,15 @@ def test_send_teams_unaddressed_admin_not_stamped(send_teams_rig):
     assert "NOT posted" in out[0].text
 
 
-def test_send_teams_no_inflight_not_admin(send_teams_rig):
-    send_teams_rig["set_inflight"](None)  # spontaneous call, no task in flight
-    out = anyio.run(channel_mod._call_tool, "send_teams", {"text": "x"})
-    _, _, meta = send_teams_rig["calls"][0]
-    assert meta["triggering_admin"] is False
-    assert "NOT posted" in out[0].text
+def test_send_teams_operator_direct_posts(send_teams_rig):
+    # No task in flight => the operator is driving directly => trusted (operator_direct).
+    send_teams_rig["set_inflight"](None)
+    out = anyio.run(channel_mod._call_tool, "send_teams", {"text": "x", "target": "Eng"})
+    _, target, meta = send_teams_rig["calls"][0]
+    assert meta.get("operator_direct") is True
+    assert "triggering_admin" not in meta
+    assert target == "Eng"
+    assert "posted to Teams" in out[0].text
 
 
 def test_send_teams_requires_text(send_teams_rig):

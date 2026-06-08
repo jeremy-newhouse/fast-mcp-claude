@@ -602,18 +602,24 @@ async def _handle_send_teams(
     text = str(arguments.get("text") or "")
     target = arguments.get("target")
     target = str(target).strip() if target else None
-    # Stamp the hub-trusted context from the IN-FLIGHT task: only an admin-triggered task that
-    # was addressed to THIS identity carries triggering_admin (mirrors the permission relay's
-    # auto-allow gate). A spontaneous call with no in-flight task carries no admin stamp, so the
-    # hub will refuse it — fail safe.
-    inflight = _RT.inflight if isinstance(_RT.inflight, dict) else {}
-    in_meta = inflight.get("metadata") if isinstance(inflight.get("metadata"), dict) else {}
-    addressed = inflight.get("recipient_session") == cfg.identity
-    metadata = {
-        "triggering_admin": bool(in_meta.get("triggering_admin")) and addressed,
-        "conversation_id": in_meta.get("conversation_id"),
-        "origin_message_id": inflight.get("id"),
-    }
+    # Stamp the hub-trusted context. Two trusted origins:
+    #   * NO in-flight task -> the OPERATOR is driving this session directly (their own action on
+    #     their own machine), trusted exactly as the channel already treats the operator's local
+    #     turns (see _handle_permission's inflight-None branch). Stamp operator_direct.
+    #   * an in-flight task -> only an admin-triggered task ADDRESSED to this identity carries
+    #     triggering_admin (mirrors the permission relay's auto-allow gate). A non-admin pushed
+    #     task carries neither flag, so the hub refuses it — fail safe.
+    inflight = _RT.inflight if isinstance(_RT.inflight, dict) else None
+    if inflight is None:
+        metadata: dict[str, Any] = {"operator_direct": True}
+    else:
+        in_meta = inflight.get("metadata") if isinstance(inflight.get("metadata"), dict) else {}
+        addressed = inflight.get("recipient_session") == cfg.identity
+        metadata = {
+            "triggering_admin": bool(in_meta.get("triggering_admin")) and addressed,
+            "conversation_id": in_meta.get("conversation_id"),
+            "origin_message_id": inflight.get("id"),
+        }
     if not text.strip():
         return [types.TextContent(type="text", text="send_teams: `text` is required")]
     result = await _mesh_send_teams(cfg, text, target, metadata)

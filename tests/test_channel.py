@@ -429,3 +429,97 @@ def test_call_tool_unknown_raises(reply_rig):
     reply_rig["set_inflight"]("m1")
     with pytest.raises(ValueError):
         anyio.run(channel_mod._call_tool, "nope", {})
+
+
+# -------------------------------------------------- send_teams tool -> hub outbox
+
+
+def test_send_teams_tool_listed():
+    tools = anyio.run(channel_mod._list_tools)
+    names = {t.name for t in tools}
+    assert "send_teams" in names and "reply" in names
+
+
+def test_send_teams_is_auto_pass():
+    cfg = _cfg()
+    assert channel_mod._is_auto_pass(channel_mod.OUR_SEND_TEAMS_TOOL, cfg) is True
+
+
+def test_relay_send_teams_tool_always_allowed(relay):
+    relay["set_inflight"](None)  # even with NO in-flight turn (the hub re-gates it)
+    params = _perm_params(channel_mod.OUR_SEND_TEAMS_TOOL)
+    anyio.run(channel_mod._handle_permission, None, _cfg(), params)
+    assert relay["sent"] == [("vaxrc", "allow")]
+    assert relay["routed"] == []
+
+
+@pytest.fixture
+def send_teams_rig(monkeypatch):
+    calls = []  # list of (text, target, metadata)
+
+    async def fake_mesh_send_teams(cfg, text, target, metadata):
+        calls.append((text, target, metadata))
+        # Simulate the hub: it posts only for admin-triggered requests.
+        if metadata.get("triggering_admin"):
+            return {"ok": True, "detail": f"delivered to '{target or 'origin'}'"}
+        return {"ok": False, "detail": "refused: not an admin-triggered session"}
+
+    monkeypatch.setattr(channel_mod, "_mesh_send_teams", fake_mesh_send_teams)
+
+    def _set_inflight(inflight):
+        channel_mod._RT = channel_mod._Runtime(cfg=_cfg(enabled=True, identity="x"))
+        channel_mod._RT.inflight = inflight
+
+    yield {"calls": calls, "set_inflight": _set_inflight}
+    channel_mod._RT = None
+
+
+def test_send_teams_admin_turn_stamps_and_posts(send_teams_rig):
+    send_teams_rig["set_inflight"](
+        {"id": "m1", "recipient_session": "x",
+         "metadata": {"triggering_admin": True, "conversation_id": "conv-1"}}
+    )
+    out = anyio.run(
+        channel_mod._call_tool, "send_teams", {"text": "build green", "target": "Eng"}
+    )
+    text, target, meta = send_teams_rig["calls"][0]
+    assert text == "build green" and target == "Eng"
+    assert meta["triggering_admin"] is True
+    assert meta["conversation_id"] == "conv-1"
+    assert "posted to Teams" in out[0].text
+
+
+def test_send_teams_default_target_is_origin(send_teams_rig):
+    send_teams_rig["set_inflight"](
+        {"id": "m1", "recipient_session": "x",
+         "metadata": {"triggering_admin": True, "conversation_id": "conv-1"}}
+    )
+    anyio.run(channel_mod._call_tool, "send_teams", {"text": "done"})  # no target
+    _, target, _ = send_teams_rig["calls"][0]
+    assert target is None
+
+
+def test_send_teams_unaddressed_admin_not_stamped(send_teams_rig):
+    # triggering_admin set but message NOT addressed to this identity => stamp is dropped.
+    send_teams_rig["set_inflight"](
+        {"id": "m1", "recipient_session": None, "metadata": {"triggering_admin": True}}
+    )
+    out = anyio.run(channel_mod._call_tool, "send_teams", {"text": "x", "target": "Eng"})
+    _, _, meta = send_teams_rig["calls"][0]
+    assert meta["triggering_admin"] is False
+    assert "NOT posted" in out[0].text
+
+
+def test_send_teams_no_inflight_not_admin(send_teams_rig):
+    send_teams_rig["set_inflight"](None)  # spontaneous call, no task in flight
+    out = anyio.run(channel_mod._call_tool, "send_teams", {"text": "x"})
+    _, _, meta = send_teams_rig["calls"][0]
+    assert meta["triggering_admin"] is False
+    assert "NOT posted" in out[0].text
+
+
+def test_send_teams_requires_text(send_teams_rig):
+    send_teams_rig["set_inflight"]({"id": "m1", "recipient_session": "x", "metadata": {}})
+    out = anyio.run(channel_mod._call_tool, "send_teams", {"text": "   "})
+    assert send_teams_rig["calls"] == []  # never reaches the mesh
+    assert "required" in out[0].text

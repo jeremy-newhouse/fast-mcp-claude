@@ -75,6 +75,8 @@ mcp = FastMCP(
         "              consume_interrupt\n"
         "  Permissions:request_approval (hook-only), pending_approvals,\n"
         "              wait_for_pending_approval, approve_tool, await_decision\n"
+        "  TeamsOutbox:request_teams_send, await_teams_send (channel),\n"
+        "              wait_for_pending_teams_send, complete_teams_send (hub)\n"
         "  Files:      list_files, read_file, write_file  (sandboxed to\n"
         "              WORKSPACE_ROOTS)\n"
         "  Pub/sub:    publish, subscribe\n"
@@ -88,4 +90,11 @@ mcp = FastMCP(
 
 
 # Import tool modules for side-effect registration via @mcp.tool decorators
-from .tools import files, messaging, permissions, presence, pubsub  # noqa: E402, F401
+from .tools import (  # noqa: E402, F401
+    files,
+    messaging,
+    permissions,
+    presence,
+    pubsub,
+    teams_outbox,
+)

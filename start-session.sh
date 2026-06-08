@@ -28,7 +28,17 @@
 # Optional overrides via env: PEER_NAME, MCP_API_KEY, MCP_LOCAL_URL, FLEET_IDENTITY, CHANNEL_MODE.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve the REAL location of this script, following symlinks, so it works when invoked via a
+# symlink on PATH (e.g. ~/.local/bin/start-session -> this file). A naive dirname of BASH_SOURCE
+# would resolve to the symlink's dir, not the repo, breaking the .env + .venv/bin lookups below.
+# (BSD readlink on macOS has no -f, so walk the link chain manually; handles relative links.)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in /*) ;; *) SOURCE="$DIR/$SOURCE" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 FMC_REPO="$SCRIPT_DIR"
 
 # --- load PEER_NAME / MCP_API_KEY from the repo .env if not already in the env ----------

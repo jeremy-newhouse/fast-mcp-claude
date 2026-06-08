@@ -95,6 +95,7 @@ INITIALIZED = "notifications/initialized"
 # agent's reply tool is mcp__fast-mcp-claude-channel__reply and we can auto-allow it by name.
 SERVER_NAME = "fast-mcp-claude-channel"
 OUR_REPLY_TOOL = f"mcp__{SERVER_NAME}__reply"
+OUR_SEND_TEAMS_TOOL = f"mcp__{SERVER_NAME}__send_teams"
 
 INSTRUCTIONS = (
     "You are a fast-mcp-claude LIVE session reachable over a peer channel. The eCA brain "
@@ -106,7 +107,10 @@ INSTRUCTIONS = (
     "`message_id` from the channel tag and a thorough `response`.\n"
     "Channel delivery is fire-and-forget: the controller only sees your work after you call "
     "reply, so ALWAYS reply — even to report a failure. Tasks arrive automatically; you never "
-    "need to poll for work."
+    "need to poll for work.\n"
+    "To post a message to a Microsoft Teams chat via the eCA hub, call the `send_teams` tool "
+    "(`text`, optional `target` chat name — omit it to post back to the chat that sent you this "
+    "task). It returns whether the hub delivered it."
 )
 
 _server: Server = Server(SERVER_NAME, version=__version__, instructions=INSTRUCTIONS)
@@ -495,7 +499,27 @@ async def _list_tools() -> list[types.Tool]:
                 },
                 "required": ["message_id", "response"],
             },
-        )
+        ),
+        types.Tool(
+            name="send_teams",
+            description=(
+                "Post a message to a Microsoft Teams chat via the eCA hub. `text` is the "
+                "message; `target` is the destination chat name (omit to post back to the chat "
+                "that sent you the current task). The hub posts only for admin-triggered tasks "
+                "and resolves the chat name; this returns whether it was delivered."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Message to post to Teams"},
+                    "target": {
+                        "type": "string",
+                        "description": "Destination chat name; omit for the originating chat",
+                    },
+                },
+                "required": ["text"],
+            },
+        ),
     ]
 
 
@@ -509,12 +533,42 @@ async def _mesh_reply(cfg: ChannelConfig, message_id: str, response: str) -> boo
         return False
 
 
-@_server.call_tool()
-async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
-    if name != "reply":
-        raise ValueError(f"unknown tool: {name}")
+async def _mesh_send_teams(
+    cfg: ChannelConfig, text: str, target: str | None, metadata: dict[str, Any]
+) -> dict[str, Any]:
+    """request_teams_send -> await_teams_send on the LOCAL server. Returns {ok, detail|error}.
+    The hub decides whether to actually post (honors metadata.triggering_admin)."""
+    args: dict[str, Any] = {
+        "text": text,
+        "metadata": metadata,
+        "requester_session": cfg.identity,
+    }
+    if target:
+        args["target"] = target
+    try:
+        async with _make_client(cfg, timeout=cfg.decision_timeout + 30.0) as c:
+            res = await c.call_tool("request_teams_send", args)
+            data = _result_data(res)
+            if not data.get("success"):
+                return {"ok": False, "error": "request_teams_send rejected by the hub server"}
+            request_id = data.get("request_id")
+            if not request_id:
+                return {"ok": False, "error": "request_teams_send returned no request_id"}
+            res2 = await c.call_tool(
+                "await_teams_send", {"request_id": request_id, "timeout": cfg.decision_timeout}
+            )
+            d = _result_data(res2)
+            if d.get("ready") and isinstance(d.get("request"), dict):
+                req = d["request"]
+                return {"ok": bool(req.get("ok")), "detail": req.get("detail")}
+            return {"ok": False, "error": "no result within budget (the hub may still post it)"}
+    except Exception as e:
+        _log(f"send_teams failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+async def _handle_reply(cfg: ChannelConfig, arguments: dict[str, Any]) -> list[types.TextContent]:
     assert _RT is not None
-    cfg = _RT.cfg
     message_id = str(arguments.get("message_id") or "")
     # `response` is the schema field; accept `text` as a tolerant alias ONLY when response is
     # absent (not merely empty) so a deliberately-empty response isn't replaced by a stray arg.
@@ -541,13 +595,54 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCon
     ]
 
 
+async def _handle_send_teams(
+    cfg: ChannelConfig, arguments: dict[str, Any]
+) -> list[types.TextContent]:
+    assert _RT is not None
+    text = str(arguments.get("text") or "")
+    target = arguments.get("target")
+    target = str(target).strip() if target else None
+    # Stamp the hub-trusted context from the IN-FLIGHT task: only an admin-triggered task that
+    # was addressed to THIS identity carries triggering_admin (mirrors the permission relay's
+    # auto-allow gate). A spontaneous call with no in-flight task carries no admin stamp, so the
+    # hub will refuse it — fail safe.
+    inflight = _RT.inflight if isinstance(_RT.inflight, dict) else {}
+    in_meta = inflight.get("metadata") if isinstance(inflight.get("metadata"), dict) else {}
+    addressed = inflight.get("recipient_session") == cfg.identity
+    metadata = {
+        "triggering_admin": bool(in_meta.get("triggering_admin")) and addressed,
+        "conversation_id": in_meta.get("conversation_id"),
+        "origin_message_id": inflight.get("id"),
+    }
+    if not text.strip():
+        return [types.TextContent(type="text", text="send_teams: `text` is required")]
+    result = await _mesh_send_teams(cfg, text, target, metadata)
+    if result.get("ok"):
+        where = target or "the originating chat"
+        return [types.TextContent(type="text", text=f"posted to Teams ({where})")]
+    detail = result.get("detail") or result.get("error") or "unknown error"
+    return [types.TextContent(type="text", text=f"NOT posted to Teams: {detail}")]
+
+
+@_server.call_tool()
+async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+    assert _RT is not None
+    cfg = _RT.cfg
+    if name == "reply":
+        return await _handle_reply(cfg, arguments)
+    if name == "send_teams":
+        return await _handle_send_teams(cfg, arguments)
+    raise ValueError(f"unknown tool: {name}")
+
+
 # --------------------------------------------------------------------- permission relay + routing
 
 
 def _is_auto_pass(tool_name: str, cfg: ChannelConfig) -> bool:
-    """Tools allowed without any approval round-trip, even on a non-admin turn: our own reply
-    tool (the delivery path) and the configured read-only set."""
-    if tool_name == OUR_REPLY_TOOL:
+    """Tools allowed without any approval round-trip, even on a non-admin turn: our own reply +
+    send_teams tools (delivery paths — the hub re-gates send_teams via triggering_admin) and the
+    configured read-only set."""
+    if tool_name in (OUR_REPLY_TOOL, OUR_SEND_TEAMS_TOOL):
         return True
     return tool_name in cfg.auto_pass_tools
 
@@ -611,8 +706,9 @@ async def _handle_permission(write_stream: Any, cfg: ChannelConfig, params: dict
     description = str(params.get("description") or "")
     preview = str(params.get("input_preview") or "")
 
-    # Our own reply tool is the delivery path — always allow, regardless of who triggered.
-    if tool_name == OUR_REPLY_TOOL:
+    # Our own reply / send_teams tools are delivery paths — always allow the tool CALL,
+    # regardless of who triggered (send_teams is re-gated hub-side on triggering_admin).
+    if tool_name in (OUR_REPLY_TOOL, OUR_SEND_TEAMS_TOOL):
         await _send_permission(write_stream, request_id, "allow")
         return
 

@@ -40,6 +40,10 @@ STATUS_EXPIRED = "expired"  # TTL cleanup
 DECISION_ALLOW = "allow"
 DECISION_DENY = "deny"
 
+# Teams-outbox lifecycle (ADR-0013): a peer live session asks the hub to post to Teams.
+OUTBOX_PENDING = "pending"  # created, awaiting the hub controller to drain + post
+OUTBOX_DONE = "done"  # the hub posted (or failed) and completed the request
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -69,6 +73,20 @@ CREATE TABLE IF NOT EXISTS approvals (
     decided_at      REAL
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_pending ON approvals(decision, created_at);
+
+CREATE TABLE IF NOT EXISTS teams_outbox (
+    id              TEXT PRIMARY KEY,
+    requester       TEXT NOT NULL,
+    target          TEXT,
+    text            TEXT NOT NULL,
+    metadata        TEXT,
+    status          TEXT NOT NULL,
+    ok              INTEGER,
+    detail          TEXT,
+    created_at      REAL NOT NULL,
+    completed_at    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_teams_outbox_pending ON teams_outbox(status, created_at);
 
 CREATE TABLE IF NOT EXISTS pubsub (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -448,6 +466,96 @@ class Store:
         await cur.close()
         return [_row_to_approval(r) for r in rows]
 
+    # -------------------------------------------------------------- teams outbox
+    # ADR-0013: a peer live session asks the hub to post to Teams. Mirrors approvals
+    # (create -> controller drains pending -> controller completes -> requester awaits
+    # the result), but on its OWN table so it never touches the approval path.
+
+    async def create_teams_send(
+        self,
+        requester: str,
+        text: str,
+        target: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        request_id = uuid.uuid4().hex
+        await self.db.execute(
+            "INSERT INTO teams_outbox "
+            "(id, requester, target, text, metadata, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                request_id,
+                requester,
+                target,
+                text,
+                json.dumps(metadata) if metadata else None,
+                OUTBOX_PENDING,
+                time.time(),
+            ),
+        )
+        await self.db.commit()
+        self._notifier.notify(self._teams_outbox_queue_key())
+        return request_id
+
+    async def list_pending_teams_sends(self, limit: int = 50) -> list[dict[str, Any]]:
+        cur = await self.db.execute(
+            "SELECT * FROM teams_outbox WHERE status=? ORDER BY created_at ASC LIMIT ?",
+            (OUTBOX_PENDING, limit),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [_row_to_teams_send(r) for r in rows]
+
+    async def wait_for_pending_teams_sends(
+        self, timeout: float, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        async def check() -> list[dict[str, Any]] | None:
+            rows = await self.list_pending_teams_sends(limit)
+            return rows if rows else None
+
+        result = await self._notifier.wait_for(
+            self._teams_outbox_queue_key(), check, timeout
+        )
+        return result or []
+
+    async def complete_teams_send(
+        self, request_id: str, ok: bool, detail: str | None = None
+    ) -> bool:
+        async with self._db_lock:
+            cur = await self.db.execute(
+                "UPDATE teams_outbox SET status=?, ok=?, detail=?, completed_at=? "
+                "WHERE id=? AND status=?",
+                (OUTBOX_DONE, 1 if ok else 0, detail, time.time(), request_id, OUTBOX_PENDING),
+            )
+            await self.db.commit()
+            updated = cur.rowcount
+            await cur.close()
+        if updated:
+            self._notifier.notify(self._teams_outbox_key(request_id))
+            return True
+        return False
+
+    async def get_teams_send(self, request_id: str) -> dict[str, Any] | None:
+        cur = await self.db.execute(
+            "SELECT * FROM teams_outbox WHERE id=?", (request_id,)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return _row_to_teams_send(row) if row else None
+
+    async def wait_for_teams_send_result(
+        self, request_id: str, timeout: float
+    ) -> dict[str, Any] | None:
+        async def check() -> dict[str, Any] | None:
+            r = await self.get_teams_send(request_id)
+            if r is None or r["status"] != OUTBOX_DONE:
+                return None
+            return r
+
+        return await self._notifier.wait_for(
+            self._teams_outbox_key(request_id), check, timeout
+        )
+
     # ------------------------------------------------------------------- pub/sub
 
     async def publish(self, channel: str, sender: str, payload: dict[str, Any]) -> int:
@@ -549,6 +657,14 @@ class Store:
         return "approvals:any"
 
     @staticmethod
+    def _teams_outbox_key(request_id: str) -> str:
+        return f"teams_outbox:{request_id}"
+
+    @staticmethod
+    def _teams_outbox_queue_key() -> str:
+        return "teams_outbox:any"
+
+    @staticmethod
     def _pubsub_key(channel: str) -> str:
         return f"pubsub:{channel}"
 
@@ -579,6 +695,17 @@ class Store:
                     await self.db.execute(
                         "DELETE FROM approvals WHERE decision IS NOT NULL AND created_at<?",
                         (cutoff,),
+                    )
+                    # Expire stale pending teams-sends so await_teams_send unblocks, then
+                    # delete completed ones.
+                    await self.db.execute(
+                        "UPDATE teams_outbox SET status=?, ok=0, detail=? "
+                        "WHERE status=? AND created_at<?",
+                        (OUTBOX_DONE, "expired: no hub pickup in time", OUTBOX_PENDING, cutoff),
+                    )
+                    await self.db.execute(
+                        "DELETE FROM teams_outbox WHERE status=? AND created_at<?",
+                        (OUTBOX_DONE, cutoff),
                     )
                     await self.db.execute(
                         "DELETE FROM pubsub WHERE created_at<?",
@@ -625,6 +752,21 @@ def _row_to_approval(row: aiosqlite.Row) -> dict[str, Any]:
         "reason": row["reason"],
         "created_at": row["created_at"],
         "decided_at": row["decided_at"],
+    }
+
+
+def _row_to_teams_send(row: aiosqlite.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "requester": row["requester"],
+        "target": row["target"],
+        "text": row["text"],
+        "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
+        "status": row["status"],
+        "ok": (None if row["ok"] is None else bool(row["ok"])),
+        "detail": row["detail"],
+        "created_at": row["created_at"],
+        "completed_at": row["completed_at"],
     }
 
 

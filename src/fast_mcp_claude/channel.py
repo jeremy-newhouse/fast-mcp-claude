@@ -118,6 +118,25 @@ def _log(msg: str) -> None:
         print(f"[fast-mcp-claude-channel] {msg}", file=sys.stderr, flush=True)
 
 
+# A bad bearer locks the WHOLE mesh endpoint for 60s after 5 attempts, which would also lock out
+# the legitimately-authed hook/launcher on the same server — so on an auth error cool down LONGER
+# than the lockout instead of retry-storming it on the normal 1→30s reconnect backoff (mirrors
+# session.py; see CLAUDE.md "never retry-storm auth failures").
+_AUTH_HINTS = ("401", "403", "unauthorized", "forbidden")
+_AUTH_COOLDOWN_S = 90.0
+
+
+async def _reconnect_sleep(what: str, exc: Exception, backoff: float) -> float:
+    """Shared reconnect handler for the presence/inbox loops: auth → long cooldown, else backoff."""
+    if any(h in str(exc).lower() for h in _AUTH_HINTS):
+        _log(f"{what} AUTH error: {exc}; cooling down {_AUTH_COOLDOWN_S:.0f}s (no retry-storm)")
+        await asyncio.sleep(_AUTH_COOLDOWN_S)
+        return 1.0
+    _log(f"{what} error: {exc}; reconnecting in {backoff:.0f}s")
+    await asyncio.sleep(backoff)
+    return min(backoff * 2, 30.0)
+
+
 @dataclass
 class ChannelConfig:
     identity: str
@@ -247,9 +266,13 @@ def _resolve_config(argv: list[str]) -> ChannelConfig:
         if args.reply_timeout is not None
         else _env_float("CHANNEL_REPLY_TIMEOUT_S", reply_timeout)
     )
-    ap_env = _parse_tools(args.auto_pass) or _parse_tools(os.environ.get("CHANNEL_AUTO_PASS_TOOLS"))
-    if ap_env is not None:
-        auto_pass = ap_env
+    # Precedence CLI > env > Settings, using `is not None` per source — NOT `or`: an explicit
+    # `--auto-pass ""` parses to an (intentionally) falsy empty frozenset, and `or` would wrongly
+    # fall through to the env/default, silently ignoring the operator's "auto-pass nothing" opt-out.
+    ap_cli = _parse_tools(args.auto_pass)
+    ap = ap_cli if ap_cli is not None else _parse_tools(os.environ.get("CHANNEL_AUTO_PASS_TOOLS"))
+    if ap is not None:
+        auto_pass = ap
     enabled = (
         args.enabled if args.enabled is not None else _env_bool("CHANNEL_ENABLED", channel_enabled)
     )
@@ -369,9 +392,7 @@ async def _presence_loop(cfg: ChannelConfig) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            _log(f"presence error: {e}; reconnecting in {backoff:.0f}s")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30.0)
+            backoff = await _reconnect_sleep("presence", e, backoff)
 
 
 # --------------------------------------------------------------------- inbound push
@@ -443,9 +464,8 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            _log(f"inbox error: {e}; reconnecting in {backoff:.0f}s\n{traceback.format_exc()}")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30.0)
+            _log(f"inbox detail:\n{traceback.format_exc()}")
+            backoff = await _reconnect_sleep("inbox", e, backoff)
 
 
 # --------------------------------------------------------------------- outbound reply tool
@@ -496,7 +516,12 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCon
     assert _RT is not None
     cfg = _RT.cfg
     message_id = str(arguments.get("message_id") or "")
-    response = str(arguments.get("response") or arguments.get("text") or "")
+    # `response` is the schema field; accept `text` as a tolerant alias ONLY when response is
+    # absent (not merely empty) so a deliberately-empty response isn't replaced by a stray arg.
+    raw = arguments.get("response")
+    if raw is None:
+        raw = arguments.get("text")
+    response = str(raw if raw is not None else "")
     ok = await _mesh_reply(cfg, message_id, response)
     # Unblock the inbox loop so it claims the next message (only if this reply is for the
     # in-flight turn; a stale/duplicate reply still relays to the controller but doesn't advance).
@@ -562,6 +587,11 @@ async def _route_approval(
                 _log(f"request_approval failed: {data}; default-deny")
                 return "deny"
             approval_id = data.get("approval_id")
+            if not approval_id:
+                # success without an id is a server contract violation — fail safe, don't
+                # call await_decision with a None id (which could match the wrong/first pending).
+                _log(f"request_approval ok but no approval_id ({data}); default-deny")
+                return "deny"
             res2 = await c.call_tool(
                 "await_decision", {"approval_id": approval_id, "timeout": cfg.decision_timeout}
             )
@@ -595,8 +625,15 @@ async def _handle_permission(write_stream: Any, cfg: ChannelConfig, params: dict
              "leaving to the local terminal dialog")
         return
 
+    # Admin auto-allow: trust the brain's per-batch `triggering_admin` stamp (the brain is the
+    # authorization authority — invariant 8 / ADR-0006 — exactly as the launcher trusts the
+    # brain's dispatch). The mesh bearer + loopback-bind + SSH tunnel (ADR-0011) are the trust
+    # boundary; the co-driving operator watching every turn in their terminal is the backstop.
+    # Defense-in-depth: only honor the stamp on a message EXPLICITLY addressed to this identity,
+    # so a blind broadcast (recipient_session=NULL) can't carry triggering_admin into an auto-allow.
     meta = inflight.get("metadata") if isinstance(inflight.get("metadata"), dict) else {}
-    if meta.get("triggering_admin") is True:
+    addressed = inflight.get("recipient_session") == cfg.identity
+    if meta.get("triggering_admin") is True and addressed:
         await _send_permission(write_stream, request_id, "allow")
         _log(f"auto-allowed {tool_name} (admin turn, msg {inflight.get('id')})")
         return

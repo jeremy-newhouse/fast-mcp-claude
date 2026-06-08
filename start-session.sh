@@ -32,7 +32,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FMC_REPO="$SCRIPT_DIR"
 
 # --- load PEER_NAME / MCP_API_KEY from the repo .env if not already in the env ----------
-_envget() { grep -E "^$1=" "$FMC_REPO/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"; }
+# Trailing `|| true`: under `set -euo pipefail`, a no-match grep exits 1 and pipefail would
+# abort the whole script inside the `${VAR:-$(_envget KEY)}` substitution. That bites any key
+# absent from .env — notably CHANNEL_ENABLED (never a standard key), which would break the
+# DEFAULT notify+pull path for everyone. Swallow the no-match so a missing key just yields "".
+_envget() { grep -E "^$1=" "$FMC_REPO/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'" || true; }
 PEER_NAME="${PEER_NAME:-$(_envget PEER_NAME)}"; PEER_NAME="${PEER_NAME:-local}"
 MCP_API_KEY="${MCP_API_KEY:-$(_envget MCP_API_KEY)}"
 MCP_PORT="${MCP_PORT:-$(_envget MCP_PORT)}"; MCP_PORT="${MCP_PORT:-5473}"
@@ -109,9 +113,13 @@ json.dump({"identity": identity, "machine": machine, "repo": repo, "cwd": cwd,
 PY
 
 # --- ensure the /fleet-inbox pull command is installed at user level ---------------------
-mkdir -p "$HOME/.claude/commands"
-if [ -f "$FMC_REPO/.claude/commands/fleet-inbox.md" ]; then
-  cp -f "$FMC_REPO/.claude/commands/fleet-inbox.md" "$HOME/.claude/commands/fleet-inbox.md"
+# Only in notify+pull mode: channel mode auto-delivers and omits the claude-local server, so the
+# /fleet-inbox command (which calls mcp__claude-local__*) would be present-but-broken there.
+if [ "$CHANNEL_MODE" != "1" ]; then
+  mkdir -p "$HOME/.claude/commands"
+  if [ -f "$FMC_REPO/.claude/commands/fleet-inbox.md" ]; then
+    cp -f "$FMC_REPO/.claude/commands/fleet-inbox.md" "$HOME/.claude/commands/fleet-inbox.md"
+  fi
 fi
 
 # --- temp MCP config + hook settings, both auto-cleaned ----------------------------------

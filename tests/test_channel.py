@@ -250,6 +250,14 @@ def test_auto_pass_cli_overrides(env, fake_settings):
     assert cfg.auto_pass_tools == frozenset({"Read", "Grep", "LS"})
 
 
+def test_auto_pass_empty_cli_opts_out(env, fake_settings):
+    # `--auto-pass ""` must yield an EMPTY set (every tool routes), NOT silently fall through to
+    # the env/Settings default — the frozenset()-is-falsy `or` bug. Env must not leak in either.
+    fake_settings()
+    env.setenv("CHANNEL_AUTO_PASS_TOOLS", "Read,Glob,Grep")
+    assert channel_mod._resolve_config(["--auto-pass", ""]).auto_pass_tools == frozenset()
+
+
 def test_status_file_from_env(env, fake_settings):
     fake_settings()
     env.setenv("CRM_SESSION_STATUS_FILE", "/tmp/x.json")
@@ -336,10 +344,22 @@ def test_relay_reply_tool_always_allowed(relay):
 
 
 def test_relay_admin_turn_auto_allows(relay):
-    relay["set_inflight"]({"id": "m1", "metadata": {"triggering_admin": True}})
+    # admin stamp on a message ADDRESSED to this identity ("x" is _cfg()'s identity)
+    relay["set_inflight"]({"id": "m1", "recipient_session": "x",
+                           "metadata": {"triggering_admin": True}})
     anyio.run(channel_mod._handle_permission, None, _cfg(), _perm_params("Bash"))
     assert relay["sent"] == [("vaxrc", "allow")]
     assert relay["routed"] == []  # admin => no Teams round-trip
+
+
+def test_relay_admin_stamp_on_broadcast_does_not_auto_allow(relay):
+    # Defense-in-depth: triggering_admin on a NON-addressed (broadcast/forged) message must NOT
+    # auto-allow — it falls through to routing instead.
+    relay["set_inflight"]({"id": "m1b", "recipient_session": None,
+                           "metadata": {"triggering_admin": True}})
+    anyio.run(channel_mod._handle_permission, None, _cfg(), _perm_params("Bash"))
+    assert relay["routed"] and relay["routed"][0]["tool_name"] == "Bash"
+    assert relay["sent"] == [("vaxrc", "deny")]
 
 
 def test_relay_nonadmin_consequential_routes_to_teams(relay):

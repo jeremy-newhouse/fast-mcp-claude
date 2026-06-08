@@ -38,7 +38,12 @@ FMC_REPO="$SCRIPT_DIR"
 # DEFAULT notify+pull path for everyone. Swallow the no-match so a missing key just yields "".
 _envget() { grep -E "^$1=" "$FMC_REPO/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'" || true; }
 PEER_NAME="${PEER_NAME:-$(_envget PEER_NAME)}"; PEER_NAME="${PEER_NAME:-local}"
-MCP_API_KEY="${MCP_API_KEY:-$(_envget MCP_API_KEY)}"
+# Mesh bearer is authoritative from THIS repo's .env (the local mesh is configured from it).
+# Prefer .env over any inherited MCP_API_KEY (e.g. a shared ~/.zshrc that exports ANOTHER
+# machine's mesh key) which the local mesh would reject with 401, leaving the channel/session
+# sidecar unable to announce. Fall back to the inherited env only when .env doesn't define it.
+_ENV_MCP_KEY="$(_envget MCP_API_KEY)"
+MCP_API_KEY="${_ENV_MCP_KEY:-${MCP_API_KEY:-}}"
 MCP_PORT="${MCP_PORT:-$(_envget MCP_PORT)}"; MCP_PORT="${MCP_PORT:-5473}"
 MCP_LOCAL_URL="${MCP_LOCAL_URL:-http://127.0.0.1:${MCP_PORT}/mcp}"
 

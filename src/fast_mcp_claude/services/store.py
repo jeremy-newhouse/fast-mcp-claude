@@ -674,50 +674,55 @@ class Store:
 
     # ------------------------------------------------------------------- cleanup
 
+    async def _cleanup_once(self, cutoff: float) -> None:
+        """One sweep: expire stale in-flight rows (so waiters unblock) and prune resolved
+        rows older than `cutoff`. Extracted from the periodic loop so it is directly testable."""
+        async with self._db_lock:
+            # Mark old queued/delivered as expired so wait_for_completion unblocks
+            await self.db.execute(
+                "UPDATE messages SET status=? WHERE status IN (?, ?) AND created_at<?",
+                (STATUS_EXPIRED, STATUS_QUEUED, STATUS_DELIVERED, cutoff),
+            )
+            # Delete fully-resolved old rows
+            await self.db.execute(
+                "DELETE FROM messages WHERE status IN (?, ?, ?) AND created_at<?",
+                (STATUS_REPLIED, STATUS_CANCELLED, STATUS_EXPIRED, cutoff),
+            )
+            await self.db.execute(
+                "DELETE FROM approvals WHERE decision IS NOT NULL AND created_at<?",
+                (cutoff,),
+            )
+            # Expire stale pending teams-sends (so they don't dangle in the pending set),
+            # then delete completed ones. Same mark-then-delete sweep as messages above; at the
+            # 7-day TTL no awaiter is still waiting, so this is hygiene, not a wake path.
+            await self.db.execute(
+                "UPDATE teams_outbox SET status=?, ok=0, detail=? "
+                "WHERE status=? AND created_at<?",
+                (OUTBOX_DONE, "expired: no hub pickup in time", OUTBOX_PENDING, cutoff),
+            )
+            await self.db.execute(
+                "DELETE FROM teams_outbox WHERE status=? AND created_at<?",
+                (OUTBOX_DONE, cutoff),
+            )
+            await self.db.execute(
+                "DELETE FROM pubsub WHERE created_at<?",
+                (cutoff,),
+            )
+            # Backstop only — `who` filters freshness via stale_after; a
+            # live adapter re-announces on every heartbeat.
+            await self.db.execute(
+                "DELETE FROM presence WHERE updated_at<?",
+                (cutoff,),
+            )
+            await self.db.commit()
+
     async def _periodic_cleanup(self) -> None:
         """Background task — expires old queued messages and prunes ancient rows."""
         ttl = self.settings.store_ttl_seconds
         while True:
             try:
                 await asyncio.sleep(min(3600, ttl // 4 or 60))
-                cutoff = time.time() - ttl
-                async with self._db_lock:
-                    # Mark old queued/delivered as expired so wait_for_completion unblocks
-                    await self.db.execute(
-                        "UPDATE messages SET status=? WHERE status IN (?, ?) AND created_at<?",
-                        (STATUS_EXPIRED, STATUS_QUEUED, STATUS_DELIVERED, cutoff),
-                    )
-                    # Delete fully-resolved old rows
-                    await self.db.execute(
-                        "DELETE FROM messages WHERE status IN (?, ?, ?) AND created_at<?",
-                        (STATUS_REPLIED, STATUS_CANCELLED, STATUS_EXPIRED, cutoff),
-                    )
-                    await self.db.execute(
-                        "DELETE FROM approvals WHERE decision IS NOT NULL AND created_at<?",
-                        (cutoff,),
-                    )
-                    # Expire stale pending teams-sends so await_teams_send unblocks, then
-                    # delete completed ones.
-                    await self.db.execute(
-                        "UPDATE teams_outbox SET status=?, ok=0, detail=? "
-                        "WHERE status=? AND created_at<?",
-                        (OUTBOX_DONE, "expired: no hub pickup in time", OUTBOX_PENDING, cutoff),
-                    )
-                    await self.db.execute(
-                        "DELETE FROM teams_outbox WHERE status=? AND created_at<?",
-                        (OUTBOX_DONE, cutoff),
-                    )
-                    await self.db.execute(
-                        "DELETE FROM pubsub WHERE created_at<?",
-                        (cutoff,),
-                    )
-                    # Backstop only — `who` filters freshness via stale_after; a
-                    # live adapter re-announces on every heartbeat.
-                    await self.db.execute(
-                        "DELETE FROM presence WHERE updated_at<?",
-                        (cutoff,),
-                    )
-                    await self.db.commit()
+                await self._cleanup_once(time.time() - ttl)
             except asyncio.CancelledError:
                 raise
             except Exception:

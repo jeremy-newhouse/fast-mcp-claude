@@ -1,50 +1,71 @@
-"""fast-mcp-claude-channel — Claude Code *channel* adapter (prompt push leg).
+"""fast-mcp-claude-channel — Claude Code *channel* sidecar for LIVE interactive sessions.
 
-Claude Code spawns this as a stdio MCP subprocess (launch the worker session with
-`claude --dangerously-load-development-channels server:claude-channel`). It declares
-the experimental `claude/channel` capability, then bridges the LOCAL fast-mcp-claude
-HTTP server's inbox into the live Claude session: it long-polls `wait_for_instruction`
-and PUSHES each queued prompt as a `notifications/claude/channel` event.
+Claude Code spawns this as a stdio MCP subprocess (launch the session with
+`claude --dangerously-load-development-channels server:fast-mcp-claude-channel`). It is the
+push (auto-delivery) replacement for the notify+pull `session.py` sidecar: instead of firing
+a macOS notification and waiting for the operator to run `/fleet-inbox`, it PUSHES each
+brain-sent prompt straight into the live session as a `<channel>` turn and routes the
+session's reply back over the mesh — fully automatic, with the operator still watching every
+turn in their own terminal.
 
-Why this exists (see README "Channels"): it removes the two biggest v1 frictions —
-  * the worker no longer needs the /worker long-poll loop to be primed by a human, and
-  * the MCP idle timeout no longer applies, because the waiting happens in THIS
-    process, not inside a Claude tool call.
+What it does (all against the LOCAL fast-mcp-claude HTTP server, which the brain reaches over
+a forward SSH tunnel):
 
-Design notes:
-  * Outbound only. The worker still returns results via the existing `reply` tool on
-    its local server — channel pushes are fire-and-forget and unacknowledged, so the
-    reply/outbox path remains the source of truth for delivery (the lesson from
-    claude-peers-mcp's silent-message-loss bugs).
-  * We run the low-level `mcp.server.Server` so ping/initialize/unknown-method are
-    handled correctly, and push notifications by writing straight to the same stdio
-    write stream the session uses (that is exactly what session.send_notification does).
-  * Permission relay is NOT handled here. Claude Code's channel permission relay is an
-    *inbound* custom notification, which the Python MCP SDK validates against the
-    ClientNotification union and drops. Keep the PreToolUse hook (hook.py) for
-    permissions; revisit channel permission relay when the SDK supports it.
-  * Presence: heartbeats `announce(identity, summary)` so peers can discover this
-    worker via `who`. Identity defaults to settings.peer_name and doubles as the
-    inbox mailbox key (send_prompt(recipient_session=<identity>)).
+  1. PRESENCE (sole announcer). Heartbeats `announce(identity, summary, metadata)` with
+     role="live-session" + `channel: true` (so the brain discovers push-capability and skips
+     notify+pull). It SUBSUMES `session.py` for channel mode — do NOT run both on one identity
+     (announce() is a full upsert; two announcers clobber each other). Presence metadata is
+     read from the same hook-written status file `session.py` uses.
 
-Channel mode is STRICT opt-in. When disabled (the default) the adapter still
-completes the MCP handshake — so Claude Code stays happy even though the entry is
-wired in `.mcp.json` — but it does NOT poll, claim, or push. This is the safety
-switch that lets a configured-but-unintended adapter coexist with `/worker` loop
-mode without eating inbox messages. Arming requires BOTH `channel_enabled` (env or
-Settings) AND launching with `--dangerously-load-development-channels`.
+  2. INBOUND push. Long-polls `wait_for_instruction(recipient_session=identity)` — an
+     automated `/fleet-inbox` — and PUSHES each claimed message as a `notifications/claude/
+     channel` event, carrying `message_id` in `meta` so the agent can echo it back. ONE
+     message in flight at a time (claim -> push -> await reply -> next): the live session runs
+     one turn at a time anyway, and a single in-flight turn keeps the permission correlation
+     (below) crisp.
+
+  3. OUTBOUND reply tool. Exposes an MCP `reply` tool; when the agent calls it the sidecar
+     calls mesh `reply(message_id, response)` -> unblocks the brain's `wait_for_completion` ->
+     the brain delivers to Teams. This is the agent's ONLY reply path (it never sees the mesh
+     worker verbs — invariant 9).
+
+  4. PERMISSION RELAY + approval routing. Declares `claude/channel/permission`. When a tool
+     call in a channel turn opens a permission dialog, Claude Code sends
+     `notifications/claude/channel/permission_request` and the sidecar decides:
+       * our own reply tool + read-only tools (channel_auto_pass_tools) -> allow (no round-trip);
+       * the in-flight message was triggered by an ADMIN (brain stamps metadata.triggering_admin
+         = true on an admin-authorized turn) -> allow immediately (zero friction);
+       * otherwise (non-admin / unknown channel sender) -> mesh `request_approval` ->
+         the brain's Phase-3 `ApprovalWatcher` DMs Jeremy in Teams -> `approve_tool` ->
+         `await_decision` -> verdict. Default DENY on timeout (never auto-approve).
+     A permission_request with NO in-flight channel turn is the operator's OWN local work:
+     the sidecar stays silent and the local terminal dialog handles it.
+
+Why the SDK can't receive the permission notification directly: the MCP SDK's typed receive
+loop validates inbound notifications against `ClientNotification` and DROPS unknown methods.
+We TEE the raw stdio read stream — sniffing each `JSONRPCNotification` before the typed loop
+(params survive intact at the stdio layer), intercepting the permission_request, and
+forwarding everything else to `Server.run()` unchanged.
+
+Channel mode is STRICT opt-in. When disabled (the default) the adapter completes the MCP
+handshake — so Claude Code stays happy even though the entry is wired in `.mcp.json` — but
+does NOT poll, claim, push, or relay. Arming requires BOTH `channel_enabled` (env/Settings)
+AND launching with `--dangerously-load-development-channels`.
 
 Config (CLI flag, else env, else Settings/.env default):
-    --enabled/--no-enabled / CHANNEL_ENABLED   arm the poll/push bridge
-                                     (default: Settings.channel_enabled, off)
-    --identity   / CRM_IDENTITY      mailbox + presence identity
-                                     (default: channel_identity, else peer_name)
+    --enabled/--no-enabled / CHANNEL_ENABLED   arm the bridge (default Settings.channel_enabled)
+    --identity   / CRM_IDENTITY      mailbox + presence identity (default channel_identity/peer)
     --local-url  / CRM_LOCAL_URL     local server MCP URL (default http://127.0.0.1:<port>/mcp)
-                   MCP_API_KEY        bearer for the local server (if it requires auth)
-    --summary    / CRM_SUMMARY       one-line presence blurb shown by who()
-                                     (default: channel_summary)
-    --poll       / CRM_POLL_S        long-poll seconds per wait_for_instruction (default 25)
+                   MCP_API_KEY        bearer for the local server
+    --summary    / CRM_SUMMARY       fallback presence blurb (default channel_summary)
+    --status-file/ CRM_SESSION_STATUS_FILE   JSON status file the CC hooks write (presence metadata)
+    --poll       / CRM_POLL_S        wait_for_instruction long-poll seconds (default 25)
     --heartbeat  / CRM_HEARTBEAT_S   presence heartbeat seconds (default 20)
+    --decision-timeout / CHANNEL_DECISION_TIMEOUT_S  non-admin await_decision budget (default 300)
+    --reply-timeout    / CHANNEL_REPLY_TIMEOUT_S     max wait for the agent's reply before
+                                     claiming the next message (default 1800)
+    --auto-pass        / CHANNEL_AUTO_PASS_TOOLS     comma tools allowed w/o a Teams round-trip
+                                     even on non-admin turns (default Read,Glob,Grep)
                    CRM_CHANNEL_DEBUG set to "0" to silence stderr diagnostics
 """
 
@@ -53,12 +74,12 @@ import asyncio
 import json
 import os
 import sys
-import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import anyio
+from mcp import types
 from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
@@ -67,28 +88,27 @@ from mcp.types import JSONRPCMessage, JSONRPCNotification
 from . import __version__
 
 CHANNEL_METHOD = "notifications/claude/channel"
-SERVER_NAME = "fast-mcp-claude"
-
-# Startup grace before the first push: the MCP handshake completes in well under a
-# second, while a controller's first message is human-speed (seconds) away — so this
-# is ample to avoid pushing into an un-initialized session (which drops events).
-INIT_GRACE_S = 1.0
+PERM_REQUEST = "notifications/claude/channel/permission_request"
+PERM_REPLY = "notifications/claude/channel/permission"
+INITIALIZED = "notifications/initialized"
+# The MCP server name == the .mcp.json key == the `server:<name>` dev-channels flag arg, so the
+# agent's reply tool is mcp__fast-mcp-claude-channel__reply and we can auto-allow it by name.
+SERVER_NAME = "fast-mcp-claude-channel"
+OUR_REPLY_TOOL = f"mcp__{SERVER_NAME}__reply"
 
 INSTRUCTIONS = (
-    "You are a fast-mcp-claude WORKER reachable over a peer channel. Remote "
-    "controllers push tasks to you as "
-    '<channel source="fast-mcp-claude" message_id="..." sender="..."> events.\n'
+    "You are a fast-mcp-claude LIVE session reachable over a peer channel. The eCA brain "
+    "pushes tasks to you as "
+    '<channel source="fast-mcp-claude-channel" message_id="..." sender="..."> events.\n'
     "When you receive one:\n"
     "  1. Treat the channel body as a normal user request and carry it out in this repo.\n"
-    "  2. When finished (or on unrecoverable error), call the `reply` tool on your local "
-    "fast-mcp-claude server, passing the message_id from the tag and a thorough result.\n"
-    "Channel delivery is fire-and-forget: the controller only sees your work after you "
-    "call reply, so ALWAYS reply — even to report a failure. You do not need to poll for "
-    "work; tasks arrive automatically."
+    "  2. When finished (or on unrecoverable error), call the `reply` tool with the EXACT "
+    "`message_id` from the channel tag and a thorough `response`.\n"
+    "Channel delivery is fire-and-forget: the controller only sees your work after you call "
+    "reply, so ALWAYS reply — even to report a failure. Tasks arrive automatically; you never "
+    "need to poll for work."
 )
 
-# Low-level server: handles initialize/ping/unknown-method correctly. We register no
-# tools — this is a one-way (push) channel; the worker replies via the HTTP server.
 _server: Server = Server(SERVER_NAME, version=__version__, instructions=INSTRUCTIONS)
 
 
@@ -96,6 +116,25 @@ def _log(msg: str) -> None:
     # stderr only — stdout is the MCP stdio transport. Lands in ~/.claude/debug/.
     if os.environ.get("CRM_CHANNEL_DEBUG", "1") != "0":
         print(f"[fast-mcp-claude-channel] {msg}", file=sys.stderr, flush=True)
+
+
+# A bad bearer locks the WHOLE mesh endpoint for 60s after 5 attempts, which would also lock out
+# the legitimately-authed hook/launcher on the same server — so on an auth error cool down LONGER
+# than the lockout instead of retry-storming it on the normal 1→30s reconnect backoff (mirrors
+# session.py; see CLAUDE.md "never retry-storm auth failures").
+_AUTH_HINTS = ("401", "403", "unauthorized", "forbidden")
+_AUTH_COOLDOWN_S = 90.0
+
+
+async def _reconnect_sleep(what: str, exc: Exception, backoff: float) -> float:
+    """Shared reconnect handler for the presence/inbox loops: auth → long cooldown, else backoff."""
+    if any(h in str(exc).lower() for h in _AUTH_HINTS):
+        _log(f"{what} AUTH error: {exc}; cooling down {_AUTH_COOLDOWN_S:.0f}s (no retry-storm)")
+        await asyncio.sleep(_AUTH_COOLDOWN_S)
+        return 1.0
+    _log(f"{what} error: {exc}; reconnecting in {backoff:.0f}s")
+    await asyncio.sleep(backoff)
+    return min(backoff * 2, 30.0)
 
 
 @dataclass
@@ -107,6 +146,28 @@ class ChannelConfig:
     poll: float
     heartbeat: float
     enabled: bool
+    status_file: str | None = None
+    decision_timeout: float = 300.0
+    reply_timeout: float = 1800.0
+    auto_pass_tools: frozenset[str] = frozenset({"Read", "Glob", "Grep"})
+
+
+@dataclass
+class _Runtime:
+    """Shared mutable state between the inbox loop, the reply tool, and the permission relay.
+
+    All live on the single asyncio loop, so plain attributes (no locks) are race-free; the
+    only cross-task signal is `reply_event` (set by the reply tool, awaited by the inbox loop).
+    """
+
+    cfg: ChannelConfig
+    inflight: dict[str, Any] | None = None  # the claimed message currently pushed, awaiting reply
+    reply_event: asyncio.Event = field(default_factory=asyncio.Event)
+    initialized: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+# Populated by _serve before any loop or tool handler runs.
+_RT: _Runtime | None = None
 
 
 def _env_float(name: str, default: float) -> float:
@@ -126,29 +187,42 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on", "t", "y")
 
 
+def _parse_tools(raw: str | None) -> frozenset[str] | None:
+    if raw is None:
+        return None
+    return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
 def _resolve_config(argv: list[str]) -> ChannelConfig:
     p = argparse.ArgumentParser(prog="fast-mcp-claude-channel")
     p.add_argument("--identity", default=None)
     p.add_argument("--local-url", default=None)
     p.add_argument("--summary", default=None)
+    p.add_argument("--status-file", default=None)
     p.add_argument("--poll", type=float, default=None)
     p.add_argument("--heartbeat", type=float, default=None)
+    p.add_argument("--decision-timeout", type=float, default=None)
+    p.add_argument("--reply-timeout", type=float, default=None)
+    p.add_argument("--auto-pass", default=None)
     p.add_argument(
         "--enabled",
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Arm the poll/push bridge. Default comes from CHANNEL_ENABLED env, "
-            "else Settings.channel_enabled (off). When off the adapter completes "
-            "the MCP handshake but stays inert — no polling, no inbox claims, no push."
+            "Arm the push/relay bridge. Default comes from CHANNEL_ENABLED env, else "
+            "Settings.channel_enabled (off). When off the adapter completes the MCP handshake "
+            "but stays inert — no polling, no inbox claims, no push, no permission relay."
         ),
     )
     args = p.parse_args(argv)
 
-    # Defaults from the project Settings/.env when available; the adapter and the
-    # server are normally launched from the same directory with the same config.
+    # Defaults from the project Settings/.env when available; the adapter and the server are
+    # normally launched from the same directory with the same config.
     peer_name, port, api_key, poll, heartbeat = "default", 5473, None, 25.0, 20.0
     channel_enabled, channel_identity, channel_summary = False, None, None
+    decision_timeout, reply_timeout = 300.0, 1800.0
+    auto_pass = frozenset({"Read", "Glob", "Grep"})
+    status_file_default = None
     try:
         from .config import get_settings
 
@@ -161,6 +235,12 @@ def _resolve_config(argv: list[str]) -> ChannelConfig:
         channel_enabled = s.channel_enabled
         channel_identity = s.channel_identity
         channel_summary = s.channel_summary
+        decision_timeout = float(getattr(s, "channel_decision_timeout_s", decision_timeout))
+        reply_timeout = float(getattr(s, "channel_reply_timeout_s", reply_timeout))
+        ap = _parse_tools(getattr(s, "channel_auto_pass_tools", None))
+        if ap is not None:
+            auto_pass = ap
+        status_file_default = getattr(s, "session_status_file", "") or None
     except Exception as e:  # bad/missing .env shouldn't kill the adapter
         _log(f"settings unavailable, using bare defaults: {e}")
 
@@ -169,10 +249,30 @@ def _resolve_config(argv: list[str]) -> ChannelConfig:
     local_url = args.local_url or os.environ.get("CRM_LOCAL_URL") or f"http://127.0.0.1:{port}/mcp"
     api_key = os.environ.get("MCP_API_KEY", api_key)
     summary = args.summary or os.environ.get("CRM_SUMMARY") or channel_summary
+    status_file = (
+        args.status_file or os.environ.get("CRM_SESSION_STATUS_FILE") or status_file_default
+    )
     poll = args.poll if args.poll is not None else _env_float("CRM_POLL_S", poll)
     heartbeat = (
         args.heartbeat if args.heartbeat is not None else _env_float("CRM_HEARTBEAT_S", heartbeat)
     )
+    decision_timeout = (
+        args.decision_timeout
+        if args.decision_timeout is not None
+        else _env_float("CHANNEL_DECISION_TIMEOUT_S", decision_timeout)
+    )
+    reply_timeout = (
+        args.reply_timeout
+        if args.reply_timeout is not None
+        else _env_float("CHANNEL_REPLY_TIMEOUT_S", reply_timeout)
+    )
+    # Precedence CLI > env > Settings, using `is not None` per source — NOT `or`: an explicit
+    # `--auto-pass ""` parses to an (intentionally) falsy empty frozenset, and `or` would wrongly
+    # fall through to the env/default, silently ignoring the operator's "auto-pass nothing" opt-out.
+    ap_cli = _parse_tools(args.auto_pass)
+    ap = ap_cli if ap_cli is not None else _parse_tools(os.environ.get("CHANNEL_AUTO_PASS_TOOLS"))
+    if ap is not None:
+        auto_pass = ap
     enabled = (
         args.enabled if args.enabled is not None else _env_bool("CHANNEL_ENABLED", channel_enabled)
     )
@@ -184,6 +284,10 @@ def _resolve_config(argv: list[str]) -> ChannelConfig:
         poll=poll,
         heartbeat=heartbeat,
         enabled=enabled,
+        status_file=status_file,
+        decision_timeout=decision_timeout,
+        reply_timeout=reply_timeout,
+        auto_pass_tools=auto_pass,
     )
 
 
@@ -205,11 +309,100 @@ def _result_data(result: Any) -> dict[str, Any]:
     return {}
 
 
-async def _push(write_stream: Any, msg: dict[str, Any]) -> None:
-    """Push one inbox message into the live Claude session as a channel event.
+def _make_client(cfg: ChannelConfig, timeout: float | None = None) -> Any:
+    """A fastmcp Client to the LOCAL server. The bearer rides on the transport (fastmcp 3.x
+    dropped the Client(headers=) kwarg), mirroring evolv-coder-agent fleet.py + launcher.py."""
+    from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
 
-    Meta keys must be identifiers (letters/digits/underscore) or Claude Code drops
-    them — message_id / sender / recipient all qualify.
+    if cfg.api_key:
+        transport = StreamableHttpTransport(
+            cfg.local_url, headers={"Authorization": f"Bearer {cfg.api_key}"}
+        )
+        return Client(transport, timeout=timeout)
+    return Client(cfg.local_url, timeout=timeout)
+
+
+# ------------------------------------------------------------------ presence (subsumes session.py)
+
+
+def _read_status(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {}
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _build_presence(cfg: ChannelConfig) -> tuple[str | None, dict[str, Any]]:
+    """Summary + metadata for announce(), from the hook-written status file. Mirrors
+    session.py._build_presence but stamps `channel: true` so the brain pushes (no notify+pull)."""
+    st = _read_status(cfg.status_file)
+    status = st.get("status") or "active"
+    last = (st.get("last") or "").strip()
+    repo = st.get("repo") or ""
+    summary = f"{repo or cfg.identity} [{status}]"
+    if last:
+        summary = f"{summary} — {last}"
+    summary = summary[:280]
+    if not (repo or last) and cfg.summary:
+        summary = cfg.summary[:280]
+    meta: dict[str, Any] = {
+        "role": "live-session",
+        "channel": True,
+        "machine": st.get("machine"),
+        "repo": repo or None,
+        "cwd": st.get("cwd"),
+        "branch": st.get("branch"),
+        "status": status,
+        "last": last or None,
+        "status_updated_at": st.get("updated_at"),
+    }
+    return summary, {k: v for k, v in meta.items() if v is not None}
+
+
+async def _presence_loop(cfg: ChannelConfig) -> None:
+    """Heartbeat announce() on its own connection until cancelled (session exit)."""
+    backoff = 1.0
+    warned_announce = False
+    while True:
+        try:
+            async with _make_client(cfg) as c:
+                backoff = 1.0
+                while True:
+                    summary, meta = _build_presence(cfg)
+                    try:
+                        res = await c.call_tool(
+                            "announce",
+                            {"identity": cfg.identity, "summary": summary, "metadata": meta},
+                        )
+                        data = _result_data(res)
+                        if not data.get("success") and not warned_announce:
+                            _log(
+                                f"announce REJECTED for identity={cfg.identity!r} "
+                                f"(this session is INVISIBLE to the brain): {data}"
+                            )
+                            warned_announce = True
+                    except Exception as e:
+                        _log(f"announce failed (continuing): {e}")
+                    await asyncio.sleep(cfg.heartbeat)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            backoff = await _reconnect_sleep("presence", e, backoff)
+
+
+# --------------------------------------------------------------------- inbound push
+
+
+async def _push(write_stream: Any, msg: dict[str, Any]) -> None:
+    """Push one claimed inbox message into the live session as a channel event.
+
+    Meta keys must be identifiers (letters/digits/underscore) or Claude Code drops them —
+    message_id / sender / recipient all qualify.
     """
     meta: dict[str, str] = {
         "message_id": str(msg.get("id", "")),
@@ -225,86 +418,289 @@ async def _push(write_stream: Any, msg: dict[str, Any]) -> None:
     await write_stream.send(SessionMessage(message=JSONRPCMessage(notif)))
 
 
-async def _bridge(write_stream: Any, cfg: ChannelConfig) -> None:
-    """Connect to the local server and pump inbox -> channel until cancelled."""
-    from fastmcp import Client
-    from fastmcp.client.transports import StreamableHttpTransport
-
-    await asyncio.sleep(INIT_GRACE_S)
-
-    def _make_client() -> Client:
-        # fastmcp 3.x: Client() no longer takes a `headers=` kwarg; the bearer rides
-        # on the transport (mirrors evolv-coder-agent fleet.py + launcher.py).
-        if cfg.api_key:
-            transport = StreamableHttpTransport(
-                cfg.local_url, headers={"Authorization": f"Bearer {cfg.api_key}"}
-            )
-            return Client(transport)
-        return Client(cfg.local_url)
+async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
+    """Claim one message at a time -> push -> await its reply -> claim the next."""
+    assert _RT is not None
+    rt = _RT
+    # Don't push before the session has finished initializing (events into an un-initialized
+    # session are dropped). The tee sets this when it sees notifications/initialized.
+    try:
+        await asyncio.wait_for(rt.initialized.wait(), timeout=30.0)
+    except asyncio.TimeoutError:
+        _log("session did not signal initialized within 30s; proceeding anyway")
 
     backoff = 1.0
-    last_announce = 0.0
     while True:
         try:
-            async with _make_client() as c:
+            async with _make_client(cfg) as c:
                 backoff = 1.0
-                _log(f"connected to {cfg.local_url} as identity={cfg.identity!r}")
+                _log(f"inbox bridge connected to {cfg.local_url} as identity={cfg.identity!r}")
                 while True:
-                    if time.time() - last_announce >= cfg.heartbeat:
-                        try:
-                            await c.call_tool(
-                                "announce",
-                                {"identity": cfg.identity, "summary": cfg.summary},
-                            )
-                        except Exception as e:
-                            _log(f"announce failed (continuing): {e}")
-                        last_announce = time.time()
-
                     res = await c.call_tool(
                         "wait_for_instruction",
                         {"recipient_session": cfg.identity, "timeout": cfg.poll},
                     )
                     data = _result_data(res)
                     if not data.get("success"):
-                        _log(f"wait_for_instruction returned error: {data}")
+                        _log(f"wait_for_instruction error: {data}")
                         await asyncio.sleep(1.0)
                         continue
                     msg = data.get("message")
-                    if msg:
-                        await _push(write_stream, msg)
-                        _log(f"pushed message {msg.get('id')} from {msg.get('sender')}")
+                    if not msg:
+                        continue  # long-poll timeout, no message — loop again
+                    rt.inflight = msg
+                    rt.reply_event = asyncio.Event()
+                    await _push(write_stream, msg)
+                    _log(f"pushed message {msg.get('id')} from {msg.get('sender')}; awaiting reply")
+                    try:
+                        await asyncio.wait_for(rt.reply_event.wait(), timeout=cfg.reply_timeout)
+                    except asyncio.TimeoutError:
+                        _log(
+                            f"no channel reply for {msg.get('id')} in {cfg.reply_timeout:.0f}s; "
+                            "claiming next (a late reply still lands via the reply tool)"
+                        )
+                    finally:
+                        rt.inflight = None
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            _log(f"bridge error: {e}; reconnecting in {backoff:.0f}s\n{traceback.format_exc()}")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30.0)
+            _log(f"inbox detail:\n{traceback.format_exc()}")
+            backoff = await _reconnect_sleep("inbox", e, backoff)
+
+
+# --------------------------------------------------------------------- outbound reply tool
+
+
+@_server.list_tools()
+async def _list_tools() -> list[types.Tool]:
+    return [
+        types.Tool(
+            name="reply",
+            description=(
+                "Send your result back to the controller over this channel. Pass the EXACT "
+                "message_id from the channel tag and your full response. This is your only "
+                "reply path — always call it when a channel task is done."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "The message_id attribute from the <channel> tag",
+                    },
+                    "response": {
+                        "type": "string",
+                        "description": "Your result/answer text (or JSON-encoded structured data)",
+                    },
+                },
+                "required": ["message_id", "response"],
+            },
+        )
+    ]
+
+
+async def _mesh_reply(cfg: ChannelConfig, message_id: str, response: str) -> bool:
+    try:
+        async with _make_client(cfg, timeout=30.0) as c:
+            res = await c.call_tool("reply", {"message_id": message_id, "response": response})
+        return bool(_result_data(res).get("success"))
+    except Exception as e:
+        _log(f"mesh reply for {message_id} failed: {e}")
+        return False
+
+
+@_server.call_tool()
+async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+    if name != "reply":
+        raise ValueError(f"unknown tool: {name}")
+    assert _RT is not None
+    cfg = _RT.cfg
+    message_id = str(arguments.get("message_id") or "")
+    # `response` is the schema field; accept `text` as a tolerant alias ONLY when response is
+    # absent (not merely empty) so a deliberately-empty response isn't replaced by a stray arg.
+    raw = arguments.get("response")
+    if raw is None:
+        raw = arguments.get("text")
+    response = str(raw if raw is not None else "")
+    ok = await _mesh_reply(cfg, message_id, response)
+    # Unblock the inbox loop so it claims the next message (only if this reply is for the
+    # in-flight turn; a stale/duplicate reply still relays to the controller but doesn't advance).
+    if _RT.inflight is not None and str(_RT.inflight.get("id")) == message_id:
+        _RT.reply_event.set()
+    if ok:
+        _log(f"replied to controller for message {message_id}")
+        return [types.TextContent(type="text", text="delivered to controller")]
+    return [
+        types.TextContent(
+            type="text",
+            text=(
+                "WARNING: reply NOT recorded (unknown/already-finalized message_id). "
+                "Check the message_id from the channel tag."
+            ),
+        )
+    ]
+
+
+# --------------------------------------------------------------------- permission relay + routing
+
+
+def _is_auto_pass(tool_name: str, cfg: ChannelConfig) -> bool:
+    """Tools allowed without any approval round-trip, even on a non-admin turn: our own reply
+    tool (the delivery path) and the configured read-only set."""
+    if tool_name == OUR_REPLY_TOOL:
+        return True
+    return tool_name in cfg.auto_pass_tools
+
+
+async def _send_permission(write_stream: Any, request_id: Any, behavior: str) -> None:
+    notif = JSONRPCNotification(
+        jsonrpc="2.0",
+        method=PERM_REPLY,
+        params={"request_id": request_id, "behavior": behavior},
+    )
+    await write_stream.send(SessionMessage(message=JSONRPCMessage(notif)))
+
+
+async def _route_approval(
+    cfg: ChannelConfig, inflight: dict[str, Any], tool_name: str, description: str, preview: str
+) -> str:
+    """Non-admin path: open a Phase-3 approval on the LOCAL server, wait for the brain's
+    verdict (its ApprovalWatcher DMs Jeremy). Returns 'allow' or 'deny'; DEFAULT-DENY on any
+    failure or timeout — we NEVER auto-approve a non-admin turn."""
+    try:
+        async with _make_client(cfg, timeout=cfg.decision_timeout + 30.0) as c:
+            res = await c.call_tool(
+                "request_approval",
+                {
+                    "session_id": cfg.identity,
+                    "tool_name": tool_name,
+                    "tool_input": {
+                        "description": description,
+                        "input_preview": preview,
+                        "sender": inflight.get("sender"),
+                        "message_id": inflight.get("id"),
+                    },
+                },
+            )
+            data = _result_data(res)
+            if not data.get("success"):
+                _log(f"request_approval failed: {data}; default-deny")
+                return "deny"
+            approval_id = data.get("approval_id")
+            if not approval_id:
+                # success without an id is a server contract violation — fail safe, don't
+                # call await_decision with a None id (which could match the wrong/first pending).
+                _log(f"request_approval ok but no approval_id ({data}); default-deny")
+                return "deny"
+            res2 = await c.call_tool(
+                "await_decision", {"approval_id": approval_id, "timeout": cfg.decision_timeout}
+            )
+            d = _result_data(res2)
+            if d.get("ready") and isinstance(d.get("approval"), dict):
+                return "allow" if d["approval"].get("decision") == "allow" else "deny"
+            _log(f"approval {approval_id} not decided within budget; default-deny")
+            return "deny"
+    except Exception as e:
+        _log(f"approval routing error: {e}; default-deny")
+        return "deny"
+
+
+async def _handle_permission(write_stream: Any, cfg: ChannelConfig, params: dict[str, Any]) -> None:
+    request_id = params.get("request_id") or params.get("requestId") or params.get("id")
+    tool_name = str(params.get("tool_name") or "?")
+    description = str(params.get("description") or "")
+    preview = str(params.get("input_preview") or "")
+
+    # Our own reply tool is the delivery path — always allow, regardless of who triggered.
+    if tool_name == OUR_REPLY_TOOL:
+        await _send_permission(write_stream, request_id, "allow")
+        return
+
+    assert _RT is not None
+    inflight = _RT.inflight
+    if inflight is None:
+        # No channel turn in flight => this is the operator's OWN local work. Stay silent;
+        # the local terminal dialog (which is always also open) handles it.
+        _log(f"permission_request {request_id} ({tool_name}) — no in-flight channel turn; "
+             "leaving to the local terminal dialog")
+        return
+
+    # Admin auto-allow: trust the brain's per-batch `triggering_admin` stamp (the brain is the
+    # authorization authority — invariant 8 / ADR-0006 — exactly as the launcher trusts the
+    # brain's dispatch). The mesh bearer + loopback-bind + SSH tunnel (ADR-0011) are the trust
+    # boundary; the co-driving operator watching every turn in their terminal is the backstop.
+    # Defense-in-depth: only honor the stamp on a message EXPLICITLY addressed to this identity,
+    # so a blind broadcast (recipient_session=NULL) can't carry triggering_admin into an auto-allow.
+    meta = inflight.get("metadata") if isinstance(inflight.get("metadata"), dict) else {}
+    addressed = inflight.get("recipient_session") == cfg.identity
+    if meta.get("triggering_admin") is True and addressed:
+        await _send_permission(write_stream, request_id, "allow")
+        _log(f"auto-allowed {tool_name} (admin turn, msg {inflight.get('id')})")
+        return
+
+    if _is_auto_pass(tool_name, cfg):
+        await _send_permission(write_stream, request_id, "allow")
+        _log(f"auto-passed read-only {tool_name} (non-admin turn)")
+        return
+
+    decision = await _route_approval(cfg, inflight, tool_name, description, preview)
+    await _send_permission(write_stream, request_id, decision)
+    _log(f"routed {tool_name} -> {decision} (non-admin turn, msg {inflight.get('id')})")
+
+
+async def _tee_reader(
+    read_stream: Any, dst: Any, write_stream: Any, cfg: ChannelConfig, tg: Any
+) -> None:
+    """Sniff raw inbound; intercept the permission notification (the typed loop would drop it),
+    forward everything else to Server.run()."""
+    try:
+        async for msg in read_stream:
+            try:
+                root = getattr(getattr(msg, "message", None), "root", None)
+                method = getattr(root, "method", None)
+                if method == INITIALIZED and _RT is not None:
+                    _RT.initialized.set()
+                elif method == PERM_REQUEST:
+                    params = getattr(root, "params", None) or {}
+                    # Handle out-of-band so the read loop keeps forwarding (await_decision blocks).
+                    tg.start_soon(_handle_permission, write_stream, cfg, params)
+                    continue  # consumed; do NOT forward (the typed loop would drop+warn)
+            except Exception as e:
+                _log(f"tee inspect error: {e}")
+            await dst.send(msg)
+    finally:
+        await dst.aclose()
+
+
+# --------------------------------------------------------------------- serve
 
 
 async def _serve(cfg: ChannelConfig) -> None:
+    global _RT
+    _RT = _Runtime(cfg=cfg)
     init_options = _server.create_initialization_options(
         notification_options=NotificationOptions(),
-        experimental_capabilities={"claude/channel": {}},
+        experimental_capabilities={"claude/channel": {}, "claude/channel/permission": {}},
     )
     if not cfg.enabled:
-        # SAFETY: wired-but-disabled. Complete the MCP handshake so Claude Code is
-        # happy, but DO NOT start the bridge — no polling, no inbox claims, no push.
-        # A disabled adapter that polled would mark messages "delivered" and push
-        # them into a channel nobody is listening to (silent message loss); leaving
-        # it inert lets /worker loop mode own the inbox. Arming requires
-        # CHANNEL_ENABLED=true AND --dangerously-load-development-channels.
-        _log("channel disabled (CHANNEL_ENABLED=false); inert — use /worker loop mode.")
+        # SAFETY: wired-but-disabled. Complete the MCP handshake so Claude Code is happy, but
+        # DO NOT start any loop — no polling, no inbox claims, no push, no relay. A disabled
+        # adapter that polled would claim messages and push them into a channel nobody routes
+        # (silent message loss); leaving it inert lets session.py notify+pull own the inbox.
+        _log("channel disabled (CHANNEL_ENABLED=false); inert handshake only.")
         async with stdio_server() as (read_stream, write_stream):
             await _server.run(read_stream, write_stream, init_options)
         return
 
-    _log(f"starting channel adapter (identity={cfg.identity!r}, local={cfg.local_url})")
+    _log(f"starting channel sidecar (identity={cfg.identity!r}, local={cfg.local_url})")
     async with stdio_server() as (read_stream, write_stream):
+        tee_send, tee_recv = anyio.create_memory_object_stream(256)
         async with anyio.create_task_group() as tg:
-            # Push loop shares the session's stdout write stream; the server loop owns
-            # the protocol (handshake, ping, shutdown when stdin closes).
-            tg.start_soon(_bridge, write_stream, cfg)
-            await _server.run(read_stream, write_stream, init_options)
+            tg.start_soon(_presence_loop, cfg)
+            tg.start_soon(_inbox_loop, cfg, write_stream)
+            tg.start_soon(_tee_reader, read_stream, tee_send, write_stream, cfg, tg)
+            # The server loop owns the protocol (handshake, ping, shutdown when stdin closes).
+            await _server.run(tee_recv, write_stream, init_options)
             tg.cancel_scope.cancel()
 
 

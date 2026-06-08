@@ -3,19 +3,29 @@
 # start-session.sh — launch an interactive Claude Code dev session that is
 # "fleet-visible" to the eCA brain (Phase 4, live-session legs).
 #
-# It wires three things onto a normal `claude` session, then execs into it:
-#   1. up-reporting hooks (SessionStart/UserPromptSubmit/Stop -> fast-mcp-claude-session-hook)
-#      that write a local status file ("what am I working on");
-#   2. the fast-mcp-claude-session SIDECAR (background) — the sole announcer of this
-#      session's presence (role="live-session", identity "<peer>.<repo>") + an inbox
-#      watcher that fires a macOS notification when the brain sends this session a prompt;
-#   3. the local mesh server as the "claude-local" MCP server, so /fleet-inbox can pull
-#      a parked prompt (wait_for_instruction) and answer it (reply).
+# It wires up-reporting hooks (SessionStart/UserPromptSubmit/Stop -> fast-mcp-claude-session-hook
+# that write a local status file) and ONE of two down-delivery mechanisms, then execs claude:
 #
-# Channels (auto-push) are NOT used: Claude Code 2.1.x removed the dev-channel load path,
-# so down-delivery is notify+pull. Run this from inside the repo you want to work in:
+#   notify+pull (default):
+#     - the fast-mcp-claude-session SIDECAR (background) — sole announcer of this session's
+#       presence (role="live-session", identity "<peer>.<repo>") + an inbox watcher that fires
+#       a macOS notification when the brain sends a prompt;
+#     - the local mesh server as the "claude-local" MCP server, so /fleet-inbox can pull a
+#       parked prompt (wait_for_instruction) and answer it (reply).
+#
+#   channel push (CHANNEL_MODE=1, or CHANNEL_ENABLED=true in .env):
+#     - the fast-mcp-claude-channel SIDECAR — spawned by claude via .mcp.json +
+#       --dangerously-load-development-channels — is the sole announcer (announce(channel:true))
+#       AND auto-injects each brain-sent prompt as a <channel> turn, routing the reply back over
+#       the mesh (no /fleet-inbox). Tool calls relay through it for approval. The session runs in
+#       --permission-mode default so consequential tools gate (the relay needs an open dialog).
+#       Channels are a research preview (claude.ai auth required — peers have it; the brain is
+#       Bedrock and only POSTs). Proven live on CC 2.1.168. See docs/channels (and ADR-0010
+#       in the evolv-coder-agent repo).
+#
+# Run this from inside the repo you want to work in:
 #     /path/to/fast-mcp-claude/start-session.sh
-# Optional overrides via env: PEER_NAME, MCP_API_KEY, MCP_LOCAL_URL, FLEET_IDENTITY.
+# Optional overrides via env: PEER_NAME, MCP_API_KEY, MCP_LOCAL_URL, FLEET_IDENTITY, CHANNEL_MODE.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +37,18 @@ PEER_NAME="${PEER_NAME:-$(_envget PEER_NAME)}"; PEER_NAME="${PEER_NAME:-local}"
 MCP_API_KEY="${MCP_API_KEY:-$(_envget MCP_API_KEY)}"
 MCP_PORT="${MCP_PORT:-$(_envget MCP_PORT)}"; MCP_PORT="${MCP_PORT:-5473}"
 MCP_LOCAL_URL="${MCP_LOCAL_URL:-http://127.0.0.1:${MCP_PORT}/mcp}"
+
+# --- channel mode: auto-PUSH down-delivery (vs the default notify+pull) -------------------
+# When on, a fast-mcp-claude-channel sidecar (spawned by claude via .mcp.json + the
+# --dangerously-load-development-channels flag) injects each brain-sent prompt straight into
+# this session as a <channel> turn and routes the reply back over the mesh — no /fleet-inbox.
+# It is then the SOLE presence announcer (channel:true), so we do NOT also start session.py.
+# Gate from CHANNEL_MODE env, else the repo .env CHANNEL_ENABLED; default OFF (notify+pull).
+CHANNEL_MODE="${CHANNEL_MODE:-$(_envget CHANNEL_ENABLED)}"
+case "$CHANNEL_MODE" in
+  1|true|TRUE|True|yes|YES|on|ON) CHANNEL_MODE=1 ;;
+  *) CHANNEL_MODE=0 ;;
+esac
 
 # --- resolve identity: <peer>.<repo-slug> (mesh SESSION_RE: [A-Za-z0-9_.-]) --------------
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -61,8 +83,13 @@ resolve_bin() {
 }
 BIN_SESSION="$(resolve_bin fast-mcp-claude-session)"
 BIN_HOOK="$(resolve_bin fast-mcp-claude-session-hook)"
+BIN_CHANNEL="$(resolve_bin fast-mcp-claude-channel)"
 if [ -z "$BIN_SESSION" ] || [ -z "$BIN_HOOK" ]; then
   echo "ERROR: fast-mcp-claude-session(-hook) not found. Run 'uv sync' in $FMC_REPO." >&2
+  exit 2
+fi
+if [ "$CHANNEL_MODE" = "1" ] && [ -z "$BIN_CHANNEL" ]; then
+  echo "ERROR: CHANNEL_MODE=1 but fast-mcp-claude-channel not found. Run 'uv sync' in $FMC_REPO." >&2
   exit 2
 fi
 
@@ -87,7 +114,7 @@ if [ -f "$FMC_REPO/.claude/commands/fleet-inbox.md" ]; then
   cp -f "$FMC_REPO/.claude/commands/fleet-inbox.md" "$HOME/.claude/commands/fleet-inbox.md"
 fi
 
-# --- temp MCP config (claude-local) + hook settings, both auto-cleaned -------------------
+# --- temp MCP config + hook settings, both auto-cleaned ----------------------------------
 TMPDIR_RUN="$(mktemp -d "${TMPDIR:-/tmp}/eca-session.XXXXXX")"
 cleanup() { rm -rf "$TMPDIR_RUN"; }
 trap cleanup EXIT
@@ -98,14 +125,34 @@ umask 077
 # The bearer goes via ENV, never argv: argv is world-readable via `ps` (even cross-uid),
 # so passing it as an argument would leak the mesh credential. (Mirrors how the launcher
 # keeps the bearer out of worker argv.) The output mcp.json stays 0600 (umask 077 above).
-MCP_API_KEY="${MCP_API_KEY:-}" python3 - "$MCPCFG" "$MCP_LOCAL_URL" <<'PY'
+#
+# Channel mode: the inner agent's ONLY mcp server is the channel sidecar, which owns the
+# mesh worker verbs (wait_for_instruction/reply) + presence + the permission relay. The agent
+# gets NO claude-local (no raw mesh verbs — invariant 9); its only reply path is the channel's
+# own `reply` tool. The channel config (identity/url/bearer/status-file) rides in the .mcp.json
+# `env` block (passed to the subprocess env, NOT argv).
+# notify+pull mode: the agent gets claude-local so /fleet-inbox can wait_for_instruction+reply.
+MCP_API_KEY="${MCP_API_KEY:-}" python3 - \
+  "$MCPCFG" "$MCP_LOCAL_URL" "$CHANNEL_MODE" "$BIN_CHANNEL" "$IDENTITY" "$STATUS_FILE" <<'PY'
 import json, os, sys
-path, url = sys.argv[1:3]
+path, url, channel_mode, channel_bin, identity, status_file = sys.argv[1:7]
 key = os.environ.get("MCP_API_KEY")
-srv = {"type": "http", "url": url}
-if key:
-    srv["headers"] = {"Authorization": f"Bearer {key}"}
-json.dump({"mcpServers": {"claude-local": srv}}, open(path, "w"))
+if channel_mode == "1":
+    env = {
+        "CHANNEL_ENABLED": "true",
+        "CRM_IDENTITY": identity,
+        "CRM_LOCAL_URL": url,
+        "CRM_SESSION_STATUS_FILE": status_file,
+    }
+    if key:
+        env["MCP_API_KEY"] = key
+    servers = {"fast-mcp-claude-channel": {"command": channel_bin, "env": env}}
+else:
+    srv = {"type": "http", "url": url}
+    if key:
+        srv["headers"] = {"Authorization": f"Bearer {key}"}
+    servers = {"claude-local": srv}
+json.dump({"mcpServers": servers}, open(path, "w"))
 PY
 
 # up-reporting hooks: each invokes the status-writer with the status-file path in env.
@@ -119,15 +166,31 @@ json.dump({"hooks": {"SessionStart": entry, "UserPromptSubmit": entry, "Stop": e
 PY
 
 echo "eCA live session: identity=$IDENTITY  repo=$REPO_BASE@$BRANCH  peer=$PEER_NAME" >&2
-echo "  status: $STATUS_FILE   inbox badge: $BADGE_FILE" >&2
-echo "  the brain can now reach this session; on a push run: /fleet-inbox $IDENTITY" >&2
 
-# --- start the sidecar (background), tied to THIS process; then become claude ------------
-# After `exec claude`, this shell's pid is reused by claude, so the sidecar's parent pid
-# stays valid and it exits when the session does.
-MCP_API_KEY="$MCP_API_KEY" CRM_IDENTITY="$IDENTITY" \
-  "$BIN_SESSION" --identity "$IDENTITY" --enabled \
-    --local-url "$MCP_LOCAL_URL" --status-file "$STATUS_FILE" \
-    --badge-file "$BADGE_FILE" --parent-pid "$$" &
-
-exec claude --mcp-config "$MCPCFG" --settings "$SETTINGS" "$@"
+# --- become claude, with the right down-delivery mechanism -------------------------------
+# After `exec claude`, this shell's pid is reused by claude, so a backgrounded sidecar's
+# parent pid stays valid and it exits when the session does.
+if [ "$CHANNEL_MODE" = "1" ]; then
+  # PUSH: the fast-mcp-claude-channel sidecar is spawned BY claude (the .mcp.json entry above)
+  # and is the SOLE presence announcer (announce(channel:true)); we do NOT also start
+  # session.py (two announcers on one identity clobber each other's presence). Down-delivery
+  # is automatic — no /fleet-inbox. The session runs in --permission-mode default (NOT auto /
+  # NOT skip): consequential tools in a channel turn must open a dialog so the sidecar's
+  # permission relay can gate them (admin-triggered -> auto-allow; non-admin -> Teams approval).
+  echo "  status: $STATUS_FILE" >&2
+  echo "  channel mode: AUTO-PUSH on — the channel sidecar announces + delivers (no /fleet-inbox)" >&2
+  echo "  one-time per repo: accept the folder-trust + dev-channels prompts; then pm2/tmux is unattended" >&2
+  exec claude --mcp-config "$MCPCFG" --settings "$SETTINGS" \
+    --permission-mode default \
+    --dangerously-load-development-channels "server:fast-mcp-claude-channel" "$@"
+else
+  # NOTIFY+PULL: session.py is the sole announcer + inbox notifier; the operator pulls with
+  # /fleet-inbox (wait_for_instruction -> reply via claude-local).
+  echo "  status: $STATUS_FILE   inbox badge: $BADGE_FILE" >&2
+  echo "  the brain can now reach this session; on a push run: /fleet-inbox $IDENTITY" >&2
+  MCP_API_KEY="$MCP_API_KEY" CRM_IDENTITY="$IDENTITY" \
+    "$BIN_SESSION" --identity "$IDENTITY" --enabled \
+      --local-url "$MCP_LOCAL_URL" --status-file "$STATUS_FILE" \
+      --badge-file "$BADGE_FILE" --parent-pid "$$" &
+  exec claude --mcp-config "$MCPCFG" --settings "$SETTINGS" "$@"
+fi

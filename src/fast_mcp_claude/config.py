@@ -84,6 +84,19 @@ class Settings(BaseSettings):
     channel_identity: str | None = None
     # One-line presence blurb the adapter heartbeats via announce().
     channel_summary: str | None = None
+    # Non-admin permission routing (channel mode): seconds the sidecar waits on await_decision
+    # for the brain's verdict before DEFAULT-DENYing a gated tool. Keep this ABOVE the brain's
+    # approval_prompt_ttl_seconds (it auto-denies first) so a real deny lands rather than a
+    # timeout. Admin turns auto-allow without any round-trip, so this only bounds non-admin.
+    channel_decision_timeout_s: float = 300.0
+    # Max seconds the sidecar waits for the agent's reply() to a pushed message before claiming
+    # the next (the live session runs one turn at a time; a late reply still relays). High so a
+    # long task isn't cut short.
+    channel_reply_timeout_s: float = 1800.0
+    # Comma-separated tools the channel permission relay lets through WITHOUT a Teams round-trip
+    # even on a non-admin turn. Read-only by default so only consequential calls (Bash/Edit/
+    # Write/...) prompt the operator in Teams. (Our own reply tool is always auto-allowed.)
+    channel_auto_pass_tools: str = "Read,Glob,Grep"
 
     # Live-session sidecar (fast-mcp-claude-session) — STRICT opt-in, default off. The
     # launch wrapper starts ONE per interactive dev session. It is the SOLE announcer of

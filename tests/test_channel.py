@@ -637,7 +637,7 @@ def test_send_to_session_notify_passes_payload(session_rig):
     assert "delivered" in out[0].text
 
 
-def test_send_to_session_wait_for_reply_uses_longer_budget(session_rig):
+def test_send_to_session_wait_for_reply_await_outlasts_hub_wait(session_rig):
     session_rig["set_result"]({"ok": True, "result": {"ready": True, "reply": "on dev"}})
     anyio.run(
         channel_mod._call_tool, "send_to_session",
@@ -645,7 +645,9 @@ def test_send_to_session_wait_for_reply_uses_longer_budget(session_rig):
     )
     call = session_rig["calls"][0]
     assert call["payload"]["wait_for_reply"] is True
-    assert call["timeout"] == 90.0  # honored the requested budget
+    assert call["payload"]["wait_seconds"] == 90  # clamped W is sent to the hub (no drift)
+    # the local await must OUTLAST the hub's W-second wait, else a slow target reports false failure
+    assert call["timeout"] == 90.0 + channel_mod._RELAY_AWAIT_MARGIN
 
 
 def test_send_to_session_wait_budget_capped(session_rig):
@@ -654,7 +656,33 @@ def test_send_to_session_wait_budget_capped(session_rig):
         channel_mod._call_tool, "send_to_session",
         {"target": "x.y", "text": "t", "wait_for_reply": True, "wait_seconds": 9999},
     )
-    assert session_rig["calls"][0]["timeout"] == 270.0  # clamped under the mesh 300s cap
+    call = session_rig["calls"][0]
+    assert call["payload"]["wait_seconds"] == channel_mod._RELAY_WAIT_CAP  # clamped to 270
+    assert call["timeout"] == 300.0  # (270 + margin) clamped under the mesh 300s await cap
+
+
+def test_send_to_session_wait_seconds_zero_uses_default(session_rig):
+    session_rig["set_result"]({"ok": True, "result": {}})
+    anyio.run(
+        channel_mod._call_tool, "send_to_session",
+        {"target": "x.y", "text": "t", "wait_for_reply": True, "wait_seconds": 0},
+    )
+    call = session_rig["calls"][0]
+    # 0 means "use the default" (not a 0s no-wait), and the SAME W goes to hub + await budget
+    assert call["payload"]["wait_seconds"] == channel_mod._RELAY_SEND_DEFAULT_WAIT
+    assert call["timeout"] == channel_mod._RELAY_SEND_DEFAULT_WAIT + channel_mod._RELAY_AWAIT_MARGIN
+
+
+def test_check_session_message_await_outlasts_hub_poll(session_rig):
+    session_rig["set_result"]({"ok": True, "result": {"ready": False}})
+    anyio.run(channel_mod._call_tool, "check_session_message", {"message_id": "abc"})
+    call = session_rig["calls"][0]
+    assert call["op"] == "check"
+    assert call["payload"]["wait_seconds"] == channel_mod._RELAY_CHECK_DEFAULT_WAIT
+    assert (
+        call["timeout"]
+        == channel_mod._RELAY_CHECK_DEFAULT_WAIT + channel_mod._RELAY_AWAIT_MARGIN
+    )
 
 
 def test_check_session_message_listed_and_auto_pass():

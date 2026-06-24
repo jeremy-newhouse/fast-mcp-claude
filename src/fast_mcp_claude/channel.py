@@ -673,6 +673,10 @@ async def _list_tools() -> list[types.Tool]:
                         "type": "string",
                         "description": "The message_id from the earlier send_to_session result",
                     },
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": "Max seconds to wait for the reply this poll (capped)",
+                    },
                 },
                 "required": ["message_id"],
             },
@@ -794,6 +798,30 @@ def _fmt(obj: Any) -> str:
         return str(obj)
 
 
+# Session/hub wait-budget contract (ADR-0015). The CALLER picks W; the hub (brain) waits W
+# before it completes the op; this sidecar awaits W + margin so the await ALWAYS outlives the
+# hub's wait — otherwise a slow/absent target makes the await expire first and surface a false
+# "no result within budget" while the hub is still waiting (and will deliver). W is clamped here
+# (the single source of truth) and sent in the payload, so the hub's wait and this await can't
+# drift. Keep W + margin under the mesh 300s await cap.
+_RELAY_AWAIT_MARGIN = 30.0
+_RELAY_WAIT_CAP = 270.0
+_RELAY_SEND_DEFAULT_WAIT = 120.0
+_RELAY_CHECK_DEFAULT_WAIT = 60.0
+
+
+def _relay_budget(wait_seconds: Any, default: float) -> float:
+    """Clamp a caller-supplied wait to [1, _RELAY_WAIT_CAP]; None/non-positive/garbage -> default
+    (so wait_for_reply with wait_seconds=0 means 'use the default', not a 0s no-wait)."""
+    try:
+        w = float(wait_seconds) if wait_seconds is not None else default
+    except (TypeError, ValueError):
+        w = default
+    if w <= 0:
+        w = default
+    return min(max(w, 1.0), _RELAY_WAIT_CAP)
+
+
 async def _mesh_session_op(
     cfg: ChannelConfig, op: str, payload: dict[str, Any], timeout: float
 ) -> dict[str, Any]:
@@ -808,7 +836,9 @@ async def _mesh_session_op(
             )
             data = _result_data(res)
             if not data.get("success"):
-                return {"ok": False, "error": "request_session_op rejected by the local server"}
+                err = data.get("error")
+                detail = err.get("message") if isinstance(err, dict) else err
+                return {"ok": False, "error": f"request_session_op rejected: {detail or 'unknown'}"}
             request_id = data.get("request_id")
             if not request_id:
                 return {"ok": False, "error": "request_session_op returned no request_id"}
@@ -859,18 +889,17 @@ async def _handle_send_to_session(
         ]
     if not text.strip():
         return [types.TextContent(type="text", text="send_to_session: `text` is required")]
-    payload: dict[str, Any] = {"target": target, "text": text, "wait_for_reply": wait_for_reply}
-    if wait_seconds is not None:
-        payload["wait_seconds"] = wait_seconds
     if wait_for_reply:
-        try:
-            budget = float(wait_seconds) if wait_seconds else 120.0
-        except (TypeError, ValueError):
-            budget = 120.0
-        budget = min(max(budget, 1.0), 270.0)  # stay under the mesh 300s wait cap
+        # Clamp W once and send it in the payload (the hub waits exactly this); await W + margin.
+        w = _relay_budget(wait_seconds, _RELAY_SEND_DEFAULT_WAIT)
+        payload: dict[str, Any] = {
+            "target": target, "text": text, "wait_for_reply": True, "wait_seconds": w,
+        }
+        await_timeout = min(w + _RELAY_AWAIT_MARGIN, 300.0)
     else:
-        budget = 60.0
-    out = await _mesh_session_op(cfg, "send", payload, timeout=budget)
+        payload = {"target": target, "text": text, "wait_for_reply": False}
+        await_timeout = 60.0  # notify completes fast (the hub just injects + acks)
+    out = await _mesh_session_op(cfg, "send", payload, timeout=await_timeout)
     if not out.get("ok"):
         result = out.get("result")
         err = (result or {}).get("error") if isinstance(result, dict) else out.get("error")
@@ -889,7 +918,15 @@ async def _handle_check_session_message(
                 type="text", text="check_session_message: `message_id` is required"
             )
         ]
-    out = await _mesh_session_op(cfg, "check", {"message_id": message_id}, timeout=60.0)
+    # Same budget contract as send: the hub polls W, we await W + margin (so the await outlives
+    # the hub's poll instead of the previous fixed 60s < hub's poll mismatch).
+    w = _relay_budget(arguments.get("wait_seconds"), _RELAY_CHECK_DEFAULT_WAIT)
+    out = await _mesh_session_op(
+        cfg,
+        "check",
+        {"message_id": message_id, "wait_seconds": w},
+        timeout=min(w + _RELAY_AWAIT_MARGIN, 300.0),
+    )
     if not out.get("ok"):
         result = out.get("result")
         err = (result or {}).get("error") if isinstance(result, dict) else out.get("error")

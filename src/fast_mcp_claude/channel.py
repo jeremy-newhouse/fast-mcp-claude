@@ -803,9 +803,11 @@ def _fmt(obj: Any) -> str:
 # hub's wait — otherwise a slow/absent target makes the await expire first and surface a false
 # "no result within budget" while the hub is still waiting (and will deliver). W is clamped here
 # (the single source of truth) and sent in the payload, so the hub's wait and this await can't
-# drift. Keep W + margin under the mesh 300s await cap.
+# drift. The cap MUST NOT exceed the hub's own mesh-wait cap (brain MESH_WAIT_CAP_S = 240) — a
+# larger W would be silently shortened by the hub, so it would not actually wait the W we sent.
+# W (<=240) + margin (30) = 270 stays under the mesh 300s await cap.
 _RELAY_AWAIT_MARGIN = 30.0
-_RELAY_WAIT_CAP = 270.0
+_RELAY_WAIT_CAP = 240.0
 _RELAY_SEND_DEFAULT_WAIT = 120.0
 _RELAY_CHECK_DEFAULT_WAIT = 60.0
 
@@ -855,14 +857,29 @@ async def _mesh_session_op(
         return {"ok": False, "error": str(e)}
 
 
+def _session_op_error(out: dict[str, Any], label: str) -> str | None:
+    """The hub's failure message for a _mesh_session_op result, or None on success."""
+    if out.get("ok"):
+        return None
+    result = out.get("result")
+    err = (result or {}).get("error") if isinstance(result, dict) else out.get("error")
+    return f"{label}: {err}"
+
+
+def _session_op_reply(out: dict[str, Any], label: str) -> list[types.TextContent]:
+    """Full render for send/check: the hub's error, else the formatted result JSON."""
+    if (err := _session_op_error(out, label)) is not None:
+        return [types.TextContent(type="text", text=err)]
+    result = out.get("result") if isinstance(out.get("result"), dict) else {}
+    return [types.TextContent(type="text", text=_fmt(result))]
+
+
 async def _handle_list_sessions(
     cfg: ChannelConfig, arguments: dict[str, Any]
 ) -> list[types.TextContent]:
     out = await _mesh_session_op(cfg, "list", {}, timeout=60.0)
-    if not out.get("ok"):
-        result = out.get("result")
-        err = (result or {}).get("error") if isinstance(result, dict) else out.get("error")
-        return [types.TextContent(type="text", text=f"could not list sessions: {err}")]
+    if (err := _session_op_error(out, "could not list sessions")) is not None:
+        return [types.TextContent(type="text", text=err)]
     result = out.get("result") if isinstance(out.get("result"), dict) else {}
     sessions = result.get("sessions") or []
     if not sessions:
@@ -900,12 +917,7 @@ async def _handle_send_to_session(
         payload = {"target": target, "text": text, "wait_for_reply": False}
         await_timeout = 60.0  # notify completes fast (the hub just injects + acks)
     out = await _mesh_session_op(cfg, "send", payload, timeout=await_timeout)
-    if not out.get("ok"):
-        result = out.get("result")
-        err = (result or {}).get("error") if isinstance(result, dict) else out.get("error")
-        return [types.TextContent(type="text", text=f"send_to_session failed: {err}")]
-    result = out.get("result") if isinstance(out.get("result"), dict) else {}
-    return [types.TextContent(type="text", text=_fmt(result))]
+    return _session_op_reply(out, "send_to_session failed")
 
 
 async def _handle_check_session_message(
@@ -927,12 +939,7 @@ async def _handle_check_session_message(
         {"message_id": message_id, "wait_seconds": w},
         timeout=min(w + _RELAY_AWAIT_MARGIN, 300.0),
     )
-    if not out.get("ok"):
-        result = out.get("result")
-        err = (result or {}).get("error") if isinstance(result, dict) else out.get("error")
-        return [types.TextContent(type="text", text=f"check_session_message failed: {err}")]
-    result = out.get("result") if isinstance(out.get("result"), dict) else {}
-    return [types.TextContent(type="text", text=_fmt(result))]
+    return _session_op_reply(out, "check_session_message failed")
 
 
 @_server.call_tool()

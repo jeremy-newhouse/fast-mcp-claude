@@ -657,8 +657,10 @@ def test_send_to_session_wait_budget_capped(session_rig):
         {"target": "x.y", "text": "t", "wait_for_reply": True, "wait_seconds": 9999},
     )
     call = session_rig["calls"][0]
-    assert call["payload"]["wait_seconds"] == channel_mod._RELAY_WAIT_CAP  # clamped to 270
-    assert call["timeout"] == 300.0  # (270 + margin) clamped under the mesh 300s await cap
+    assert call["payload"]["wait_seconds"] == channel_mod._RELAY_WAIT_CAP  # clamped to 240
+    # await = cap + margin (240 + 30 = 270), still under the mesh 300s await cap; and the cap
+    # equals the hub's MESH_WAIT_CAP_S so the hub actually honors the full W we send
+    assert call["timeout"] == channel_mod._RELAY_WAIT_CAP + channel_mod._RELAY_AWAIT_MARGIN
 
 
 def test_send_to_session_wait_seconds_zero_uses_default(session_rig):

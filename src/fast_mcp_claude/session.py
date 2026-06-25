@@ -193,7 +193,8 @@ def _build_presence(cfg: SessionConfig) -> tuple[str | None, dict[str, Any]]:
     status = st.get("status") or "active"
     last = (st.get("last") or "").strip()
     repo = st.get("repo") or ""
-    summary = f"{repo or cfg.identity} [{status}]"
+    name = st.get("name") or ""
+    summary = f"{repo or cfg.identity}{(' · ' + name) if name else ''} [{status}]"
     if last:
         summary = f"{summary} — {last}"
     summary = summary[:280]
@@ -203,6 +204,7 @@ def _build_presence(cfg: SessionConfig) -> tuple[str | None, dict[str, Any]]:
         "role": "live-session",
         "machine": st.get("machine"),
         "repo": repo or None,
+        "name": name or None,
         "cwd": st.get("cwd"),
         "branch": st.get("branch"),
         "status": status,

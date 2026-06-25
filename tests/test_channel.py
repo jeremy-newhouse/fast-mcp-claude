@@ -303,6 +303,19 @@ def test_presence_reads_status_file(tmp_path):
     assert "writing tests" in summary
 
 
+def test_presence_includes_name(tmp_path):
+    # ADR-0016: presence publishes the session name + folds it into the summary.
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({
+        "machine": "mini2", "repo": "evolv-coder-agent", "name": "planning",
+        "branch": "dev", "status": "active",
+    }))
+    cfg = _cfg(identity="mini2.eca", status_file=str(sf))
+    summary, meta = channel_mod._build_presence(cfg)
+    assert meta["name"] == "planning"
+    assert "planning" in summary
+
+
 # -------------------------------------------------- permission relay routing
 
 

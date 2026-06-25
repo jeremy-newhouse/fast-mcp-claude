@@ -77,6 +77,8 @@ mcp = FastMCP(
         "              wait_for_pending_approval, approve_tool, await_decision\n"
         "  TeamsOutbox:request_teams_send, await_teams_send (channel),\n"
         "              wait_for_pending_teams_send, complete_teams_send (hub)\n"
+        "  SessionRelay:request_session_op, await_session_op (session),\n"
+        "              wait_for_pending_session_ops, complete_session_op (hub)\n"
         "  Files:      list_files, read_file, write_file  (sandboxed to\n"
         "              WORKSPACE_ROOTS)\n"
         "  Pub/sub:    publish, subscribe\n"
@@ -96,5 +98,6 @@ from .tools import (  # noqa: E402, F401
     permissions,
     presence,
     pubsub,
+    session_relay,
     teams_outbox,
 )

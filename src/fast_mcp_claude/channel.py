@@ -96,8 +96,22 @@ INITIALIZED = "notifications/initialized"
 SERVER_NAME = "fast-mcp-claude-channel"
 OUR_REPLY_TOOL = f"mcp__{SERVER_NAME}__reply"
 OUR_SEND_TEAMS_TOOL = f"mcp__{SERVER_NAME}__send_teams"
+OUR_LIST_SESSIONS_TOOL = f"mcp__{SERVER_NAME}__list_sessions"
+OUR_SEND_TO_SESSION_TOOL = f"mcp__{SERVER_NAME}__send_to_session"
+OUR_CHECK_SESSION_MESSAGE_TOOL = f"mcp__{SERVER_NAME}__check_session_message"
+# Our own tools are delivery/control paths (like reply): always allow the CALL — the hub
+# re-applies any policy on its side. Kept as a set so the permission relay + auto-pass agree.
+OUR_TOOLS = frozenset(
+    {
+        OUR_REPLY_TOOL,
+        OUR_SEND_TEAMS_TOOL,
+        OUR_LIST_SESSIONS_TOOL,
+        OUR_SEND_TO_SESSION_TOOL,
+        OUR_CHECK_SESSION_MESSAGE_TOOL,
+    }
+)
 
-INSTRUCTIONS = (
+INSTRUCTIONS_BASE = (
     "You are a fast-mcp-claude LIVE session reachable over a peer channel. The eCA brain "
     "pushes tasks to you as "
     '<channel source="fast-mcp-claude-channel" message_id="..." sender="..."> events.\n'
@@ -111,6 +125,85 @@ INSTRUCTIONS = (
     "To post a message to a Microsoft Teams chat via the eCA hub, call the `send_teams` tool "
     "(`text`, optional `target` chat name — omit it to post back to the chat that sent you this "
     "task). It returns whether the hub delivered it."
+)
+
+# Teams formatting conventions. These live in the server `instructions` (not in a skill) because
+# the instructions are the ONLY context guaranteed present in EVERY channel-handling session, on
+# EVERY peer and in EVERY repo. A pushed task reads as a generic repo job, so nothing else flags
+# the eventual send_teams / relayed reply as Teams-bound — without this block the rules would only
+# fire in repos that happen to carry a Teams skill. Keep this the GENERIC, repo-agnostic subset;
+# repo-specific detail (destination chat names, JIRA host, repo/org names, any message preface)
+# stays in the working repo's own Teams skill, which this block tells the session to load.
+# The one concrete name kept inline — the operator `Jeremy Newhouse` — is deployment-universal,
+# NOT repo-specific: the brain has a single admin/approver across the whole fleet (invariant 8;
+# the ApprovalWatcher DMs that same person), and send_teams needs a real, resolvable target, so a
+# placeholder would be unactionable here.
+_TEAMS_FORMATTING = """\
+## Teams formatting (MANDATORY)
+
+Apply before EVERY send_teams call, and before any reply whose content will be
+relayed to a Teams chat. If the working repo provides a Teams formatting skill
+(e.g. .claude/skills/teams-ultra-chat), load it for the repo-specific DATA it
+defines — destination chat names, JIRA host, and repo/org names. The rules below
+are the non-negotiable subset and OVERRIDE any conflicting general etiquette in
+that skill (e.g. a message preface); they apply on EVERY peer and in EVERY repo,
+even when no such skill is present.
+
+- Tables: use Markdown pipe-tables — a header row, a `| --- |` separator row, and
+  EACH data row on its OWN line. NEVER collapse a table onto a single line (it
+  renders as raw text — the most common failure). The hub renders pipe-tables as
+  real grids, including `[text](url)` links inside cells (verified 2026-06-08).
+- Links: every JIRA key, PR number, commit SHA, and URL must be a Markdown link,
+  never bare — e.g. `[ABC-34](https://<jira-host>/browse/ABC-34)` or
+  `[be#187](https://github.com/<org>/<repo>/pull/187)`. Take the JIRA host, repo,
+  and org from the WORKING repo (its git remotes / its Teams skill), never from
+  memory or another repo. Commit links require the FULL 40-char SHA (get it via
+  `git rev-parse <short-sha>`; a fabricated suffix 404s silently). Link refs even
+  inside table cells — a bare key in a cell is not acceptable.
+- No emojis, ever. No "From Claude Code" preface (this is a dedicated agent
+  identity). No confidential client data. Push commits to the remote BEFORE
+  linking them.
+- Route by audience — pick ONE destination per message. Project/team work updates
+  go to the team chat the working repo's Teams skill names; do NOT guess a chat
+  name, and do NOT post one repo's updates to another repo's chat. Admin
+  approvals, decisions, and sensitive / 1:1 items go to the operator
+  (`Jeremy Newhouse`). When unsure between a team chat and the operator for
+  anything needing approval or holding sensitive detail → the operator.
+- Never mention peer-machine names, IPs, hostnames, or runtime/environment detail
+  in a team chat (those may go to the operator only, when relevant).
+"""
+
+# Session-to-session messaging (ADR-0015). These tools let the operator's live sessions stay
+# in sync with each other. They are relayed by the eCA hub (the only node that can reach every
+# peer); a message into another session arrives as a normal turn prefixed
+# "[Session message from <identity>]".
+_SESSION_MESSAGING = """\
+## Talking to the operator's other sessions
+
+You can see and message the operator's OTHER live Claude Code sessions (across all their
+machines) to keep work in sync. The eCA hub relays this — you never address peers directly.
+
+- `list_sessions()` — list the operator's other live sessions: machine, repo, branch, what
+  each is doing (status), and whether it is channel-push capable. Use this to answer "what is
+  everyone working on?" or to find a target's address before sending.
+- `send_to_session(target, text, wait_for_reply=false)` — deliver a message to another session.
+  - `target` is `machine.repo` (e.g. `mbpm2.backend`) from list_sessions, or `"all"` to send to
+    every other live session at once (a broadcast — e.g. "I'm about to deploy, pause pushes").
+  - Default is fire-and-forget (an FYI). Set `wait_for_reply=true` (single target only) to block
+    for the other session's answer; if it doesn't answer within the wait budget the message is
+    still delivered and its reply will be pushed back to you when it lands.
+
+Use these for coordination ("I changed the API contract in <repo>, rebase", "what's your
+branch?"). The receiving session sees your message as a normal turn and decides what to do; a
+relayed message does NOT get elevated tool permissions on the other side.
+"""
+
+INSTRUCTIONS = (
+    INSTRUCTIONS_BASE
+    + "\n\n"
+    + _SESSION_MESSAGING.rstrip()
+    + "\n\n"
+    + _TEAMS_FORMATTING.rstrip()
 )
 
 _server: Server = Server(SERVER_NAME, version=__version__, instructions=INSTRUCTIONS)
@@ -483,7 +576,9 @@ async def _list_tools() -> list[types.Tool]:
             description=(
                 "Send your result back to the controller over this channel. Pass the EXACT "
                 "message_id from the channel tag and your full response. This is your only "
-                "reply path — always call it when a channel task is done."
+                "reply path — always call it when a channel task is done. If this reply will "
+                "be relayed to a Teams chat, format it per the Teams conventions in the server "
+                "instructions (pipe-tables row-per-line, Markdown links for all refs, no emojis)."
             ),
             inputSchema={
                 "type": "object",
@@ -506,7 +601,10 @@ async def _list_tools() -> list[types.Tool]:
                 "Post a message to a Microsoft Teams chat via the eCA hub. `text` is the "
                 "message; `target` is the destination chat name (omit to post back to the chat "
                 "that sent you the current task). The hub posts only for admin-triggered tasks "
-                "and resolves the chat name; this returns whether it was delivered."
+                "and resolves the chat name; this returns whether it was delivered. Format per "
+                "the Teams conventions in the server instructions before sending: pipe-tables "
+                "with each row on its own line; every JIRA key / PR / commit / URL as a Markdown "
+                "link (no bare refs); no emojis."
             ),
             inputSchema={
                 "type": "object",
@@ -518,6 +616,69 @@ async def _list_tools() -> list[types.Tool]:
                     },
                 },
                 "required": ["text"],
+            },
+        ),
+        types.Tool(
+            name="list_sessions",
+            description=(
+                "List the operator's OTHER live Claude Code sessions across all their machines "
+                "(via the eCA hub): machine, repo, branch, status (what each is working on), and "
+                "whether it is channel-push capable. Use to answer 'what is everyone working on?' "
+                "or to find a target's machine.repo before send_to_session. Takes no arguments."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        types.Tool(
+            name="send_to_session",
+            description=(
+                "Send a message to another of the operator's live sessions, relayed by the eCA "
+                "hub, to keep work in sync. `target` is `machine.repo` (from list_sessions) or "
+                "'all' to broadcast to every other live session. Default is fire-and-forget (an "
+                "FYI); set `wait_for_reply` true (single target only) to block for the other "
+                "session's answer. The message arrives at the target as a normal turn and does "
+                "NOT grant it elevated tool permissions."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Destination 'machine.repo' (from list_sessions), or 'all'",
+                    },
+                    "text": {"type": "string", "description": "Message to deliver"},
+                    "wait_for_reply": {
+                        "type": "boolean",
+                        "description": "Block for the target's reply (single target only)",
+                    },
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": "Max seconds to wait when wait_for_reply (capped)",
+                    },
+                },
+                "required": ["target", "text"],
+            },
+        ),
+        types.Tool(
+            name="check_session_message",
+            description=(
+                "Collect a reply to an earlier send_to_session(wait_for_reply=true) that didn't "
+                "answer within the wait budget. Pass the `message_id` it returned. Returns the "
+                "reply if it has landed, or {ready:false} to check again. (The reply is also "
+                "pushed to you automatically when it lands; this is the explicit pull.)"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "The message_id from the earlier send_to_session result",
+                    },
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": "Max seconds to wait for the reply this poll (capped)",
+                    },
+                },
+                "required": ["message_id"],
             },
         ),
     ]
@@ -630,6 +791,157 @@ async def _handle_send_teams(
     return [types.TextContent(type="text", text=f"NOT posted to Teams: {detail}")]
 
 
+def _fmt(obj: Any) -> str:
+    try:
+        return json.dumps(obj, indent=2, ensure_ascii=False)
+    except Exception:
+        return str(obj)
+
+
+# Session/hub wait-budget contract (ADR-0015). The CALLER picks W; the hub (brain) waits W
+# before it completes the op; this sidecar awaits W + margin so the await ALWAYS outlives the
+# hub's wait — otherwise a slow/absent target makes the await expire first and surface a false
+# "no result within budget" while the hub is still waiting (and will deliver). W is clamped here
+# (the single source of truth) and sent in the payload, so the hub's wait and this await can't
+# drift. The cap MUST NOT exceed the hub's own mesh-wait cap (brain MESH_WAIT_CAP_S = 240) — a
+# larger W would be silently shortened by the hub, so it would not actually wait the W we sent.
+# W (<=240) + margin (30) = 270 stays under the mesh 300s await cap.
+_RELAY_AWAIT_MARGIN = 30.0
+_RELAY_WAIT_CAP = 240.0
+_RELAY_SEND_DEFAULT_WAIT = 120.0
+_RELAY_CHECK_DEFAULT_WAIT = 60.0
+
+
+def _relay_budget(wait_seconds: Any, default: float) -> float:
+    """Clamp a caller-supplied wait to [1, _RELAY_WAIT_CAP]; None/non-positive/garbage -> default
+    (so wait_for_reply with wait_seconds=0 means 'use the default', not a 0s no-wait)."""
+    try:
+        w = float(wait_seconds) if wait_seconds is not None else default
+    except (TypeError, ValueError):
+        w = default
+    if w <= 0:
+        w = default
+    return min(max(w, 1.0), _RELAY_WAIT_CAP)
+
+
+async def _mesh_session_op(
+    cfg: ChannelConfig, op: str, payload: dict[str, Any], timeout: float
+) -> dict[str, Any]:
+    """request_session_op -> await_session_op on the LOCAL server. Returns {ok, result|error}.
+    The hub (brain SessionRelayWatcher) does the cross-peer routing and completes the op — this
+    just queues it locally and waits for the result."""
+    try:
+        async with _make_client(cfg, timeout=timeout + 30.0) as c:
+            res = await c.call_tool(
+                "request_session_op",
+                {"op": op, "payload": payload, "requester_session": cfg.identity},
+            )
+            data = _result_data(res)
+            if not data.get("success"):
+                err = data.get("error")
+                detail = err.get("message") if isinstance(err, dict) else err
+                return {"ok": False, "error": f"request_session_op rejected: {detail or 'unknown'}"}
+            request_id = data.get("request_id")
+            if not request_id:
+                return {"ok": False, "error": "request_session_op returned no request_id"}
+            res2 = await c.call_tool(
+                "await_session_op", {"request_id": request_id, "timeout": timeout}
+            )
+            d = _result_data(res2)
+            if d.get("ready") and isinstance(d.get("request"), dict):
+                req = d["request"]
+                return {"ok": bool(req.get("ok")), "result": req.get("result")}
+            return {"ok": False, "error": "no result within budget (the hub may still be working)"}
+    except Exception as e:
+        _log(f"session_op {op} failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def _session_op_error(out: dict[str, Any], label: str) -> str | None:
+    """The hub's failure message for a _mesh_session_op result, or None on success."""
+    if out.get("ok"):
+        return None
+    result = out.get("result")
+    err = (result or {}).get("error") if isinstance(result, dict) else out.get("error")
+    return f"{label}: {err}"
+
+
+def _session_op_reply(out: dict[str, Any], label: str) -> list[types.TextContent]:
+    """Full render for send/check: the hub's error, else the formatted result JSON."""
+    if (err := _session_op_error(out, label)) is not None:
+        return [types.TextContent(type="text", text=err)]
+    result = out.get("result") if isinstance(out.get("result"), dict) else {}
+    return [types.TextContent(type="text", text=_fmt(result))]
+
+
+async def _handle_list_sessions(
+    cfg: ChannelConfig, arguments: dict[str, Any]
+) -> list[types.TextContent]:
+    out = await _mesh_session_op(cfg, "list", {}, timeout=60.0)
+    if (err := _session_op_error(out, "could not list sessions")) is not None:
+        return [types.TextContent(type="text", text=err)]
+    result = out.get("result") if isinstance(out.get("result"), dict) else {}
+    sessions = result.get("sessions") or []
+    if not sessions:
+        note = "no other live sessions are currently running"
+        unreachable = result.get("unreachable_machines") or []
+        if unreachable:
+            note += f"\nunreachable machines: {_fmt(unreachable)}"
+        return [types.TextContent(type="text", text=note)]
+    return [types.TextContent(type="text", text=_fmt(result))]
+
+
+async def _handle_send_to_session(
+    cfg: ChannelConfig, arguments: dict[str, Any]
+) -> list[types.TextContent]:
+    target = str(arguments.get("target") or "").strip()
+    text = str(arguments.get("text") or "")
+    wait_for_reply = bool(arguments.get("wait_for_reply"))
+    wait_seconds = arguments.get("wait_seconds")
+    if not target:
+        return [
+            types.TextContent(
+                type="text", text="send_to_session: `target` is required (machine.repo or 'all')"
+            )
+        ]
+    if not text.strip():
+        return [types.TextContent(type="text", text="send_to_session: `text` is required")]
+    if wait_for_reply:
+        # Clamp W once and send it in the payload (the hub waits exactly this); await W + margin.
+        w = _relay_budget(wait_seconds, _RELAY_SEND_DEFAULT_WAIT)
+        payload: dict[str, Any] = {
+            "target": target, "text": text, "wait_for_reply": True, "wait_seconds": w,
+        }
+        await_timeout = min(w + _RELAY_AWAIT_MARGIN, 300.0)
+    else:
+        payload = {"target": target, "text": text, "wait_for_reply": False}
+        await_timeout = 60.0  # notify completes fast (the hub just injects + acks)
+    out = await _mesh_session_op(cfg, "send", payload, timeout=await_timeout)
+    return _session_op_reply(out, "send_to_session failed")
+
+
+async def _handle_check_session_message(
+    cfg: ChannelConfig, arguments: dict[str, Any]
+) -> list[types.TextContent]:
+    message_id = str(arguments.get("message_id") or "").strip()
+    if not message_id:
+        return [
+            types.TextContent(
+                type="text", text="check_session_message: `message_id` is required"
+            )
+        ]
+    # Same budget contract as send: the hub polls W, we await W + margin (so the await outlives
+    # the hub's poll instead of the previous fixed 60s < hub's poll mismatch).
+    w = _relay_budget(arguments.get("wait_seconds"), _RELAY_CHECK_DEFAULT_WAIT)
+    out = await _mesh_session_op(
+        cfg,
+        "check",
+        {"message_id": message_id, "wait_seconds": w},
+        timeout=min(w + _RELAY_AWAIT_MARGIN, 300.0),
+    )
+    return _session_op_reply(out, "check_session_message failed")
+
+
 @_server.call_tool()
 async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
     assert _RT is not None
@@ -638,6 +950,12 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCon
         return await _handle_reply(cfg, arguments)
     if name == "send_teams":
         return await _handle_send_teams(cfg, arguments)
+    if name == "list_sessions":
+        return await _handle_list_sessions(cfg, arguments)
+    if name == "send_to_session":
+        return await _handle_send_to_session(cfg, arguments)
+    if name == "check_session_message":
+        return await _handle_check_session_message(cfg, arguments)
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -645,10 +963,10 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCon
 
 
 def _is_auto_pass(tool_name: str, cfg: ChannelConfig) -> bool:
-    """Tools allowed without any approval round-trip, even on a non-admin turn: our own reply +
-    send_teams tools (delivery paths — the hub re-gates send_teams via triggering_admin) and the
-    configured read-only set."""
-    if tool_name in (OUR_REPLY_TOOL, OUR_SEND_TEAMS_TOOL):
+    """Tools allowed without any approval round-trip, even on a non-admin turn: our own
+    delivery/control tools (reply, send_teams, list_sessions, send_to_session — the hub applies
+    any policy on its side) and the configured read-only set."""
+    if tool_name in OUR_TOOLS:
         return True
     return tool_name in cfg.auto_pass_tools
 
@@ -712,9 +1030,9 @@ async def _handle_permission(write_stream: Any, cfg: ChannelConfig, params: dict
     description = str(params.get("description") or "")
     preview = str(params.get("input_preview") or "")
 
-    # Our own reply / send_teams tools are delivery paths — always allow the tool CALL,
-    # regardless of who triggered (send_teams is re-gated hub-side on triggering_admin).
-    if tool_name in (OUR_REPLY_TOOL, OUR_SEND_TEAMS_TOOL):
+    # Our own tools are delivery/control paths — always allow the tool CALL, regardless of who
+    # triggered (the hub re-applies policy: send_teams on triggering_admin; session relay routing).
+    if tool_name in OUR_TOOLS:
         await _send_permission(write_stream, request_id, "allow")
         return
 

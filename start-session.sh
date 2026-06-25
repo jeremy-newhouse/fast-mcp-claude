@@ -74,11 +74,24 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 REPO_BASE="$(basename "$REPO_ROOT")"
 REPO_SLUG="$(printf '%s' "$REPO_BASE" | tr -c 'A-Za-z0-9_.-' '-' )"
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-# Short stable hash of the ABSOLUTE repo root so two same-basename checkouts (worktrees,
-# ~/a/api and ~/b/api) get DISTINCT mailboxes instead of clobbering one shared presence
-# row + inbox. The human still addresses the session by machine/repo (metadata.repo).
+# Short stable hash of the ABSOLUTE repo root — the fallback distinguisher when there is
+# neither a session name NOR a branch (detached HEAD), so two same-basename checkouts still
+# get DISTINCT mailboxes instead of clobbering one shared presence row + inbox.
 REPO_HASH="$(printf '%s' "$REPO_ROOT" | cksum | cut -d' ' -f1)"
-IDENTITY="${FLEET_IDENTITY:-${PEER_NAME}.${REPO_SLUG}-${REPO_HASH}}"
+
+# Session NAME (ADR-0016): distinguishes multiple sessions in the SAME repo on one host and
+# gives each a human handle. Defaults to the git branch; override with SESSION_NAME. Slugged to
+# the mesh SESSION_RE and folded into the identity as its final segment (<peer>.<repo>.<name>),
+# so same-dir sessions get DISTINCT presence rows + are addressable by name. Falls back to the
+# path-hash suffix only when there is neither a name nor a branch (detached HEAD).
+SESSION_NAME="${SESSION_NAME:-}"
+if [ -z "$SESSION_NAME" ] && [ "$BRANCH" != "?" ]; then SESSION_NAME="$BRANCH"; fi
+NAME_SLUG="$(printf '%s' "$SESSION_NAME" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/^[-.]*//; s/[-.]*$//')"
+if [ -n "$NAME_SLUG" ]; then
+  IDENTITY="${FLEET_IDENTITY:-${PEER_NAME}.${REPO_SLUG}.${NAME_SLUG}}"
+else
+  IDENTITY="${FLEET_IDENTITY:-${PEER_NAME}.${REPO_SLUG}-${REPO_HASH}}"
+fi
 
 # Hard-fail on an identity the mesh server would reject (SESSION_RE ^[A-Za-z0-9_.-]{1,128}$),
 # mirroring validate_launcher_identity. A stray space/quote/unicode in PEER_NAME or
@@ -119,12 +132,12 @@ STATUS_FILE="$SESS_DIR/$IDENTITY.json"
 BADGE_FILE="$SESS_DIR/$IDENTITY.badge"
 
 # seed the status file (valid JSON via python so the hook/sidecar merge cleanly)
-python3 - "$STATUS_FILE" "$IDENTITY" "$PEER_NAME" "$REPO_BASE" "$REPO_ROOT" "$BRANCH" <<'PY'
+python3 - "$STATUS_FILE" "$IDENTITY" "$PEER_NAME" "$REPO_BASE" "$REPO_ROOT" "$BRANCH" "$NAME_SLUG" <<'PY'
 import json, sys, time
-path, identity, machine, repo, cwd, branch = sys.argv[1:7]
+path, identity, machine, repo, cwd, branch, name = sys.argv[1:8]
 json.dump({"identity": identity, "machine": machine, "repo": repo, "cwd": cwd,
-           "branch": branch, "status": "starting", "started_at": time.time(),
-           "updated_at": time.time(), "last": ""}, open(path, "w"))
+           "branch": branch, "name": name or None, "status": "starting",
+           "started_at": time.time(), "updated_at": time.time(), "last": ""}, open(path, "w"))
 PY
 
 # --- ensure the /fleet-inbox pull command is installed at user level ---------------------

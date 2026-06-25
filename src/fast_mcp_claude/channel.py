@@ -183,12 +183,14 @@ _SESSION_MESSAGING = """\
 You can see and message the operator's OTHER live Claude Code sessions (across all their
 machines) to keep work in sync. The eCA hub relays this — you never address peers directly.
 
-- `list_sessions()` — list the operator's other live sessions: machine, repo, branch, what
-  each is doing (status), and whether it is channel-push capable. Use this to answer "what is
-  everyone working on?" or to find a target's address before sending.
+- `list_sessions()` — list the operator's other live sessions: machine, repo, name, branch,
+  what each is doing (status), and whether it is channel-push capable. Several sessions can
+  share a repo on one host — the `name` (default: the git branch) disambiguates them. Use this
+  to answer "what is everyone working on?" or to find a target's address before sending.
 - `send_to_session(target, text, wait_for_reply=false)` — deliver a message to another session.
-  - `target` is `machine.repo` (e.g. `mbpm2.backend`) from list_sessions, or `"all"` to send to
-    every other live session at once (a broadcast — e.g. "I'm about to deploy, pause pushes").
+  - `target` is `machine.repo`, `machine.name`, `machine.repo.name`, or a bare unique `name`
+    (all from list_sessions) — or `"all"` to broadcast to every other live session at once
+    (e.g. "I'm about to deploy, pause pushes"). Address by name when sessions share a repo.
   - Default is fire-and-forget (an FYI). Set `wait_for_reply=true` (single target only) to block
     for the other session's answer; if it doesn't answer within the wait budget the message is
     still delivered and its reply will be pushed back to you when it lands.
@@ -441,7 +443,8 @@ def _build_presence(cfg: ChannelConfig) -> tuple[str | None, dict[str, Any]]:
     status = st.get("status") or "active"
     last = (st.get("last") or "").strip()
     repo = st.get("repo") or ""
-    summary = f"{repo or cfg.identity} [{status}]"
+    name = st.get("name") or ""
+    summary = f"{repo or cfg.identity}{(' · ' + name) if name else ''} [{status}]"
     if last:
         summary = f"{summary} — {last}"
     summary = summary[:280]
@@ -452,6 +455,7 @@ def _build_presence(cfg: ChannelConfig) -> tuple[str | None, dict[str, Any]]:
         "channel": True,
         "machine": st.get("machine"),
         "repo": repo or None,
+        "name": name or None,
         "cwd": st.get("cwd"),
         "branch": st.get("branch"),
         "status": status,
@@ -622,9 +626,11 @@ async def _list_tools() -> list[types.Tool]:
             name="list_sessions",
             description=(
                 "List the operator's OTHER live Claude Code sessions across all their machines "
-                "(via the eCA hub): machine, repo, branch, status (what each is working on), and "
-                "whether it is channel-push capable. Use to answer 'what is everyone working on?' "
-                "or to find a target's machine.repo before send_to_session. Takes no arguments."
+                "(via the eCA hub): machine, repo, name, branch, status (what each is working "
+                "on), and whether it is channel-push capable. Several sessions can share a repo "
+                "on one host — the `name` (default: the git branch) disambiguates them. Use to "
+                "answer 'what is everyone working on?' or to find a target before send_to_session. "
+                "Takes no arguments."
             ),
             inputSchema={"type": "object", "properties": {}},
         ),
@@ -632,18 +638,23 @@ async def _list_tools() -> list[types.Tool]:
             name="send_to_session",
             description=(
                 "Send a message to another of the operator's live sessions, relayed by the eCA "
-                "hub, to keep work in sync. `target` is `machine.repo` (from list_sessions) or "
-                "'all' to broadcast to every other live session. Default is fire-and-forget (an "
-                "FYI); set `wait_for_reply` true (single target only) to block for the other "
-                "session's answer. The message arrives at the target as a normal turn and does "
-                "NOT grant it elevated tool permissions."
+                "hub, to keep work in sync. `target` is `machine.repo`, `machine.name`, "
+                "`machine.repo.name`, or a bare unique `name` (all from list_sessions) — or "
+                "'all' to broadcast to every other live session. When several sessions share a "
+                "repo on one host, address by name. Default is fire-and-forget (an FYI); set "
+                "`wait_for_reply` true (single target only) to block for the other session's "
+                "answer. The message arrives at the target as a normal turn and does NOT grant "
+                "it elevated tool permissions."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "target": {
                         "type": "string",
-                        "description": "Destination 'machine.repo' (from list_sessions), or 'all'",
+                        "description": (
+                            "Destination: 'machine.repo', 'machine.name', "
+                            "'machine.repo.name', a unique 'name', or 'all'"
+                        ),
                     },
                     "text": {"type": "string", "description": "Message to deliver"},
                     "wait_for_reply": {

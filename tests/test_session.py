@@ -134,6 +134,18 @@ def test_build_presence_falls_back_to_summary_when_no_status(tmp_path):
     assert meta["role"] == "live-session"
 
 
+def test_build_presence_includes_name(tmp_path):
+    # ADR-0016: the session name (seeded from --name / git branch) is published in presence.
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({
+        "machine": "mini2", "repo": "api", "name": "planning",
+        "branch": "feat-x", "status": "working", "last": "y", "updated_at": 1.0,
+    }))
+    summary, meta = session_mod._build_presence(_cfg(status_file=str(sf)))
+    assert meta["name"] == "planning"
+    assert "planning" in summary
+
+
 # ----------------------------------------------------------------- inbox watcher (no claim)
 
 

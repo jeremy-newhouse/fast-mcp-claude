@@ -72,6 +72,22 @@ STDERR_TAIL_BYTES = 8192
 # Env vars stripped from the spawned worker's environment (mesh bearer must not leak).
 _SCRUB_ENV_EXACT = ("MCP_API_KEY",)
 _SCRUB_ENV_PREFIX = ("CRM_",)
+# Consecutive failed announces before the heartbeat tells the bridge to rebuild the client.
+# A `fast-mcp-claude` restart kills our MCP session; the long-poll main loop can stay blocked
+# against that dead session, so the heartbeat is the reliable detector. ~2 intervals avoids
+# rebuilding on a one-off blip while still recovering in well under a minute (GH #3).
+_ANNOUNCE_FAILS_BEFORE_RECONNECT = 2
+# Auth-failure hints: a bad bearer won't be fixed by reconnecting (and 5 in a row lock the
+# whole endpoint for 60s), so an auth error must NEVER trip a rebuild.
+_AUTH_HINTS = ("401", "403", "unauthorized", "forbidden")
+
+
+class _ReconnectNeeded(Exception):
+    """Force a client rebuild from the bridge loop. Raised when the heartbeat detects the local
+    server's MCP session has gone (a `fast-mcp-claude` restart surfaces ONLY as a persistent
+    'announce failed' — which the blocked long-poll wouldn't otherwise act on, so the launcher
+    would heartbeat 'Session terminated' forever and silently drop out of who()). Caught by the
+    outer reconnect-with-backoff in _bridge (GH #3)."""
 
 
 def _log(msg: str) -> None:
@@ -945,8 +961,18 @@ def _announce_metadata(cfg: LauncherConfig) -> dict[str, Any]:
     }
 
 
-async def _heartbeat_loop(client: Any, cfg: LauncherConfig, running: "_Counter") -> None:
-    """Independent task: announce presence every cfg.heartbeat seconds (like channel.py)."""
+async def _heartbeat_loop(
+    client: Any, cfg: LauncherConfig, running: "_Counter", reconnect_needed: asyncio.Event
+) -> None:
+    """Independent task: announce presence every cfg.heartbeat seconds (like channel.py).
+
+    After _ANNOUNCE_FAILS_BEFORE_RECONNECT consecutive NON-auth failures, set reconnect_needed
+    and exit so the bridge rebuilds the client: a `fast-mcp-claude` restart shows up here as a
+    persistent 'Session terminated', and without this the launcher would announce-fail forever
+    and drop out of who() while the main loop stayed blocked on a dead session (GH #3). Auth
+    failures never trip a rebuild (reconnecting won't fix a bad bearer, and would risk the 60s
+    endpoint lockout)."""
+    consecutive = 0
     while True:
         try:
             await client.call_tool(
@@ -957,9 +983,52 @@ async def _heartbeat_loop(client: Any, cfg: LauncherConfig, running: "_Counter")
                     "metadata": _announce_metadata(cfg),
                 },
             )
+            consecutive = 0
         except Exception as e:
             _log(f"announce failed (continuing): {e}")
+            if any(h in str(e).lower() for h in _AUTH_HINTS):
+                consecutive = 0  # auth won't recover via reconnect; never trip a rebuild
+            else:
+                consecutive += 1
+                if consecutive >= _ANNOUNCE_FAILS_BEFORE_RECONNECT:
+                    _log(
+                        f"announce failed {consecutive}x consecutively; signaling bridge to "
+                        "rebuild the client (local server likely restarted)"
+                    )
+                    reconnect_needed.set()
+                    return
         await asyncio.sleep(cfg.heartbeat)
+
+
+async def _wait_for_instruction_or_reconnect(
+    c: Any, cfg: LauncherConfig, reconnect_needed: asyncio.Event
+) -> Any:
+    """Long-poll wait_for_instruction, but abort with _ReconnectNeeded if the heartbeat signals a
+    dead session while we're blocked — otherwise a server restart could leave us parked in a poll
+    against a session the server has forgotten, forever (GH #3). Returns the raw tool result; any
+    error from the call itself propagates (the bridge's outer handler reconnects on it too)."""
+    call = asyncio.ensure_future(
+        c.call_tool(
+            "wait_for_instruction",
+            {"recipient_session": cfg.identity, "timeout": cfg.poll},
+        )
+    )
+    dead = asyncio.ensure_future(reconnect_needed.wait())
+    try:
+        await asyncio.wait({call, dead}, return_when=asyncio.FIRST_COMPLETED)
+        if call.done():
+            return call.result()  # re-raises a call error -> outer reconnect
+        raise _ReconnectNeeded()  # heartbeat tripped while the poll was still blocked
+    finally:
+        # Settle whichever future we're abandoning so it can't leak as a pending task. The
+        # in-flight call is cancelled here; the client context is about to be torn down anyway.
+        for fut in (call, dead):
+            if not fut.done():
+                fut.cancel()
+                try:
+                    await fut
+                except (asyncio.CancelledError, Exception):
+                    pass
 
 
 async def _bridge(cfg: LauncherConfig) -> None:
@@ -1006,16 +1075,22 @@ async def _bridge(cfg: LauncherConfig) -> None:
                     reaped_once = True
                 else:
                     _log("reconnect: skipping reaper (live in-flight tasks must not be reaped)")
-                heartbeat_task = asyncio.create_task(_heartbeat_loop(c, cfg, running))
+                # Fresh per connection: the heartbeat sets this if it detects the session has
+                # died (server restart), and the main poll races against it so a blocked
+                # long-poll can't strand us on a dead session (GH #3).
+                reconnect_needed = asyncio.Event()
+                heartbeat_task = asyncio.create_task(
+                    _heartbeat_loop(c, cfg, running, reconnect_needed)
+                )
                 while True:
                     # Slot FIRST: never claim a task we can't run (claiming flips it
                     # to 'delivered'; a crash before reply would lose it).
                     await sem.acquire()
+                    if reconnect_needed.is_set():
+                        sem.release()  # heartbeat already flagged a dead session
+                        raise _ReconnectNeeded()
                     try:
-                        res = await c.call_tool(
-                            "wait_for_instruction",
-                            {"recipient_session": cfg.identity, "timeout": cfg.poll},
-                        )
+                        res = await _wait_for_instruction_or_reconnect(c, cfg, reconnect_needed)
                     except Exception:
                         sem.release()  # give the slot back before reconnecting
                         raise
@@ -1038,6 +1113,14 @@ async def _bridge(cfg: LauncherConfig) -> None:
         except asyncio.CancelledError:
             await _shutdown(client, cfg, live, tasks, heartbeat_task)
             raise
+        except _ReconnectNeeded:
+            # Expected control-flow signal (heartbeat saw a dead session), not a crash: rebuild
+            # the client promptly and without a noisy traceback. The next connect re-announces.
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+            _log("rebuilding client after detecting a dead session (server restart)")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
         except Exception as e:
             if heartbeat_task is not None:
                 heartbeat_task.cancel()

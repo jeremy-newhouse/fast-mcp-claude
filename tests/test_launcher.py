@@ -963,5 +963,105 @@ def test_announce_metadata_shape():
     assert md["cwd_allowlist"] == ["/tmp/a"]
 
 
+# ================================================================ GH #3 reconnect
+
+# A `fast-mcp-claude` restart kills the launcher's MCP session; the heartbeat must detect the
+# persistent failure and force a client rebuild instead of announce-failing forever (and the
+# blocked long-poll must abort rather than strand on the dead session).
+
+
+class _AnnounceRaises:
+    """Local client whose announce() always raises; everything else is unexpected."""
+
+    def __init__(self, exc):
+        self._exc = exc
+        self.announce_calls = 0
+
+    async def call_tool(self, name, args):
+        if name == "announce":
+            self.announce_calls += 1
+            raise self._exc
+        raise AssertionError(f"unexpected call {name!r}")
+
+
+async def test_heartbeat_trips_reconnect_after_consecutive_failures():
+    client = _AnnounceRaises(RuntimeError("Session terminated"))
+    ev = asyncio.Event()
+    await asyncio.wait_for(
+        L._heartbeat_loop(client, _cfg(heartbeat=0.0), L._Counter(), ev), timeout=2.0
+    )
+    assert ev.is_set()  # signalled the bridge to rebuild
+    assert client.announce_calls == L._ANNOUNCE_FAILS_BEFORE_RECONNECT
+
+
+async def test_heartbeat_auth_failure_never_trips_reconnect():
+    """A bad bearer won't be fixed by reconnecting (and could re-arm the 60s lockout), so an
+    auth error must keep retrying without ever signalling a rebuild."""
+    client = _AnnounceRaises(RuntimeError("401 Unauthorized"))
+    ev = asyncio.Event()
+    task = asyncio.create_task(L._heartbeat_loop(client, _cfg(heartbeat=0.0), L._Counter(), ev))
+    await asyncio.sleep(0.05)  # let it fail many times
+    assert not ev.is_set()
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.announce_calls > L._ANNOUNCE_FAILS_BEFORE_RECONNECT  # kept trying, never tripped
+
+
+async def test_heartbeat_transient_blip_does_not_accumulate():
+    """One failure among successes resets the counter — only a SUSTAINED outage rebuilds."""
+
+    class _FlakyOnce:
+        def __init__(self):
+            self.n = 0
+
+        async def call_tool(self, name, args):
+            self.n += 1
+            if name == "announce" and self.n == 1:
+                raise RuntimeError("one-off blip")
+            return FakeClient._Res({"success": True})
+
+    ev = asyncio.Event()
+    task = asyncio.create_task(
+        L._heartbeat_loop(_FlakyOnce(), _cfg(heartbeat=0.0), L._Counter(), ev)
+    )
+    await asyncio.sleep(0.05)
+    assert not ev.is_set()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_wait_for_instruction_aborts_when_session_dies():
+    """A long-poll blocked against a dead session aborts with _ReconnectNeeded once the heartbeat
+    flags it — the core of the fix: no more stranding forever (GH #3)."""
+    never = asyncio.Event()
+
+    class _Blocks:
+        async def call_tool(self, name, args):
+            assert name == "wait_for_instruction"
+            await never.wait()  # a poll that never returns against the dead session
+
+    ev = asyncio.Event()
+    task = asyncio.create_task(L._wait_for_instruction_or_reconnect(_Blocks(), _cfg(poll=30.0), ev))
+    await asyncio.sleep(0.01)
+    assert not task.done()  # genuinely blocked on the poll
+    ev.set()  # heartbeat detected the dead session
+    with pytest.raises(L._ReconnectNeeded):
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+async def test_wait_for_instruction_returns_result_when_healthy():
+    class _Returns:
+        async def call_tool(self, name, args):
+            return FakeClient._Res({"success": True, "message": {"id": "x" * 32}})
+
+    ev = asyncio.Event()
+    res = await L._wait_for_instruction_or_reconnect(_Returns(), _cfg(poll=1.0), ev)
+    assert L._result_data(res)["message"]["id"] == "x" * 32
+    assert not ev.is_set()
+
+
 # Reference os/sys so static checkers don't flag the imports used only in fakes.
 _ = (os, sys)

@@ -440,6 +440,28 @@ def test_send_teams_tool_listed():
     assert "send_teams" in names and "reply" in names
 
 
+def test_instructions_carry_generic_teams_formatting():
+    """Teams conventions must live in the server instructions (the only context guaranteed present
+    in every channel session on every peer/repo) and stay repo-agnostic — no evolv-ultra chat
+    names / repos / JIRA host hardcoded, so they never mislead a session in a different repo."""
+    instr = channel_mod.INSTRUCTIONS
+    assert "## Teams formatting (MANDATORY)" in instr
+    assert "pipe-tables" in instr and "row" in instr.lower()
+    assert "git rev-parse" in instr  # full 40-char SHA rule
+    assert "No emojis" in instr
+    # Repo-specific detail is deferred to the working repo's Teams skill, NOT hardcoded here.
+    for leak in ("ULTRADEV TEAM CHAT", "ULTRA TEAM CHAT", "evolv-ultra-be", "evolving-ai"):
+        assert leak not in instr, f"repo-specific {leak!r} leaked into generic server instructions"
+
+
+def test_tool_descriptions_point_to_teams_formatting():
+    tools = {t.name: t for t in anyio.run(channel_mod._list_tools)}
+    for name in ("send_teams", "reply"):
+        desc = tools[name].description or ""
+        assert "Teams conventions in the server instructions" in desc
+        assert "no emojis" in desc.lower()
+
+
 def test_send_teams_is_auto_pass():
     cfg = _cfg()
     assert channel_mod._is_auto_pass(channel_mod.OUR_SEND_TEAMS_TOOL, cfg) is True
@@ -526,3 +548,161 @@ def test_send_teams_requires_text(send_teams_rig):
     out = anyio.run(channel_mod._call_tool, "send_teams", {"text": "   "})
     assert send_teams_rig["calls"] == []  # never reaches the mesh
     assert "required" in out[0].text
+
+
+# -------------------------------------------------- session-to-session relay (ADR-0015)
+
+
+def test_session_tools_listed():
+    names = {t.name for t in anyio.run(channel_mod._list_tools)}
+    assert "list_sessions" in names and "send_to_session" in names
+
+
+def test_session_tools_are_auto_pass():
+    cfg = _cfg(auto_pass_tools=frozenset())  # even with NO read-only allowlist
+    assert channel_mod._is_auto_pass(channel_mod.OUR_LIST_SESSIONS_TOOL, cfg) is True
+    assert channel_mod._is_auto_pass(channel_mod.OUR_SEND_TO_SESSION_TOOL, cfg) is True
+
+
+def test_relay_session_tools_always_allowed(relay):
+    # Delivery/control paths: allowed regardless of in-flight turn, never routed to Teams.
+    relay["set_inflight"](None)
+    anyio.run(
+        channel_mod._handle_permission, None, _cfg(),
+        _perm_params(channel_mod.OUR_SEND_TO_SESSION_TOOL),
+    )
+    assert relay["sent"] == [("vaxrc", "allow")]
+    assert relay["routed"] == []
+
+
+def test_instructions_carry_session_messaging():
+    instr = channel_mod.INSTRUCTIONS
+    assert "## Talking to the operator's other sessions" in instr
+    assert "list_sessions()" in instr
+    assert "send_to_session(" in instr
+    assert "wait_for_reply" in instr
+
+
+@pytest.fixture
+def session_rig(monkeypatch):
+    """Record _mesh_session_op calls and return a configured result."""
+    calls = []
+    result_box = {"ok": True, "result": {}}
+
+    async def fake_op(cfg, op, payload, timeout):
+        calls.append({"op": op, "payload": payload, "timeout": timeout})
+        return result_box["result_value"] if "result_value" in result_box else result_box
+
+    monkeypatch.setattr(channel_mod, "_mesh_session_op", fake_op)
+    channel_mod._RT = channel_mod._Runtime(cfg=_cfg(enabled=True))
+    yield {"calls": calls, "set_result": lambda v: result_box.__setitem__("result_value", v)}
+    channel_mod._RT = None
+
+
+def test_list_sessions_formats_result(session_rig):
+    session_rig["set_result"](
+        {"ok": True, "result": {"sessions": [{"identity": "mbpm2.backend", "repo": "backend"}]}}
+    )
+    out = anyio.run(channel_mod._call_tool, "list_sessions", {})
+    assert session_rig["calls"][0]["op"] == "list"
+    assert "mbpm2.backend" in out[0].text
+
+
+def test_list_sessions_empty(session_rig):
+    session_rig["set_result"]({"ok": True, "result": {"sessions": []}})
+    out = anyio.run(channel_mod._call_tool, "list_sessions", {})
+    assert "no other live sessions" in out[0].text
+
+
+def test_send_to_session_requires_target_and_text(session_rig):
+    out = anyio.run(channel_mod._call_tool, "send_to_session", {"text": "hi"})
+    assert "`target` is required" in out[0].text
+    out2 = anyio.run(channel_mod._call_tool, "send_to_session", {"target": "mbpm2.backend"})
+    assert "`text` is required" in out2[0].text
+    assert session_rig["calls"] == []  # never reached the mesh
+
+
+def test_send_to_session_notify_passes_payload(session_rig):
+    session_rig["set_result"]({"ok": True, "result": {"delivered": True, "ready": False}})
+    out = anyio.run(
+        channel_mod._call_tool, "send_to_session",
+        {"target": "mbpm2.backend", "text": "rebase pls"},
+    )
+    call = session_rig["calls"][0]
+    assert call["op"] == "send"
+    assert call["payload"]["target"] == "mbpm2.backend"
+    assert call["payload"]["text"] == "rebase pls"
+    assert call["payload"]["wait_for_reply"] is False
+    assert call["timeout"] == 60.0  # short budget for notify
+    assert "delivered" in out[0].text
+
+
+def test_send_to_session_wait_for_reply_await_outlasts_hub_wait(session_rig):
+    session_rig["set_result"]({"ok": True, "result": {"ready": True, "reply": "on dev"}})
+    anyio.run(
+        channel_mod._call_tool, "send_to_session",
+        {"target": "mbpm2.backend", "text": "branch?", "wait_for_reply": True, "wait_seconds": 90},
+    )
+    call = session_rig["calls"][0]
+    assert call["payload"]["wait_for_reply"] is True
+    assert call["payload"]["wait_seconds"] == 90  # clamped W is sent to the hub (no drift)
+    # the local await must OUTLAST the hub's W-second wait, else a slow target reports false failure
+    assert call["timeout"] == 90.0 + channel_mod._RELAY_AWAIT_MARGIN
+
+
+def test_send_to_session_wait_budget_capped(session_rig):
+    session_rig["set_result"]({"ok": True, "result": {}})
+    anyio.run(
+        channel_mod._call_tool, "send_to_session",
+        {"target": "x.y", "text": "t", "wait_for_reply": True, "wait_seconds": 9999},
+    )
+    call = session_rig["calls"][0]
+    assert call["payload"]["wait_seconds"] == channel_mod._RELAY_WAIT_CAP  # clamped to 240
+    # await = cap + margin (240 + 30 = 270), still under the mesh 300s await cap; and the cap
+    # equals the hub's MESH_WAIT_CAP_S so the hub actually honors the full W we send
+    assert call["timeout"] == channel_mod._RELAY_WAIT_CAP + channel_mod._RELAY_AWAIT_MARGIN
+
+
+def test_send_to_session_wait_seconds_zero_uses_default(session_rig):
+    session_rig["set_result"]({"ok": True, "result": {}})
+    anyio.run(
+        channel_mod._call_tool, "send_to_session",
+        {"target": "x.y", "text": "t", "wait_for_reply": True, "wait_seconds": 0},
+    )
+    call = session_rig["calls"][0]
+    # 0 means "use the default" (not a 0s no-wait), and the SAME W goes to hub + await budget
+    assert call["payload"]["wait_seconds"] == channel_mod._RELAY_SEND_DEFAULT_WAIT
+    assert call["timeout"] == channel_mod._RELAY_SEND_DEFAULT_WAIT + channel_mod._RELAY_AWAIT_MARGIN
+
+
+def test_check_session_message_await_outlasts_hub_poll(session_rig):
+    session_rig["set_result"]({"ok": True, "result": {"ready": False}})
+    anyio.run(channel_mod._call_tool, "check_session_message", {"message_id": "abc"})
+    call = session_rig["calls"][0]
+    assert call["op"] == "check"
+    assert call["payload"]["wait_seconds"] == channel_mod._RELAY_CHECK_DEFAULT_WAIT
+    assert (
+        call["timeout"]
+        == channel_mod._RELAY_CHECK_DEFAULT_WAIT + channel_mod._RELAY_AWAIT_MARGIN
+    )
+
+
+def test_check_session_message_listed_and_auto_pass():
+    names = {t.name for t in anyio.run(channel_mod._list_tools)}
+    assert "check_session_message" in names
+    cfg = _cfg(auto_pass_tools=frozenset())
+    assert channel_mod._is_auto_pass(channel_mod.OUR_CHECK_SESSION_MESSAGE_TOOL, cfg) is True
+
+
+def test_check_session_message_requires_id(session_rig):
+    out = anyio.run(channel_mod._call_tool, "check_session_message", {})
+    assert "`message_id` is required" in out[0].text
+    assert session_rig["calls"] == []
+
+
+def test_check_session_message_polls(session_rig):
+    session_rig["set_result"]({"ok": True, "result": {"ready": True, "reply": "on dev"}})
+    out = anyio.run(channel_mod._call_tool, "check_session_message", {"message_id": "abc"})
+    call = session_rig["calls"][0]
+    assert call["op"] == "check" and call["payload"]["message_id"] == "abc"
+    assert "on dev" in out[0].text

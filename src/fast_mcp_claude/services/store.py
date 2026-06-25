@@ -88,6 +88,19 @@ CREATE TABLE IF NOT EXISTS teams_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_teams_outbox_pending ON teams_outbox(status, created_at);
 
+CREATE TABLE IF NOT EXISTS session_relay (
+    id              TEXT PRIMARY KEY,
+    requester       TEXT NOT NULL,
+    op              TEXT NOT NULL,
+    payload         TEXT,
+    status          TEXT NOT NULL,
+    ok              INTEGER,
+    result          TEXT,
+    created_at      REAL NOT NULL,
+    completed_at    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_session_relay_pending ON session_relay(status, created_at);
+
 CREATE TABLE IF NOT EXISTS pubsub (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     channel     TEXT NOT NULL,
@@ -556,6 +569,104 @@ class Store:
             self._teams_outbox_key(request_id), check, timeout
         )
 
+    # --------------------------------------------------------------- session relay
+    # Session-to-session messaging: a peer live session asks the hub (the only node that
+    # spans all peers) to LIST other sessions or SEND a message to one. Same create -> hub
+    # drains pending -> hub completes -> requester awaits shape as teams_outbox, on its OWN
+    # table so a bug here cannot touch the approval / teams / worker-message paths. The hub
+    # (brain SessionRelayWatcher) does the privileged cross-peer routing; this is just the
+    # durable relay queue. `op` is 'list' or 'send'; `payload`/`result` are opaque JSON here.
+
+    async def create_session_op(
+        self,
+        requester: str,
+        op: str,
+        payload: dict[str, Any] | None = None,
+    ) -> str:
+        request_id = uuid.uuid4().hex
+        await self.db.execute(
+            "INSERT INTO session_relay "
+            "(id, requester, op, payload, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                request_id,
+                requester,
+                op,
+                json.dumps(payload) if payload else None,
+                OUTBOX_PENDING,
+                time.time(),
+            ),
+        )
+        await self.db.commit()
+        self._notifier.notify(self._session_relay_queue_key())
+        return request_id
+
+    async def list_pending_session_ops(self, limit: int = 50) -> list[dict[str, Any]]:
+        cur = await self.db.execute(
+            "SELECT * FROM session_relay WHERE status=? ORDER BY created_at ASC LIMIT ?",
+            (OUTBOX_PENDING, limit),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [_row_to_session_op(r) for r in rows]
+
+    async def wait_for_pending_session_ops(
+        self, timeout: float, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        async def check() -> list[dict[str, Any]] | None:
+            rows = await self.list_pending_session_ops(limit)
+            return rows if rows else None
+
+        result = await self._notifier.wait_for(
+            self._session_relay_queue_key(), check, timeout
+        )
+        return result or []
+
+    async def complete_session_op(
+        self, request_id: str, ok: bool, result: dict[str, Any] | None = None
+    ) -> bool:
+        async with self._db_lock:
+            cur = await self.db.execute(
+                "UPDATE session_relay SET status=?, ok=?, result=?, completed_at=? "
+                "WHERE id=? AND status=?",
+                (
+                    OUTBOX_DONE,
+                    1 if ok else 0,
+                    json.dumps(result) if result is not None else None,
+                    time.time(),
+                    request_id,
+                    OUTBOX_PENDING,
+                ),
+            )
+            await self.db.commit()
+            updated = cur.rowcount
+            await cur.close()
+        if updated:
+            self._notifier.notify(self._session_relay_key(request_id))
+            return True
+        return False
+
+    async def get_session_op(self, request_id: str) -> dict[str, Any] | None:
+        cur = await self.db.execute(
+            "SELECT * FROM session_relay WHERE id=?", (request_id,)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return _row_to_session_op(row) if row else None
+
+    async def wait_for_session_op_result(
+        self, request_id: str, timeout: float
+    ) -> dict[str, Any] | None:
+        async def check() -> dict[str, Any] | None:
+            r = await self.get_session_op(request_id)
+            if r is None or r["status"] != OUTBOX_DONE:
+                return None
+            return r
+
+        return await self._notifier.wait_for(
+            self._session_relay_key(request_id), check, timeout
+        )
+
     # ------------------------------------------------------------------- pub/sub
 
     async def publish(self, channel: str, sender: str, payload: dict[str, Any]) -> int:
@@ -665,6 +776,14 @@ class Store:
         return "teams_outbox:any"
 
     @staticmethod
+    def _session_relay_key(request_id: str) -> str:
+        return f"session_relay:{request_id}"
+
+    @staticmethod
+    def _session_relay_queue_key() -> str:
+        return "session_relay:any"
+
+    @staticmethod
     def _pubsub_key(channel: str) -> str:
         return f"pubsub:{channel}"
 
@@ -702,6 +821,21 @@ class Store:
             )
             await self.db.execute(
                 "DELETE FROM teams_outbox WHERE status=? AND created_at<?",
+                (OUTBOX_DONE, cutoff),
+            )
+            # Same mark-then-delete hygiene for the session-relay queue.
+            await self.db.execute(
+                "UPDATE session_relay SET status=?, ok=0, result=? "
+                "WHERE status=? AND created_at<?",
+                (
+                    OUTBOX_DONE,
+                    '{"error": "expired: no hub pickup in time"}',
+                    OUTBOX_PENDING,
+                    cutoff,
+                ),
+            )
+            await self.db.execute(
+                "DELETE FROM session_relay WHERE status=? AND created_at<?",
                 (OUTBOX_DONE, cutoff),
             )
             await self.db.execute(
@@ -770,6 +904,20 @@ def _row_to_teams_send(row: aiosqlite.Row) -> dict[str, Any]:
         "status": row["status"],
         "ok": (None if row["ok"] is None else bool(row["ok"])),
         "detail": row["detail"],
+        "created_at": row["created_at"],
+        "completed_at": row["completed_at"],
+    }
+
+
+def _row_to_session_op(row: aiosqlite.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "requester": row["requester"],
+        "op": row["op"],
+        "payload": json.loads(row["payload"]) if row["payload"] else None,
+        "status": row["status"],
+        "ok": (None if row["ok"] is None else bool(row["ok"])),
+        "result": json.loads(row["result"]) if row["result"] else None,
         "created_at": row["created_at"],
         "completed_at": row["completed_at"],
     }

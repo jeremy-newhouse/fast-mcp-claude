@@ -719,3 +719,124 @@ def test_check_session_message_polls(session_rig):
     call = session_rig["calls"][0]
     assert call["op"] == "check" and call["payload"]["message_id"] == "abc"
     assert "on dev" in out[0].text
+
+
+# -------------------------------------------- inbox loop: expects_reply=false FYIs (ECA-58)
+#
+# A hub-stamped fire-and-forget message (metadata.expects_reply=false — notify sends,
+# broadcasts, late-reply push-backs) must be pushed WITHOUT holding the one-in-flight
+# reply-await slot (an unanswered FYI would wedge the mailbox for reply_timeout — 30 min
+# default) and must be auto-finalized via mesh reply() so it doesn't sit 'delivered' until
+# the 7-day TTL. Messages without the stamp keep the claim -> push -> await-reply behavior.
+
+import asyncio  # noqa: E402
+
+
+class _Res:
+    def __init__(self, data):
+        self.data = data
+
+
+class _ScriptedClient:
+    """Async-context fastmcp Client stand-in: feeds scripted wait_for_instruction messages,
+    records every call, raises CancelledError when the script is exhausted (ends the loop)."""
+
+    def __init__(self, messages):
+        self._script = list(messages)
+        self.calls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def call_tool(self, name, args):
+        self.calls.append((name, args))
+        if name == "wait_for_instruction":
+            if not self._script:
+                raise asyncio.CancelledError
+            return _Res({"success": True, "message": self._script.pop(0)})
+        if name == "reply":
+            return _Res({"success": True})
+        raise AssertionError(f"unexpected tool call: {name}")
+
+
+class _RecordingStream:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, m):
+        self.sent.append(m)
+
+
+def _run_inbox(monkeypatch, cfg, messages):
+    client = _ScriptedClient(messages)
+    monkeypatch.setattr(channel_mod, "_make_client", lambda cfg, timeout=None: client)
+    stream = _RecordingStream()
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    channel_mod._RT.initialized.set()
+
+    async def main():
+        # A regression that re-introduces the reply-await for FYIs hangs here and surfaces
+        # as TimeoutError instead of the expected clean CancelledError end-of-script.
+        await asyncio.wait_for(channel_mod._inbox_loop(cfg, stream), timeout=5.0)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main())
+    finally:
+        rt = channel_mod._RT
+        channel_mod._RT = None
+    return client, stream, rt
+
+
+def _pushed(stream):
+    out = []
+    for m in stream.sent:
+        root = m.message.root
+        if root.method == channel_mod.CHANNEL_METHOD:
+            out.append(root.params)
+    return out
+
+
+def test_inbox_fyi_skips_reply_await_and_auto_acks(monkeypatch):
+    cfg = _cfg(enabled=True, identity="peer.repo.a", reply_timeout=60.0)
+    fyi = {
+        "id": "m-fyi", "sender": "evolv-coder-agent", "prompt": "[Session message] heads-up",
+        "recipient_session": "peer.repo.a",
+        "metadata": {"from_session": "peer.repo.b", "expects_reply": False},
+    }
+    client, stream, rt = _run_inbox(monkeypatch, cfg, [fyi])
+
+    pushed = _pushed(stream)
+    assert len(pushed) == 1 and pushed[0]["meta"]["message_id"] == "m-fyi"
+    # Auto-finalized on the mesh so it doesn't linger status=delivered.
+    replies = [a for n, a in client.calls if n == "reply"]
+    assert replies == [
+        {"message_id": "m-fyi", "response": "(auto-ack: FYI delivered to the live session)"}
+    ]
+    # Moved straight on to the next claim (reply_timeout=60 would have hung the harness).
+    waits = [a for n, a in client.calls if n == "wait_for_instruction"]
+    assert len(waits) == 2
+    assert rt.inflight is None
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [None, {"from_session": "peer.repo.b"}, {"from_session": "peer.repo.b", "expects_reply": True}],
+)
+def test_inbox_unstamped_message_still_awaits_reply(monkeypatch, metadata):
+    cfg = _cfg(enabled=True, identity="peer.repo.a", reply_timeout=0.05)
+    msg = {
+        "id": "m-task", "sender": "evolv-coder-agent", "prompt": "do work",
+        "recipient_session": "peer.repo.a", "metadata": metadata,
+    }
+    client, stream, rt = _run_inbox(monkeypatch, cfg, [msg])
+
+    assert [p["meta"]["message_id"] for p in _pushed(stream)] == ["m-task"]
+    # No auto-ack: the session's own reply tool is the only finalizer for real tasks.
+    assert [n for n, _ in client.calls if n == "reply"] == []
+    # It DID hold the in-flight slot (await timed out at 0.05s, then claimed again).
+    assert len([a for n, a in client.calls if n == "wait_for_instruction"]) == 2
+    assert rt.inflight is None

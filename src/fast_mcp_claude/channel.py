@@ -22,7 +22,10 @@ a forward SSH tunnel):
      channel` event, carrying `message_id` in `meta` so the agent can echo it back. ONE
      message in flight at a time (claim -> push -> await reply -> next): the live session runs
      one turn at a time anyway, and a single in-flight turn keeps the permission correlation
-     (below) crisp.
+     (below) crisp. Exception (ECA-58): a hub-stamped fire-and-forget message
+     (metadata.expects_reply=false — session-relay FYI notifies, broadcasts, late-reply
+     push-backs) is pushed WITHOUT holding the in-flight slot and auto-acked on the mesh,
+     so an unanswered FYI can't wedge the mailbox for reply_timeout (30 min default).
 
   3. OUTBOUND reply tool. Exposes an MCP `reply` tool; when the agent calls it the sidecar
      calls mesh `reply(message_id, response)` -> unblocks the brain's `wait_for_completion` ->
@@ -122,6 +125,8 @@ INSTRUCTIONS_BASE = (
     "Channel delivery is fire-and-forget: the controller only sees your work after you call "
     "reply, so ALWAYS reply — even to report a failure. Tasks arrive automatically; you never "
     "need to poll for work.\n"
+    "Exception: a message ending '(FYI — no reply needed; this message was auto-acknowledged.)' "
+    "is already finalized — act on it if needed but do NOT call reply for it.\n"
     "To post a message to a Microsoft Teams chat via the eCA hub, call the `send_teams` tool "
     "(`text`, optional `target` chat name — omit it to post back to the chat that sent you this "
     "task). It returns whether the hub delivered it."
@@ -549,6 +554,32 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                     msg = data.get("message")
                     if not msg:
                         continue  # long-poll timeout, no message — loop again
+                    meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
+                    if meta.get("expects_reply") is False:
+                        # ECA-58: hub-stamped fire-and-forget (FYI notify / broadcast /
+                        # late-reply push-back). Push WITHOUT holding the one-in-flight slot —
+                        # an unanswered FYI would otherwise wedge this mailbox for
+                        # reply_timeout (30 min default) — and auto-finalize the mesh message
+                        # so it doesn't sit 'delivered' until the 7-day TTL. Permission
+                        # requests raised by the FYI's turn see NO in-flight message: the
+                        # exact state a post-reply-timeout turn already produces today
+                        # (local terminal dialog / operator_direct send_teams stamping).
+                        await _push(write_stream, msg)
+                        _log(
+                            f"pushed FYI {msg.get('id')} from {msg.get('sender')} "
+                            "(expects_reply=false; not holding the in-flight slot)"
+                        )
+                        try:
+                            await c.call_tool(
+                                "reply",
+                                {
+                                    "message_id": str(msg.get("id", "")),
+                                    "response": "(auto-ack: FYI delivered to the live session)",
+                                },
+                            )
+                        except Exception as e:
+                            _log(f"FYI auto-ack for {msg.get('id')} failed (continuing): {e}")
+                        continue
                     rt.inflight = msg
                     rt.reply_event = asyncio.Event()
                     await _push(write_stream, msg)

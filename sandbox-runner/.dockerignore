@@ -1,0 +1,43 @@
+# HARD guard (AC#3): the build context must never carry secrets, VCS metadata,
+# host tooling, or local state into image layers. Default-deny would be ideal but
+# Docker has no "ignore all"; this enumerates every sensitive/irrelevant path.
+
+# --- secrets & credentials (never in a layer) ---
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.crt
+**/*token*
+**/*secret*
+**/.netrc
+**/.git-credentials
+**/.aws
+**/.ssh
+
+# --- VCS / CI metadata ---
+**/.git
+**/.gitignore
+**/.github
+
+# --- local dev / build state ---
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/*.egg-info
+**/build
+**/dist
+**/uv.lock
+
+# --- test/smoke scaffolding not needed in the runtime image ---
+tests
+smoke
+
+# --- editor / OS cruft ---
+**/.DS_Store
+**/.idea
+**/.vscode

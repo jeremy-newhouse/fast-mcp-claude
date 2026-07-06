@@ -42,6 +42,20 @@ from .runner import run_job, runner_env_from_process
 REQUEST_FILENAME = "request.json"
 # Where the working tree is checked out (tmpfs-backed; read-only rootfs elsewhere).
 DEFAULT_WORKTREE = "/work/repo"
+# Cred-free replay model leg (Q4): when set, swap the live SDK query for canned
+# messages so the smoke exercises clone/relay/limits/egress/layer without a bearer.
+REPLAY_ENV = "SANDBOX_RUNNER_REPLAY"
+
+
+def _select_query_fn(relay: JobRelay) -> Any:
+    """Return the runner's ``query_fn``: live SDK by default, replay when opted in."""
+    value = os.environ.get(REPLAY_ENV)
+    if not value:
+        return None  # run_job falls back to the live SDK `query`
+    from .replay import load_replay_query_fn
+
+    relay.emit("lifecycle", phase="replay_leg", source=value)
+    return load_replay_query_fn(value)
 
 
 def _log(msg: str) -> None:
@@ -101,14 +115,18 @@ async def _run(args: argparse.Namespace) -> int:
             raise ValueError("request.json missing required 'prompt'")
 
         cwd = await _prepare_worktree(req, relay, args.token_path)
-        result = await run_job(
-            prompt=prompt,
-            cwd=cwd,
-            limits=limits,
-            relay=relay,
-            model=model,
-            env=runner_env_from_process(),
-        )
+        query_fn = _select_query_fn(relay)
+        run_kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "cwd": cwd,
+            "limits": limits,
+            "relay": relay,
+            "model": model,
+            "env": runner_env_from_process(),
+        }
+        if query_fn is not None:
+            run_kwargs["query_fn"] = query_fn
+        result = await run_job(**run_kwargs)
         _log(f"job {job_id} finished: state={result['state']} cost={result['total_cost_usd']}")
         return 0
     except Exception as exc:  # noqa: BLE001 — convert setup failures into a result frame

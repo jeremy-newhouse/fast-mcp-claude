@@ -35,10 +35,11 @@ def r(session_id: str, *, cost: float = 0.01, usage: dict | None = None,
     )
 
 
-def a(*tools: str) -> AssistantMessage:
+def a(*tools: str, usage: dict | None = None) -> AssistantMessage:
     return AssistantMessage(
         content=[ToolUseBlock(id=f"t-{t}", name=t, input={}) for t in tools],
         model="test-model",
+        usage=usage,
     )
 
 
@@ -249,3 +250,30 @@ async def test_auto_cycle_fires_on_context_pressure(make_engine, registry, repo,
 
     await wait_until(_cycled)
     assert any(e["event"] == "auto_cycle" for e in events.read("w1"))
+
+
+async def test_context_pressure_uses_last_request_usage(make_engine, registry, repo, events):
+    """Pressure reads the LAST AssistantMessage's per-request usage, never
+    ResultMessage's cumulative sum — a multi-call turn's sum can exceed the
+    whole context window and would thrash auto-cycle (proven live)."""
+    cumulative = {"input_tokens": 100, "cache_read_input_tokens": 322_000}
+    last_request = {"input_tokens": 10, "cache_read_input_tokens": 40_000}
+    engine, _ = make_engine(
+        [[a("Bash", usage={"input_tokens": 5, "cache_read_input_tokens": 20_000}),
+          a("Read", usage=last_request),
+          r("s1", usage=cumulative)]]
+    )
+    await engine.spawn("w1", str(repo))
+    turn_id = await engine.prompt("w1", "multi tool-call turn")
+
+    async def _done():
+        turn = await registry.get_turn(turn_id)
+        return turn if turn["state"] == "done" else None
+
+    turn = await wait_until(_done)
+    import json as _json
+
+    assert _json.loads(turn["usage"]) == last_request
+    finished = [e for e in events.read("w1") if e["event"] == "turn_finished"]
+    assert finished[-1]["context_pct"] == 20  # 40k/200k, not min(100, 322k/200k)
+    assert not any(e["event"] == "auto_cycle" for e in events.read("w1"))

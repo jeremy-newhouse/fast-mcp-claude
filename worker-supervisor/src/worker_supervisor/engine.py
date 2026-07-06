@@ -34,29 +34,41 @@ from .events import EventLog
 from .gate import QuestionBridge, WorkerPolicy, make_gate, make_question_hook
 from .registry import Registry, WORKER_GONE
 
-# Nominal context window for pressure estimation (tokens). The SDK's ResultMessage
-# usage reports the last request's input/cache token counts, which approximate the
-# session's context size; query() exposes no direct context-fill signal.
+# Nominal context window for pressure estimation (tokens). Context size is read
+# from the LAST AssistantMessage's per-request usage; ResultMessage.usage is the
+# SUM across the turn's API calls (a 7-call turn reported cache_read 322k > the
+# whole window, proven live) and only serves as a fallback when no assistant
+# usage was seen. query() exposes no direct context-fill signal.
 CONTEXT_WINDOW_TOKENS = 200_000
 
-CYCLE_PROMPT = (
-    "You are being cycled to a fresh context window. Write your session handover NOW: "
-    "use `/handover write` if this repo has the handover skill, otherwise write "
-    ".claude/handovers/HANDOVER-<utc-date>-<topic>.md per repo convention. Capture task "
-    "state, next steps, critical context/traps, and failed approaches. Then stop; do not "
-    "start new work."
-)
-RESTORE_PROMPT = (
-    "You are a fresh context taking over from your previous epoch. Restore your working "
-    "state: run `/handover restore` if this repo has the handover skill; otherwise read "
-    "the newest file in .claude/handovers/, treat it as your session handover, and "
-    "continue its next steps."
-)
-RETIRE_PROMPT = (
-    "You are being retired after an idle period. Write a final session handover NOW "
-    "(same conventions as /handover write) recording where the work stands for a "
-    "successor. Then stop."
-)
+# Lifecycle prompts embed the ABSOLUTE handover dir: a weak model given a bare
+# ".claude/handovers/" resolved it against $HOME, missed the repo's handover,
+# and restored as a fresh start (proven live on haiku).
+def cycle_prompt(repo: str) -> str:
+    return (
+        "You are being cycled to a fresh context window. Write your session handover NOW: "
+        "use `/handover write` if this repo has the handover skill, otherwise write "
+        f"{repo}/.claude/handovers/HANDOVER-<utc-date>-<topic>.md per repo convention. "
+        "Capture task state, next steps, critical context/traps, and failed approaches. "
+        "Then stop; do not start new work."
+    )
+
+
+def restore_prompt(repo: str) -> str:
+    return (
+        "You are a fresh context taking over from your previous epoch. Restore your working "
+        "state: run `/handover restore` if this repo has the handover skill; otherwise read "
+        f"the newest file in {repo}/.claude/handovers/ (NOT your home directory), treat it "
+        "as your session handover, and continue its next steps."
+    )
+
+
+def retire_prompt(repo: str) -> str:
+    return (
+        "You are being retired after an idle period. Write a final session handover NOW to "
+        f"{repo}/.claude/handovers/ (same conventions as /handover write) recording where "
+        "the work stands for a successor. Then stop."
+    )
 
 
 def session_transcript_path(cwd: str, session_id: str) -> Path:
@@ -160,7 +172,9 @@ class Engine:
     async def cycle(self, name: str) -> int:
         """Manual cycle: handover-write turn; epoch rolls when it completes."""
         worker = await self._require_active(name)
-        turn_id = await self._reg.enqueue_turn(worker["name"], CYCLE_PROMPT, kind="cycle_handover")
+        turn_id = await self._reg.enqueue_turn(
+            worker["name"], cycle_prompt(worker["repo"]), kind="cycle_handover"
+        )
         self._events.emit(name, "cycle_requested", turn_id=turn_id)
         self._kick(name)
         return turn_id
@@ -206,7 +220,7 @@ class Engine:
             last_turn = await self._reg.last_finished_turn(w["name"])
             if last_turn is not None and last_turn["kind"] == "retire_handover":
                 continue  # retirement already in flight/failed; don't loop
-            await self._reg.enqueue_turn(w["name"], RETIRE_PROMPT, kind="retire_handover")
+            await self._reg.enqueue_turn(w["name"], retire_prompt(w["repo"]), kind="retire_handover")
             self._events.emit(w["name"], "idle_retirement_started", idle_s=int(idle_s))
             self._kick(w["name"])
             retired.append(w["name"])
@@ -399,7 +413,9 @@ class Engine:
                         list(stderr_tail), [resume_from],
                     )
                     await self._reg.roll_epoch(name, "resume_failed")
-                    await self._reg.enqueue_turn(name, RESTORE_PROMPT, kind="restore")
+                    await self._reg.enqueue_turn(
+                        name, restore_prompt(worker["repo"]), kind="restore"
+                    )
                     await self._reg.set_worker_status(name, "idle", active=True)
                     self._kick(name)
                     return
@@ -604,8 +620,11 @@ class Engine:
             outcome.cost_usd = msg.total_cost_usd
             outcome.duration_ms = msg.duration_ms
             outcome.num_turns = msg.num_turns
-            outcome.usage = msg.usage
+            if outcome.usage is None:  # cumulative fallback; see CONTEXT_WINDOW_TOKENS
+                outcome.usage = msg.usage
         elif isinstance(msg, AssistantMessage):
+            if msg.usage:
+                outcome.usage = msg.usage  # last request wins: current context size
             for block in msg.content:
                 if isinstance(block, ToolUseBlock):
                     outcome.tools.append(block.name)
@@ -619,9 +638,11 @@ class Engine:
         if turn is None or turn["state"] != "done":
             return  # keep-on-failure: no auto-progression past a failed turn
         kind = turn["kind"]
+        worker = await self._reg.get_worker(name)
+        repo = worker["repo"] if worker else ""
         if kind == "cycle_handover":
             epoch = await self._reg.roll_epoch(name, "cycled")
-            await self._reg.enqueue_turn(name, RESTORE_PROMPT, kind="restore")
+            await self._reg.enqueue_turn(name, restore_prompt(repo), kind="restore")
             self._events.emit(name, "epoch_cycled", new_epoch=epoch["seq"])
             self._kick(name)
             return
@@ -644,7 +665,7 @@ class Engine:
             and await self._reg.next_queued_turn(name) is None
         ):
             self._events.emit(name, "auto_cycle", context_pct=pct)
-            await self._reg.enqueue_turn(name, CYCLE_PROMPT, kind="cycle_handover")
+            await self._reg.enqueue_turn(name, cycle_prompt(repo), kind="cycle_handover")
             self._kick(name)
 
     # -- status (FR-WS6) --------------------------------------------------------

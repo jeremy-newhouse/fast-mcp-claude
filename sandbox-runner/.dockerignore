@@ -33,9 +33,14 @@
 **/dist
 **/uv.lock
 
-# --- test/smoke scaffolding not needed in the runtime image ---
+# --- test/smoke/sidecar scaffolding not needed in the agent runtime image ---
+# (egress-proxy has its OWN Dockerfile; seccomp/apparmor are host-side launch
+# artifacts the spawner passes via --security-opt, never baked into this image.)
 tests
 smoke
+egress-proxy
+seccomp
+apparmor
 
 # --- editor / OS cruft ---
 **/.DS_Store

@@ -1,4 +1,6 @@
-# syntax=docker/dockerfile:1
+# NOTE: no `# syntax=` frontend pin — stock instructions only, so Docker's
+# builtin BuildKit frontend handles it and we skip the Docker Hub round-trip to
+# resolve docker/dockerfile:1 that transiently hangs (DeadlineExceeded, ECA-64).
 # ECA-64 egress filtering proxy (AC#1 egress clause).
 #
 # A tiny default-DENY forward proxy (tinyproxy). The agent container sits on an

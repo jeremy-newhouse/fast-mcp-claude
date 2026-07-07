@@ -1,4 +1,9 @@
-# syntax=docker/dockerfile:1
+# NOTE: intentionally NO `# syntax=` frontend pin. This Dockerfile uses only
+# stock instructions (no heredocs / RUN --mount / COPY --link), so Docker's
+# builtin BuildKit frontend handles it — and skipping the pin avoids a Docker
+# Hub round-trip to resolve docker/dockerfile:1 that transiently hangs with
+# DeadlineExceeded (ECA-64). If you ever add BuildKit-only syntax, restore the
+# pin AND pre-pull the frontend + base image before building.
 # ECA-64 hardened agent sandbox image (AC#1/AC#3).
 # Day-one base: python:3.12-slim (git + a shell are required for the
 # credential-helper clone, so distroless can't run the helper — DHI/distroless

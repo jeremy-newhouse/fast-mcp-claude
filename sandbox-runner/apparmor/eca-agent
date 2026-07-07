@@ -1,0 +1,77 @@
+# ECA-64 AppArmor profile for the agent sandbox — LINUX / ECS PATH ONLY.
+#
+# ⚠️  NO-OP ON DOCKER DESKTOP macOS. Verified: the LinuxKit VM ships no AppArmor
+#     LSM, so `--security-opt apparmor=eca-agent` is SILENTLY IGNORED (exits 0
+#     even for a nonexistent profile). On Mac peers, seccomp (../seccomp/) is the
+#     MAC substitute. Ship this for the Linux/ECS tier; do not claim enforcement
+#     on Mac (container-sandbox.md residual).
+#
+# Install on a Linux host before use:
+#     sudo apparmor_parser -r -W sandbox-runner/apparmor/eca-agent
+# then launch with:  docker run --security-opt apparmor=eca-agent ...
+#
+# Derived from the moby `docker-default` template, with an added hardening delta
+# (raw sockets, ptrace, /proc & /sys writes, mount, kernel-keyring paths). The
+# broad `file,`/`network,` allows are kept from docker-default deliberately: the
+# python+git workload's file access is not path-restricted here (untested on this
+# Mac host), so hardening is expressed as explicit DENIES layered on top — same
+# posture docker-default uses. cap-drop=ALL + seccomp remain the primary layers.
+
+#include <tunables/global>
+
+profile eca-agent flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # --- network: allow ordinary TCP/UDP (HTTPS to the proxy, DNS); deny raw ---
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+  network unix stream,
+  network unix dgram,
+  deny network raw,
+  deny network packet,
+
+  # Capabilities are already fully dropped at runtime (--cap-drop=ALL); keep the
+  # docker-default allow line but deny the escalation-relevant ones explicitly.
+  capability,
+  deny capability sys_admin,
+  deny capability sys_module,
+  deny capability sys_ptrace,
+  deny capability sys_rawio,
+  deny capability sys_boot,
+  deny capability mac_admin,
+  deny capability mac_override,
+
+  # --- filesystem: docker-default allow, then hardening denies ---
+  file,
+  umount,
+
+  # /proc hardening (no writes to sysctls except kernel/shm; no kcore/sysrq/mem)
+  deny @{PROC}/* w,
+  deny @{PROC}/sys/[^k]** w,
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+  deny @{PROC}/kmem rwklx,
+  deny @{PROC}/mem rwklx,
+
+  # /sys hardening (no firmware, no LSM securityfs, no kernel writes)
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # No mount/pivot/namespace remounts (belt with the seccomp mount denies).
+  deny mount,
+  deny pivot_root,
+
+  # No kernel keyring files.
+  deny /proc/keys rwklx,
+  deny /proc/key-users rwklx,
+
+  # --- ptrace / signals: only within our own profile, nothing else ---
+  ptrace (trace,read,tracedby,readby) peer=eca-agent,
+  deny ptrace,
+  signal (receive,send) peer=eca-agent,
+}

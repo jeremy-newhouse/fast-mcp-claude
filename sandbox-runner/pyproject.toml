@@ -1,0 +1,35 @@
+[project]
+name = "sandbox-runner"
+version = "0.1.0"
+description = "In-container SDK runner for the hardened Docker agent sandbox (ADR-0024 / ECA-64, design of record in evolv-coder-agent docs). Sibling of worker-supervisor; deliberately leaner — no MCP, no coordination deps."
+requires-python = ">=3.12"
+# Deliberately minimal image dependency closure (AC#1/AC#3): the SDK ONLY.
+# No fastmcp (no in-container MCP — invariant-9 analog), no aiosqlite, no httpx.
+dependencies = [
+    "claude-agent-sdk==0.2.91",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+sandbox-runner = "sandbox_runner.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sandbox_runner"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

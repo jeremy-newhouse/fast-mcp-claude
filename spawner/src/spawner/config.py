@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     seccomp_path: str | None = Field(default=None)
     # Per-job scratch root where request.json / events.jsonl / result.json live (bind-mounted /job).
     job_root: str = Field(default="~/.spawner/jobs")
+    # Cred-free launch knob: when true the launcher passes ``SANDBOX_RUNNER_REPLAY=1`` (env, NOT a
+    # secret bind-mount) so the runner returns a canned one-turn success without a Bedrock secret.
+    # Purpose: let a live e2e drain run end-to-end before real model creds are wired on the peer.
+    agent_replay: bool = Field(default=False)
 
     # --- Secrets (peer-local store; spawner NEVER mints) ---
     gh_token_path: str | None = Field(default=None)  # 0400 file -> /run/secrets/gh_token

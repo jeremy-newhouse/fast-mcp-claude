@@ -160,6 +160,11 @@ class DockerLauncher:
         ]
         if s.seccomp_path:
             argv += ["--security-opt", f"seccomp={s.seccomp_path}"]
+        # Cred-free replay leg: the runner honors SANDBOX_RUNNER_REPLAY (sandbox_runner/__main__.py)
+        # and returns a canned one-turn success, so a live drain needs no Bedrock secret. This is a
+        # container-wide -e (a non-secret flag), unlike the 0400 secret bind-mounts below.
+        if s.agent_replay:
+            argv += ["-e", "SANDBOX_RUNNER_REPLAY=1"]
         # Secrets: 0400 read-only bind mounts; NEVER -e / --env-file (docs §Lifecycle step 5).
         if s.gh_token_path:
             argv += ["-v", f"{s.path(s.gh_token_path)}:/run/secrets/gh_token:ro"]

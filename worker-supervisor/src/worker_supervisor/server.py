@@ -24,6 +24,26 @@ from .gate import WorkerPolicy
 from .registry import Registry
 
 
+async def _probe_socket(path: str) -> bool:
+    """Return True if a daemon is already answering on the unix socket at path.
+
+    Any failure to connect (refused, timeout, OS error) means the file is
+    stale and safe to unlink — return False.
+    """
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(path), timeout=1.0
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:  # noqa: BLE001 — peer may close abruptly after connect
+            pass
+        return True
+    except (asyncio.TimeoutError, TimeoutError, ConnectionRefusedError, OSError):
+        return False
+
+
 class ControlServer:
     def __init__(
         self, config: Config, engine: Engine, registry: Registry, events: EventLog
@@ -33,6 +53,18 @@ class ControlServer:
         self._reg = registry
         self._events = events
         self._server: asyncio.AbstractServer | None = None
+
+    async def preflight_socket_check(self) -> None:
+        """Raise SystemExit(1) if another daemon is already listening on the socket.
+
+        A second daemon instance would steal the socket from the live pm2 daemon
+        (real incident 2026-07-07, AC#5/ECA-72). Only a stale socket file
+        (connection refused) is safe to proceed past; raise and let the caller
+        log via the daemon's _log() idiom before re-raising.
+        """
+        path = self._cfg.socket_path
+        if path.exists() and await _probe_socket(str(path)):
+            raise SystemExit(1)
 
     async def serve_forever(self) -> None:
         path = self._cfg.socket_path

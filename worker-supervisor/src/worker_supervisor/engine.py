@@ -28,7 +28,7 @@ from claude_agent_sdk import (
 )
 
 from .capsule import write_capsule
-from .config import Config
+from .config import Config, Limits
 from .envbuild import build_worker_env, snapshot_boot_env
 from .events import EventLog
 from .gate import QuestionBridge, WorkerPolicy, make_gate, make_question_hook
@@ -49,25 +49,57 @@ def cycle_prompt(repo: str) -> str:
         "You are being cycled to a fresh context window. Write your session handover NOW: "
         "use `/handover write` if this repo has the handover skill, otherwise write "
         f"{repo}/.claude/handovers/HANDOVER-<utc-date>-<topic>.md per repo convention. "
-        "Capture task state, next steps, critical context/traps, and failed approaches. "
+        "Write a LEAN handover: current task state, immediate next steps, critical traps, "
+        "and failed approaches — reference DEV-PLAN and file paths on disk rather than "
+        "copying design-doc text inline. A successor reading only this handover + DEV-PLAN "
+        "+ code on disk must be able to resume under 50% context. "
         "Then stop; do not start new work."
     )
 
 
 def restore_prompt(repo: str) -> str:
     return (
-        "You are a fresh context taking over from your previous epoch. Restore your working "
-        "state: run `/handover restore` if this repo has the handover skill; otherwise read "
-        f"the newest file in {repo}/.claude/handovers/ (NOT your home directory), treat it "
-        "as your session handover, and continue its next steps."
+        "You are a fresh context taking over from your previous epoch. "
+        "Restore using the LEAN path: "
+        "(1) run `/handover restore` if this repo has the handover skill; otherwise read "
+        f"the newest file in {repo}/.claude/handovers/ "
+        "(NOT your home directory) and continue its next steps. "
+        "(2) If the handover references a DEV-PLAN, read that file for authoritative task scope. "
+        "(3) Treat code on disk as the ground truth for current state. "
+        "Do NOT re-read the design-doc corpus or ADR collection wholesale — the handover "
+        "already distilled what matters. Begin working immediately after reading handover + DEV-PLAN."
     )
 
 
 def retire_prompt(repo: str) -> str:
     return (
-        "You are being retired after an idle period. Write a final session handover NOW to "
-        f"{repo}/.claude/handovers/ (same conventions as /handover write) recording where "
-        "the work stands for a successor. Then stop."
+        "You are being retired after an idle period. Write a final session handover NOW: "
+        "use `/handover write` if this repo has the handover skill, otherwise write to "
+        f"{repo}/.claude/handovers/ (same conventions). "
+        "Write a LEAN handover: task state, next steps, critical traps, and failed approaches — "
+        "reference DEV-PLAN and file paths on disk rather than copying design-doc text inline. "
+        "A successor must be able to resume under 50% context from handover + DEV-PLAN + code alone. "
+        "Then stop."
+    )
+
+
+def _discipline_append(limits: Limits, cycle_context_pct: int) -> str:
+    """Per-turn system-prompt appendix: renders live limits so the agent can self-pace.
+
+    Encodes the three long-op discipline rules from the ECA-60 dogfood campaign:
+    epoch-2 restores grounded at 69-79% context; epoch-3 landed 44-45% under
+    bounded-turn guidance. Never hardcode the numeric limits here.
+    """
+    return (
+        f"TURN DISCIPLINE (enforced by worker-supervisor): "
+        f"(1) This turn runs under {limits.wall_clock_s}s wall-clock / "
+        f"{limits.max_turns} SDK turns; context auto-cycles at ~{cycle_context_pct}%. "
+        f"Keep each turn's scope bounded — split plan and implement across separate turns "
+        f"rather than doing a whole large task in one. "
+        f"(2) Commit completed work BEFORE starting any long-running operation. "
+        f"(3) Run long shell work (docker builds, big installs) backgrounded with "
+        f"nohup + a log file; poll with generous-but-bounded timeouts — "
+        f"never let one foreground command silently burn the whole wall-clock."
     )
 
 
@@ -347,6 +379,14 @@ class Engine:
                 max_turns=limits.max_turns,
                 max_budget_usd=max(0.01, round(remaining_budget, 4)),
                 model=policy.model,
+                # AC#2 (ECA-72): retain the default Claude Code system prompt and
+                # append live per-turn limits so the agent can self-pace without
+                # relying on the orchestrator to encode them in every task prompt.
+                system_prompt={
+                    "type": "preset",
+                    "preset": "claude_code",
+                    "append": _discipline_append(limits, self._cfg.cycle_context_pct),
+                },
                 env=build_worker_env(
                     self._boot_env,
                     policy.allow_env,

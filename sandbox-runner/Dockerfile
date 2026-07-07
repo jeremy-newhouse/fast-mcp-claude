@@ -1,9 +1,9 @@
-# NOTE: intentionally NO `# syntax=` frontend pin. This Dockerfile uses only
-# stock instructions (no heredocs / RUN --mount / COPY --link), so Docker's
-# builtin BuildKit frontend handles it — and skipping the pin avoids a Docker
-# Hub round-trip to resolve docker/dockerfile:1 that transiently hangs with
-# DeadlineExceeded (ECA-64). If you ever add BuildKit-only syntax, restore the
-# pin AND pre-pull the frontend + base image before building.
+# NOTE: intentionally NO `# syntax=` frontend pin. COPY --chmod is natively
+# supported by Docker's builtin BuildKit frontend without a Docker Hub
+# round-trip (avoids the DeadlineExceeded transient hang from ECA-64).
+# BuildKit required; availability confirmed on mini2 (ECA-72, 2026-07-07).
+# No heredocs / RUN --mount / COPY --link are used; if you add any, assess
+# whether the builtin frontend still covers it before adding the pin.
 # ECA-64 hardened agent sandbox image (AC#1/AC#3).
 # Day-one base: python:3.12-slim (git + a shell are required for the
 # credential-helper clone, so distroless can't run the helper — DHI/distroless
@@ -51,8 +51,7 @@ RUN set -eux; \
     mkdir -p /work /job; \
     chown -R 1000:1000 /work /job
 
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 0555 /usr/local/bin/entrypoint.sh
+COPY --chmod=0555 entrypoint.sh /usr/local/bin/entrypoint.sh
 
 USER 1000:1000
 WORKDIR /work

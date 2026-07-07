@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -35,6 +36,9 @@ from .config import Settings
 logger = logging.getLogger(__name__)
 
 REQUEST_FILENAME = "request.json"
+
+# Repo slug shape — mirrors nats_dispatch._REPO_RE (one '/', non-empty halves, no whitespace).
+_REPO_SLUG_RE = re.compile(r"^[^\s/]+/[^\s/]+$")
 
 
 class ContainerLauncher(Protocol):
@@ -84,23 +88,37 @@ def build_request(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resolve_repo(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Derive the runner ``repo`` block from an OPTIONAL owner/repo (seam for the ECA-66 field).
+    """Derive the runner ``repo`` block from the OPTIONAL ECA-66 dispatch field.
 
-    Accepts either a structured ``repo`` dict (``{url, ref, clone}``) or a bare ``owner/repo``
-    string under ``owner/repo`` / ``owner_repo`` -> ``https://github.com/<owner/repo>.git``.
+    The REAL shipped field (``nats_dispatch.py`` dev@5fb91dc) is ``payload["repo"]`` as a BARE
+    ``"<owner>/<name>"`` string (validated by ``nats_dispatch.validate_repo`` — exactly one '/',
+    non-empty halves, no whitespace). We map it to ``https://github.com/<slug>.git`` + ``clone``.
+    Also accepted for flexibility: a structured ``repo`` dict (``{url, ref, clone}``) and the
+    legacy ``owner/repo`` / ``owner_repo`` keys. A malformed value resolves to ``None`` (the job
+    runs repo-less rather than constructing a bad clone URL).
     """
-    if isinstance(payload.get("repo"), dict):
-        repo = dict(payload["repo"])
+    raw = payload.get("repo")
+    if isinstance(raw, dict):
+        repo = dict(raw)
         repo.setdefault("clone", True)
         return repo
+
+    ref = payload.get("ref")
+    # The real ECA-66 field: repo-as-string. Mirror validate_repo's shape (one '/', non-empty).
+    if isinstance(raw, str) and _REPO_SLUG_RE.match(raw.strip()):
+        return _slug_to_repo(raw.strip(), ref)
+    # Legacy/alternate keys, kept for back-compat with earlier plan drafts.
     slug = payload.get("owner/repo") or payload.get("owner_repo")
-    if isinstance(slug, str) and "/" in slug:
-        ref = payload.get("ref")
-        repo = {"url": f"https://github.com/{slug}.git", "clone": True}
-        if ref:
-            repo["ref"] = ref
-        return repo
+    if isinstance(slug, str) and _REPO_SLUG_RE.match(slug.strip()):
+        return _slug_to_repo(slug.strip(), ref)
     return None
+
+
+def _slug_to_repo(slug: str, ref: Any) -> dict[str, Any]:
+    repo: dict[str, Any] = {"url": f"https://github.com/{slug}.git", "clone": True}
+    if ref:
+        repo["ref"] = ref
+    return repo
 
 
 class DockerLauncher:

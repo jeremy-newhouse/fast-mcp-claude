@@ -117,9 +117,11 @@ class _StubLauncher:
         self.state = state
         self.text = text
         self.launched: list[str] = []
+        self.requests: list[dict] = []
 
     async def launch(self, job_id, request, job_dir: Path) -> str:
         self.launched.append(job_id)
+        self.requests.append(request)
         job_dir.mkdir(parents=True, exist_ok=True)
         (job_dir / "events.jsonl").write_text(json.dumps({"type": "boot", "job_id": job_id}) + "\n")
         (job_dir / "result.json").write_text(
@@ -168,7 +170,9 @@ async def test_full_dispatch_to_result_roundtrip(nats_url, tmp_path):
     # Dispatch a job exactly as NatsDispatcher.dispatch would (job_id + derived-subject shape).
     dispatch_payload = {
         "job_id": job_id, "actor": "operator", "member": "operator", "machine": "mini2",
-        "prompt": "prove the round-trip", "cwd": "/tmp",
+        "prompt": "prove the round-trip",
+        # REAL ECA-66 field shape (nats_dispatch.py dev@5fb91dc): repo is a bare "<owner>/<name>".
+        "repo": "octocat/Hello-World",
         "limits": {"wall_clock": 60, "max_turns": 3, "max_budget_usd": 1.0},
     }
     await js.publish(
@@ -188,6 +192,10 @@ async def test_full_dispatch_to_result_roundtrip(nats_url, tmp_path):
         assert envelope["text"] == "live round-trip"
         assert envelope["total_cost_usd"] == 0.02
         assert launcher.launched == [job_id]
+        # The real repo field resolved into the runner request (bare string -> clone block).
+        assert launcher.requests[0]["repo"] == {
+            "url": "https://github.com/octocat/Hello-World.git", "clone": True
+        }
 
         # Local record is terminal.
         assert (await store.get(job_id))["state"] == DONE

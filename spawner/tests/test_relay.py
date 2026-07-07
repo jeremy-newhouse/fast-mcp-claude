@@ -42,6 +42,34 @@ def test_build_request_structured_repo_defaults_clone():
     assert req["repo"]["ref"] == "main"
 
 
+def test_build_request_clones_from_bare_repo_string():
+    # The REAL ECA-66 dispatch field: payload["repo"] is a bare "<owner>/<name>" string
+    # (nats_dispatch.py dev@5fb91dc). It must resolve to a clone block, not fall through to None.
+    req = build_request({"job_id": "j4", "prompt": "p", "repo": "octocat/Hello-World"})
+    assert req["repo"] == {"url": "https://github.com/octocat/Hello-World.git", "clone": True}
+
+
+def test_build_request_bare_repo_string_carries_ref():
+    req = build_request({"job_id": "j5", "prompt": "p", "repo": "octocat/spoon", "ref": "dev"})
+    assert req["repo"] == {
+        "url": "https://github.com/octocat/spoon.git", "clone": True, "ref": "dev"
+    }
+
+
+def test_build_request_malformed_repo_string_ignored():
+    # Malformed slugs (no slash, too many slashes, whitespace, empty half) resolve to no clone —
+    # the job runs repo-less rather than constructing a bad clone URL.
+    for bad in ["not-a-slug", "a/b/c", "owner/", "/name", "own er/name", ""]:
+        req = build_request({"job_id": "j6", "prompt": "p", "repo": bad})
+        assert "repo" not in req, f"expected {bad!r} to be ignored"
+
+
+def test_build_request_dict_repo_takes_precedence_over_string_shape():
+    # A dict is still honored as a structured repo block (not treated as a string).
+    req = build_request({"job_id": "j7", "prompt": "p", "repo": {"url": "https://x/y.git"}})
+    assert req["repo"] == {"url": "https://x/y.git", "clone": True}
+
+
 def test_result_envelope_completed_is_ok():
     env = build_result_envelope(
         {"job_id": "j", "state": "completed", "final_text": "answer",

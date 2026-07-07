@@ -60,6 +60,17 @@ async def _serve() -> None:
         asyncio.create_task(_idle_sweep(engine), name="idle-sweep"),
     ]
     server = ControlServer(cfg, engine, registry, events)
+    # AC#5 (ECA-72): refuse to boot if a live daemon already holds the socket.
+    # A second instance would steal it from pm2 silently (real incident 2026-07-07).
+    try:
+        await server.preflight_socket_check()
+    except SystemExit:
+        _log(
+            f"FATAL: control socket {cfg.socket_path} already has a live listener — "
+            "refusing to boot to avoid stealing it from the running daemon; "
+            "stop the existing instance first."
+        )
+        raise
     server_task = asyncio.create_task(server.serve_forever(), name="control")
     _log(f"control socket: {cfg.socket_path}")
 
@@ -82,6 +93,16 @@ async def _serve() -> None:
 
 
 def main() -> None:
+    # AC#6 (ECA-72): operators running `worker-supervisor status` by hand must not
+    # accidentally boot a daemon. Any unexpected argument is a usage error.
+    if len(sys.argv) > 1:
+        print(
+            f"worker-supervisor: unexpected arguments: {sys.argv[1:]!r}\n"
+            "This command starts the supervisor daemon. "
+            "To manage workers, use the `workers` CLI instead.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     while True:
         try:
             asyncio.run(_serve())

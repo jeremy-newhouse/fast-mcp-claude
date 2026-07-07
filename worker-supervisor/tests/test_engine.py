@@ -277,3 +277,31 @@ async def test_context_pressure_uses_last_request_usage(make_engine, registry, r
     finished = [e for e in events.read("w1") if e["event"] == "turn_finished"]
     assert finished[-1]["context_pct"] == 20  # 40k/200k, not min(100, 322k/200k)
     assert not any(e["event"] == "auto_cycle" for e in events.read("w1"))
+
+
+async def test_system_prompt_carries_live_limits(make_engine, registry, repo, cfg):
+    """ClaudeAgentOptions.system_prompt must render live wall_clock_s / max_turns /
+    cycle_context_pct so the agent can self-pace — never hardcoded (ECA-72 AC#2).
+
+    Evidence: epoch-2 restores grounded at 69-79% context because the agent had no
+    per-turn awareness of its limits; epoch-3 landed 44-45% under explicit guidance.
+    """
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "check options")
+    await terminal_turn(registry, tid)
+
+    sp = calls[0].system_prompt
+    assert sp is not None, "system_prompt must be set on every turn"
+    assert sp["type"] == "preset"
+    assert sp["preset"] == "claude_code"
+    append = sp["append"]
+
+    # Discriminating substrings: the exact phrases _discipline_append renders.
+    assert f"{cfg.limits.wall_clock_s}s wall-clock" in append
+    assert f"{cfg.limits.max_turns} SDK turns" in append
+    assert str(cfg.cycle_context_pct) in append
+
+    # The three discipline clauses must be present.
+    assert "Commit completed work BEFORE" in append
+    assert "nohup" in append

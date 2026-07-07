@@ -79,7 +79,7 @@ run_agent() {
     -e HOME=/work \
     -v "$jd:/job" \
     -v "$GH_TOKEN:/run/secrets/gh_token:ro" \
-    "${BEDROCK_ARGS[@]}" \
+    ${BEDROCK_ARGS[@]+"${BEDROCK_ARGS[@]}"} \
     "$@" \
     "$AGENT_IMAGE" --job-dir /job >"$jd/stdout.log" 2>"$jd/stderr.log"
 }
@@ -100,16 +100,19 @@ log "2. end-to-end: clone -> one turn -> result.json reaches the driver"
 cat > "$WORK/e2e.json" <<JSON
 { "job_id": "smoke-e2e",
   "prompt": "Summarize the README in three bullets.",
-  "repo": { "url": "$CLONE_URL", "ref": "$CLONE_REF", "clone": true, "depth": 1 },
+  "repo": { "url": "$CLONE_URL", "ref": "$CLONE_REF", "clone": true, "depth": 1,
+            "worktree": "/job/repo" },
   "limits": { "wall_clock_s": 120, "max_turns": 1, "max_budget_usd": 1.0 } }
 JSON
 E2E_ENV=()
 [ "$REPLAY_DEFAULT" = "1" ] && E2E_ENV=(-e SANDBOX_RUNNER_REPLAY=1)
 [ -n "${ECA_ANTHROPIC_MODEL:-}" ] && E2E_ENV+=(-e "ANTHROPIC_MODEL=$ECA_ANTHROPIC_MODEL")
-run_agent e2e "$WORK/e2e.json" "${E2E_ENV[@]}"
+run_agent e2e "$WORK/e2e.json" ${E2E_ENV[@]+"${E2E_ENV[@]}"}
 st="$(result_state e2e)"
 [ "$st" = "completed" ] && ok "e2e result state=completed" || bad "e2e result state=$st (expected completed)"
-[ -f "$WORK/e2e/repo/README" ] && ok "repo cloned into container tmpfs (README present)" \
+# Clone lands in the host-visible /job mount (repo.worktree=/job/repo) so the
+# driver can prove the clone+egress succeeded from outside the container.
+[ -f "$WORK/e2e/repo/README" ] && ok "repo cloned via proxy egress (README present in /job mount)" \
   || bad "clone leg: README not found (clone/egress failure?)"
 grep -q '"total_cost_usd"' "$WORK/e2e/result.json" 2>/dev/null \
   && ok "result carries total_cost_usd/usage" || bad "result missing cost fields"
@@ -120,7 +123,10 @@ log "3. limits proofs (each limit demonstrably bites)"
 # plumbing end-to-end through the container; native SDK enforcement is covered by
 # the unit tests + the live leg). wall-clock is enforced live by the runner.
 _limit_job() {  # _limit_job <name> <replay-json> <wall_clock_s> <expect-state>
-  local name="$1" replay="$2" wall="$3" expect="$4" jd="$WORK/$name"
+  # NOTE(bash 3.2): keep jd on its own `local` line — referencing $name in the
+  # same `local` as its assignment expands the (unset) outer name under set -u.
+  local name="$1" replay="$2" wall="$3" expect="$4"
+  local jd="$WORK/$name"
   mkdir -p "$jd"; printf '%s' "$replay" > "$jd/replay.json"
   cat > "$jd/req.json" <<JSON
 { "job_id": "$name", "prompt": "noop",

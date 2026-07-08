@@ -776,6 +776,9 @@ def _run_inbox(monkeypatch, cfg, messages):
     stream = _RecordingStream()
     channel_mod._RT = channel_mod._Runtime(cfg=cfg)
     channel_mod._RT.initialized.set()
+    # ECA-71: the inbox loop won't claim until announce is confirmed; simulate the normal
+    # operating state (presence loop got a successful announce) so these tests exercise claiming.
+    channel_mod._RT.announce_confirmed.set()
 
     async def main():
         # A regression that re-introduces the reply-await for FYIs hangs here and surfaces
@@ -835,8 +838,115 @@ def test_inbox_unstamped_message_still_awaits_reply(monkeypatch, metadata):
     client, stream, rt = _run_inbox(monkeypatch, cfg, [msg])
 
     assert [p["meta"]["message_id"] for p in _pushed(stream)] == ["m-task"]
-    # No auto-ack: the session's own reply tool is the only finalizer for real tasks.
-    assert [n for n, _ in client.calls if n == "reply"] == []
-    # It DID hold the in-flight slot (await timed out at 0.05s, then claimed again).
+    # ECA-71 Layer C: on non-consumption (reply_timeout elapsed; fast-signal off by default) the
+    # sender is BOUNCED via mesh reply, not silently dropped — so it is never black-holed. (The
+    # agent's own reply tool remains the finalizer on the happy path; this is the failure path.)
+    assert [a for n, a in client.calls if n == "reply"] == [
+        {"message_id": "m-task", "response": channel_mod._NON_CONSUMPTION_BOUNCE}
+    ]
+    # It DID hold the in-flight slot (awaited reply_timeout at 0.05s, then bounced + claimed again).
     assert len([a for n, a in client.calls if n == "wait_for_instruction"]) == 2
     assert rt.inflight is None
+
+
+# ---------------------------------------------- ECA-71 Layer B: never claim under a contested id
+#
+# The inbox loop gates every claim on announce_confirmed. A fork whose announce is refused
+# (IDENTITY_LIVE_ELSEWHERE) never sets it, so it never claims — closing MISROUTE + the
+# fork-without-flag black hole at their shared source.
+
+
+def test_inbox_does_not_claim_until_announce_confirmed(monkeypatch):
+    cfg = _cfg(enabled=True, identity="peer.repo.a")
+    msg = {"id": "m1", "sender": "brain", "prompt": "do", "recipient_session": "peer.repo.a"}
+    client = _ScriptedClient([msg])
+    monkeypatch.setattr(channel_mod, "_make_client", lambda cfg, timeout=None: client)
+    stream = _RecordingStream()
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    channel_mod._RT.initialized.set()
+    # announce_confirmed deliberately LEFT UNSET (simulates a refused fork / not-yet-confirmed).
+
+    async def main():
+        await asyncio.wait_for(channel_mod._inbox_loop(cfg, stream), timeout=0.3)
+
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(main())  # blocks on announce_confirmed.wait(), never reaches the client
+    finally:
+        channel_mod._RT = None
+
+    # It never claimed — no wait_for_instruction, nothing pushed.
+    assert [n for n, _ in client.calls if n == "wait_for_instruction"] == []
+    assert _pushed(stream) == []
+
+
+# ---------------------------------------------- ECA-71 Layer C: degrade after K non-consumptions
+#
+# After degrade_after consecutive non-consumptions the sidecar disarms its claim loop (and the
+# presence loop re-announces channel=false/degraded so the brain reroutes to notify+pull).
+
+
+def test_inbox_degrades_and_stops_claiming_after_k_nonconsumptions(monkeypatch):
+    cfg = _cfg(
+        enabled=True, identity="peer.repo.a", reply_timeout=0.02, heartbeat=0.01, degrade_after=1
+    )
+    msg = {"id": "m1", "sender": "brain", "prompt": "do", "recipient_session": "peer.repo.a"}
+    # Three messages queued, but a degrade_after=1 must stop claiming after the FIRST bounce.
+    client = _ScriptedClient([msg, msg, msg])
+    monkeypatch.setattr(channel_mod, "_make_client", lambda cfg, timeout=None: client)
+    stream = _RecordingStream()
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    channel_mod._RT.initialized.set()
+    channel_mod._RT.announce_confirmed.set()
+
+    async def main():
+        # Once degraded, the loop sleeps on heartbeat forever -> the timeout is the clean end.
+        await asyncio.wait_for(channel_mod._inbox_loop(cfg, stream), timeout=0.5)
+
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(main())
+    finally:
+        rt = channel_mod._RT
+        channel_mod._RT = None
+
+    assert rt.degraded is True
+    # Bounced the one message it claimed (never black-holed)...
+    assert {"message_id": "m1", "response": channel_mod._NON_CONSUMPTION_BOUNCE} in [
+        a for n, a in client.calls if n == "reply"
+    ]
+    # ...and then stopped claiming: only ONE claim happened despite three queued messages.
+    assert len([1 for n, _ in client.calls if n == "wait_for_instruction"]) == 1
+
+
+# -------------------------------- ECA-71 Layer C: fast liveness signal (_await_consumption)
+
+
+def test_await_consumption_true_when_replied():
+    cfg = _cfg(enabled=True, reply_timeout=5.0)
+    rt = channel_mod._Runtime(cfg=cfg)
+
+    async def run():
+        rt.reply_event.set()
+        return await channel_mod._await_consumption(cfg, rt, baseline_ts=None)
+
+    assert asyncio.run(run()) is True
+
+
+def test_await_consumption_fast_bounce_on_dead_consumer():
+    # Fast signal ON, no reply, no status-file advance -> bounce fast (does NOT wait reply_timeout).
+    cfg = _cfg(
+        enabled=True,
+        liveness_check_enabled=True,
+        liveness_window_s=0.05,
+        reply_timeout=50.0,  # if the fast path were broken this would hang past the 5s wait_for
+        status_file=None,  # _status_updated_at -> None => no sign of life
+    )
+    rt = channel_mod._Runtime(cfg=cfg)
+
+    async def run():
+        return await asyncio.wait_for(
+            channel_mod._await_consumption(cfg, rt, baseline_ts=None), timeout=5.0
+        )
+
+    assert asyncio.run(run()) is False

@@ -712,22 +712,75 @@ class Store:
         identity: str,
         summary: str | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
-        """Upsert a peer's presence row (identity + what it's doing + heartbeat)."""
-        await self.db.execute(
-            "INSERT INTO presence (identity, summary, metadata, updated_at) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(identity) DO UPDATE SET "
-            "summary=excluded.summary, metadata=excluded.metadata, updated_at=excluded.updated_at",
-            (
-                identity,
-                summary,
-                json.dumps(metadata) if metadata else None,
-                time.time(),
-            ),
-        )
-        await self.db.commit()
+    ) -> dict[str, Any]:
+        """Upsert a peer's presence row (identity + what it's doing + heartbeat).
+
+        Owner-token identity guard (ECA-71 / ADR-0029). A `fast-mcp-claude-channel` sidecar is
+        the *sole* announcer for its identity; a second live process reusing the same identity
+        (a claude.ai background fork of the TUI session) used to clobber the row and both would
+        then claim the same mailbox — misrouting or black-holing messages. So if a row already
+        exists for this identity with a **different** `metadata.announce_token` whose heartbeat
+        is still **fresh** (within the who() stale window, `poll_heartbeat_s*3`), we REFUSE the
+        second announcer: `{success: False, error: {code: "IDENTITY_LIVE_ELSEWHERE"}}`. A
+        missing, matching, or stale token is accepted — so crash-and-relaunch and legitimate
+        takeover (a dead announcer's token goes stale and is freely reclaimed) still work, and
+        a pre-ECA-71 announcer that sends no token is never refused (fully backward compatible).
+
+        The read-check-upsert runs under `_db_lock` so two concurrent announces can't both pass
+        the freshness check and race the upsert (same single-process mutex the claim path uses).
+        """
+        incoming_token = metadata.get("announce_token") if isinstance(metadata, dict) else None
+        now = time.time()
+        async with self._db_lock:
+            if incoming_token is not None:
+                cur = await self.db.execute(
+                    "SELECT metadata, updated_at FROM presence WHERE identity=?",
+                    (identity,),
+                )
+                row = await cur.fetchone()
+                await cur.close()
+                if row is not None:
+                    existing_meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                    existing_token = (
+                        existing_meta.get("announce_token")
+                        if isinstance(existing_meta, dict)
+                        else None
+                    )
+                    fresh_window = float(self.settings.poll_heartbeat_s * 3)
+                    age = now - row["updated_at"]
+                    if (
+                        existing_token is not None
+                        and existing_token != incoming_token
+                        and age <= fresh_window
+                    ):
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "IDENTITY_LIVE_ELSEWHERE",
+                                "message": (
+                                    f"identity {identity!r} is already announced by another "
+                                    f"live process (owner token differs; last heartbeat "
+                                    f"{age:.0f}s ago, within the {fresh_window:.0f}s freshness "
+                                    f"window). Refusing to clobber it."
+                                ),
+                            },
+                        }
+            await self.db.execute(
+                "INSERT INTO presence (identity, summary, metadata, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(identity) DO UPDATE SET "
+                "summary=excluded.summary, metadata=excluded.metadata, "
+                "updated_at=excluded.updated_at",
+                (
+                    identity,
+                    summary,
+                    json.dumps(metadata) if metadata else None,
+                    now,
+                ),
+            )
+            await self.db.commit()
         self._notifier.notify(self._presence_key())
+        return {"success": True}
 
     async def list_presence(self, stale_after: float | None = None) -> list[dict[str, Any]]:
         """Return known peers, freshest first. If stale_after is set, drop rows

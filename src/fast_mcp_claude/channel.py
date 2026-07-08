@@ -254,6 +254,18 @@ class ChannelConfig:
     decision_timeout: float = 300.0
     reply_timeout: float = 1800.0
     auto_pass_tools: frozenset[str] = frozenset({"Read", "Glob", "Grep"})
+    # ECA-71 / ADR-0029: owner-token identity guard. A per-process boot token stamped into
+    # every announce()'s metadata; the server refuses a *different* live process reusing this
+    # identity so a fork can't clobber presence and race the inbox. Blank => no guard (the
+    # server treats a tokenless announce as always-accepted — pre-ECA-71 behavior).
+    announce_token: str = ""
+    # ECA-71 / ADR-0029: Layer C non-consumption recovery. `liveness_check_enabled` arms the
+    # fast status-file signal (default off, gated on spike #2); `liveness_window_s` is how long
+    # after a push to wait for the consumer to show life; `degrade_after` consecutive
+    # non-consumptions disarm the claim loop + re-announce degraded.
+    liveness_check_enabled: bool = False
+    liveness_window_s: float = 90.0
+    degrade_after: int = 3
 
 
 @dataclass
@@ -268,6 +280,17 @@ class _Runtime:
     inflight: dict[str, Any] | None = None  # the claimed message currently pushed, awaiting reply
     reply_event: asyncio.Event = field(default_factory=asyncio.Event)
     initialized: asyncio.Event = field(default_factory=asyncio.Event)
+    # ECA-71 Layer B: set by the presence loop on a successful announce, cleared on refusal
+    # (IDENTITY_LIVE_ELSEWHERE). The inbox loop gates every claim on it, so a refused fork
+    # NEVER claims — closing MISROUTE + the fork-without-flag black hole at their shared source.
+    announce_confirmed: asyncio.Event = field(default_factory=asyncio.Event)
+    announce_refused_logged: bool = False
+    # ECA-71 Layer C: consecutive non-consumptions; at cfg.degrade_after the sidecar disarms and
+    # re-announces degraded. `degraded_status_ts` snapshots the status-file updated_at at degrade
+    # time so the presence loop can re-arm when the consumer shows life again.
+    consecutive_nonconsumption: int = 0
+    degraded: bool = False
+    degraded_status_ts: float | None = None
 
 
 # Populated by _serve before any loop or tool handler runs.
@@ -327,6 +350,7 @@ def _resolve_config(argv: list[str]) -> ChannelConfig:
     decision_timeout, reply_timeout = 300.0, 1800.0
     auto_pass = frozenset({"Read", "Glob", "Grep"})
     status_file_default = None
+    liveness_check_enabled, liveness_window_s, degrade_after = False, 90.0, 3
     try:
         from .config import get_settings
 
@@ -345,6 +369,11 @@ def _resolve_config(argv: list[str]) -> ChannelConfig:
         if ap is not None:
             auto_pass = ap
         status_file_default = getattr(s, "session_status_file", "") or None
+        liveness_check_enabled = bool(
+            getattr(s, "channel_liveness_check_enabled", liveness_check_enabled)
+        )
+        liveness_window_s = float(getattr(s, "channel_liveness_window_s", liveness_window_s))
+        degrade_after = int(getattr(s, "channel_degrade_after", degrade_after))
     except Exception as e:  # bad/missing .env shouldn't kill the adapter
         _log(f"settings unavailable, using bare defaults: {e}")
 
@@ -380,6 +409,11 @@ def _resolve_config(argv: list[str]) -> ChannelConfig:
     enabled = (
         args.enabled if args.enabled is not None else _env_bool("CHANNEL_ENABLED", channel_enabled)
     )
+    liveness_check_enabled = _env_bool("CHANNEL_LIVENESS_CHECK", liveness_check_enabled)
+    liveness_window_s = _env_float("CHANNEL_LIVENESS_WINDOW_S", liveness_window_s)
+    # Owner-token guard (ECA-71): unique per process START. pid alone is not enough — a pid can be
+    # recycled — so pair it with random bytes; a fork gets a different token and is refused.
+    announce_token = f"{os.getpid()}:{os.urandom(6).hex()}"
     return ChannelConfig(
         identity=identity,
         local_url=local_url,
@@ -392,6 +426,10 @@ def _resolve_config(argv: list[str]) -> ChannelConfig:
         decision_timeout=decision_timeout,
         reply_timeout=reply_timeout,
         auto_pass_tools=auto_pass,
+        announce_token=announce_token,
+        liveness_check_enabled=liveness_check_enabled,
+        liveness_window_s=liveness_window_s,
+        degrade_after=degrade_after,
     )
 
 
@@ -466,32 +504,83 @@ def _build_presence(cfg: ChannelConfig) -> tuple[str | None, dict[str, Any]]:
         "status": status,
         "last": last or None,
         "status_updated_at": st.get("updated_at"),
+        # ECA-71 owner-token: identifies THIS process to the server's duplicate-identity guard.
+        "announce_token": cfg.announce_token or None,
     }
     return summary, {k: v for k, v in meta.items() if v is not None}
 
 
+def _status_updated_at(cfg: ChannelConfig) -> float | None:
+    """The status file's `updated_at` (the CC hooks bump it on UserPromptSubmit/Stop), or None.
+    Layer C's liveness signal: a live consumer advances this shortly after a channel push."""
+    ts = _read_status(cfg.status_file).get("updated_at")
+    try:
+        return float(ts) if ts is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _error_code(data: dict[str, Any]) -> str | None:
+    err = data.get("error")
+    if isinstance(err, dict):
+        return err.get("code")
+    return None
+
+
 async def _presence_loop(cfg: ChannelConfig) -> None:
-    """Heartbeat announce() on its own connection until cancelled (session exit)."""
+    """Heartbeat announce() on its own connection until cancelled (session exit).
+
+    ECA-71: this loop owns the `announce_confirmed` gate. A successful announce sets it (arming
+    the inbox loop); a refusal (IDENTITY_LIVE_ELSEWHERE — a fork reused our identity) clears it,
+    so the inbox loop stops claiming and this session never fights the real owner for messages.
+    When Layer C has degraded the session, presence advertises channel=false/status=degraded so
+    the brain stops pushing; the loop re-arms when the status file shows the consumer live again.
+    """
+    assert _RT is not None
+    rt = _RT
     backoff = 1.0
-    warned_announce = False
     while True:
         try:
             async with _make_client(cfg) as c:
                 backoff = 1.0
                 while True:
+                    _maybe_rearm(cfg, rt)
                     summary, meta = _build_presence(cfg)
+                    if rt.degraded:
+                        # Advertise not-push-capable so the brain reroutes to notify+pull.
+                        meta["channel"] = False
+                        meta["status"] = "degraded"
+                        summary = f"{summary} [DEGRADED: channel consumer not live]"[:280]
                     try:
                         res = await c.call_tool(
                             "announce",
                             {"identity": cfg.identity, "summary": summary, "metadata": meta},
                         )
                         data = _result_data(res)
-                        if not data.get("success") and not warned_announce:
+                        if data.get("success"):
+                            rt.announce_confirmed.set()
+                            rt.announce_refused_logged = False
+                        elif _error_code(data) == "IDENTITY_LIVE_ELSEWHERE":
+                            # A different live process holds this identity (typically a claude.ai
+                            # background fork reusing CRM_IDENTITY). Disarm claiming so we never
+                            # race it for messages, and log LOUDLY once so the operator can kill
+                            # the offender. First-announcer-wins (ADR-0029): we do NOT arbitrate.
+                            rt.announce_confirmed.clear()
+                            if not rt.announce_refused_logged:
+                                _log(
+                                    f"announce REFUSED for identity={cfg.identity!r}: another "
+                                    f"live process already holds it (IDENTITY_LIVE_ELSEWHERE). "
+                                    f"This session will NOT claim messages (claim loop disarmed) "
+                                    f"to avoid misroute/black-hole. Kill the duplicate process "
+                                    f"if this session should be the owner. Detail: {data}"
+                                )
+                                rt.announce_refused_logged = True
+                        elif not rt.announce_refused_logged:
                             _log(
-                                f"announce REJECTED for identity={cfg.identity!r} "
+                                f"announce rejected for identity={cfg.identity!r} "
                                 f"(this session is INVISIBLE to the brain): {data}"
                             )
-                            warned_announce = True
+                            rt.announce_refused_logged = True
                     except Exception as e:
                         _log(f"announce failed (continuing): {e}")
                     await asyncio.sleep(cfg.heartbeat)
@@ -499,6 +588,26 @@ async def _presence_loop(cfg: ChannelConfig) -> None:
             raise
         except Exception as e:
             backoff = await _reconnect_sleep("presence", e, backoff)
+
+
+def _maybe_rearm(cfg: ChannelConfig, rt: "_Runtime") -> None:
+    """Layer C re-arm: if degraded and the status file's updated_at has advanced past the value
+    snapshotted at degrade time, the consumer is live again — clear degraded and reset the
+    non-consumption count so the next heartbeat re-advertises channel=true and claiming resumes.
+    The operator's own local turns bump updated_at regardless of whether a channel push does
+    (spike #2), so this re-arm signal is reliable."""
+    if not rt.degraded:
+        return
+    now_ts = _status_updated_at(cfg)
+    base = rt.degraded_status_ts
+    if now_ts is not None and (base is None or now_ts > base):
+        _log(
+            f"re-arming identity={cfg.identity!r}: status file advanced "
+            f"(updated_at {base} -> {now_ts}); consumer live again, resuming claims"
+        )
+        rt.degraded = False
+        rt.degraded_status_ts = None
+        rt.consecutive_nonconsumption = 0
 
 
 # --------------------------------------------------------------------- inbound push
@@ -524,8 +633,53 @@ async def _push(write_stream: Any, msg: dict[str, Any]) -> None:
     await write_stream.send(SessionMessage(message=JSONRPCMessage(notif)))
 
 
+async def _await_consumption(cfg: ChannelConfig, rt: "_Runtime", baseline_ts: float | None) -> bool:
+    """Wait for the in-flight message to be CONSUMED and return True (the agent called `reply`,
+    setting reply_event), or False on NON-CONSUMPTION (ECA-71 Layer C).
+
+    Fast path off (default, spike-#2-pending): wait the full reply_timeout; False on timeout.
+
+    Fast path on (channel_liveness_check_enabled): within liveness_window_s of the push, wait for
+    either a reply OR a sign of life — the status file's updated_at advancing past `baseline_ts`
+    (a live consumer bumps it via the UserPromptSubmit hook). No reply AND no advance ⇒ the
+    consumer is dead/parked ⇒ return False fast (bounce, don't wait 30 min). A live-but-slow turn
+    (status advanced) is never bounced early: it gets the remaining reply_timeout."""
+    if not cfg.liveness_check_enabled:
+        try:
+            await asyncio.wait_for(rt.reply_event.wait(), timeout=cfg.reply_timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    try:
+        await asyncio.wait_for(rt.reply_event.wait(), timeout=cfg.liveness_window_s)
+        return True  # replied inside the liveness window
+    except asyncio.TimeoutError:
+        pass
+    now_ts = _status_updated_at(cfg)
+    advanced = now_ts is not None and (baseline_ts is None or now_ts > baseline_ts)
+    if not advanced:
+        return False  # no reply, no sign of life -> dead/parked consumer
+    remaining = max(0.0, cfg.reply_timeout - cfg.liveness_window_s)
+    try:
+        await asyncio.wait_for(rt.reply_event.wait(), timeout=remaining)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+_NON_CONSUMPTION_BOUNCE = (
+    "<the addressed live session did not process this message: its channel consumer is not "
+    "live (not loaded, or the agent loop is parked/forked away). Message not delivered.>"
+)
+
+
 async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
-    """Claim one message at a time -> push -> await its reply -> claim the next."""
+    """Claim one message at a time -> push -> await its reply -> claim the next.
+
+    ECA-71 gate: never claim unless announce is CONFIRMED (Layer B — a refused fork stays
+    disarmed) and the session is not DEGRADED (Layer C — a dead consumer stops claiming until it
+    shows life again). On non-consumption the sender is BOUNCED, never silently black-holed."""
     assert _RT is not None
     rt = _RT
     # Don't push before the session has finished initializing (events into an un-initialized
@@ -534,6 +688,11 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
         await asyncio.wait_for(rt.initialized.wait(), timeout=30.0)
     except asyncio.TimeoutError:
         _log("session did not signal initialized within 30s; proceeding anyway")
+    # Layer B: wait for the first confirmed announce before claiming anything. A fork whose
+    # announce is refused never sets this, so it never claims (blocks here indefinitely).
+    if not rt.announce_confirmed.is_set():
+        _log("waiting for a confirmed announce before claiming (ECA-71 identity guard)")
+        await rt.announce_confirmed.wait()
 
     backoff = 1.0
     while True:
@@ -542,6 +701,12 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                 backoff = 1.0
                 _log(f"inbox bridge connected to {cfg.local_url} as identity={cfg.identity!r}")
                 while True:
+                    # Re-check the gate every iteration: a refusal (fork appeared) clears
+                    # announce_confirmed and Layer C sets degraded — either must pause claiming.
+                    await rt.announce_confirmed.wait()
+                    if rt.degraded:
+                        await asyncio.sleep(cfg.heartbeat)
+                        continue
                     res = await c.call_tool(
                         "wait_for_instruction",
                         {"recipient_session": cfg.identity, "timeout": cfg.poll},
@@ -582,17 +747,37 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                         continue
                     rt.inflight = msg
                     rt.reply_event = asyncio.Event()
+                    baseline_ts = _status_updated_at(cfg)  # snapshot BEFORE the push (Layer C)
                     await _push(write_stream, msg)
                     _log(f"pushed message {msg.get('id')} from {msg.get('sender')}; awaiting reply")
                     try:
-                        await asyncio.wait_for(rt.reply_event.wait(), timeout=cfg.reply_timeout)
-                    except asyncio.TimeoutError:
-                        _log(
-                            f"no channel reply for {msg.get('id')} in {cfg.reply_timeout:.0f}s; "
-                            "claiming next (a late reply still lands via the reply tool)"
-                        )
+                        consumed = await _await_consumption(cfg, rt, baseline_ts)
                     finally:
                         rt.inflight = None
+                    if consumed:
+                        rt.consecutive_nonconsumption = 0
+                        continue
+                    # Layer C: NON-CONSUMPTION. Bounce the sender so the brain's
+                    # wait_for_completion unblocks with a failure instead of a silent 30-min
+                    # black hole. Double-check reply_event: a reply may have raced in.
+                    if rt.reply_event.is_set():
+                        rt.consecutive_nonconsumption = 0
+                        continue
+                    _log(
+                        f"NON-CONSUMPTION of {msg.get('id')} (no reply / no sign of life); "
+                        "bouncing to the sender so it is not black-holed"
+                    )
+                    await _mesh_reply(cfg, str(msg.get("id", "")), _NON_CONSUMPTION_BOUNCE)
+                    rt.consecutive_nonconsumption += 1
+                    if rt.consecutive_nonconsumption >= cfg.degrade_after and not rt.degraded:
+                        rt.degraded = True
+                        rt.degraded_status_ts = _status_updated_at(cfg)
+                        _log(
+                            f"DEGRADING identity={cfg.identity!r}: "
+                            f"{rt.consecutive_nonconsumption} consecutive non-consumptions. "
+                            "Disarming claims + re-announcing channel=false/degraded so the "
+                            "brain reroutes (notify+pull). Re-arms when the consumer shows life."
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as e:

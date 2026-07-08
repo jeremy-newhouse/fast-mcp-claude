@@ -138,6 +138,10 @@ class LauncherConfig:
     # Unix socket the worker hook talks to; the launcher relays approvals over it so the
     # worker never gets the mesh bearer. Path only (not a secret) appears in the worker argv.
     approval_socket_path: str = ""
+    # ECA-71 / ADR-0029 owner-token: a per-process boot token stamped into every announce so the
+    # server's duplicate-identity guard can refuse a second launcher reusing this identity. Blank
+    # keeps pre-ECA-71 behavior (tokenless announces are never refused). Set once at startup.
+    announce_token: str = ""
 
 
 def _env_float(name: str, default: float) -> float:
@@ -283,6 +287,7 @@ def _resolve_config(argv: list[str]) -> LauncherConfig:
         approval_auto_pass_tools=approval_auto_pass_tools,
         approval_hook_selftest=approval_hook_selftest,
         approval_socket_path=approval_socket_path,
+        announce_token=f"{os.getpid()}:{os.urandom(6).hex()}",
     )
 
 
@@ -958,6 +963,8 @@ def _announce_metadata(cfg: LauncherConfig) -> dict[str, Any]:
         "cwd_allowlist": [str(p) for p in cfg.cwd_allowlist],
         "tools_ceiling": list(cfg.tools_ceiling),
         "max_concurrent": cfg.max_concurrent,
+        # ECA-71 owner-token: identifies THIS launcher process to the server's identity guard.
+        "announce_token": cfg.announce_token or None,
     }
 
 
@@ -973,9 +980,10 @@ async def _heartbeat_loop(
     failures never trip a rebuild (reconnecting won't fix a bad bearer, and would risk the 60s
     endpoint lockout)."""
     consecutive = 0
+    refusal_logged = False
     while True:
         try:
-            await client.call_tool(
+            res = await client.call_tool(
                 "announce",
                 {
                     "identity": cfg.identity,
@@ -984,6 +992,22 @@ async def _heartbeat_loop(
                 },
             )
             consecutive = 0
+            # ECA-71: tolerate a duplicate-identity refusal (a second launcher for this identity)
+            # — it is NOT a dead-session failure, so never trip a reconnect; just log loudly once
+            # so the operator can kill the offender. pm2 runs one launcher per peer, so this is a
+            # defensive backstop; the real fix lives in the channel sidecar.
+            data = _result_data(res)
+            if not data.get("success"):
+                err = data.get("error") if isinstance(data.get("error"), dict) else {}
+                if err.get("code") == "IDENTITY_LIVE_ELSEWHERE" and not refusal_logged:
+                    _log(
+                        f"announce REFUSED for identity={cfg.identity!r}: another live launcher "
+                        f"already holds it (IDENTITY_LIVE_ELSEWHERE). Kill the duplicate if this "
+                        f"process should own it. Detail: {data}"
+                    )
+                    refusal_logged = True
+            else:
+                refusal_logged = False
         except Exception as e:
             _log(f"announce failed (continuing): {e}")
             if any(h in str(e).lower() for h in _AUTH_HINTS):

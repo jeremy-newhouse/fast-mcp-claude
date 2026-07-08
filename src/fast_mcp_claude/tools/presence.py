@@ -29,7 +29,10 @@ logger = get_logger(__name__)
     description=(
         "[Any] Announce this peer's presence and a short summary of what it is "
         "doing, so other sessions can discover it via who(). The channel adapter "
-        "calls this on a heartbeat; humans rarely call it directly."
+        "calls this on a heartbeat; humans rarely call it directly. If metadata "
+        "carries an `announce_token`, presence is owner-guarded: a second live "
+        "process reusing the same identity with a different token is refused "
+        "(IDENTITY_LIVE_ELSEWHERE) while the first is still heartbeating."
     )
 )
 async def announce(
@@ -55,7 +58,12 @@ async def announce(
         if metadata is not None and not isinstance(metadata, dict):
             raise ValidationError("metadata must be an object", field="metadata")
 
-        await store.announce(identity, summary=summary, metadata=metadata)
+        result = await store.announce(identity, summary=summary, metadata=metadata)
+        # Owner-token identity guard (ECA-71 / ADR-0029): the store refuses a second live
+        # announcer for an identity already held by a different process. Propagate the refusal
+        # so the sidecar/launcher can disarm its claim loop instead of clobbering presence.
+        if not result.get("success"):
+            return {"success": False, "identity": identity, "error": result.get("error")}
         return {"success": True, "identity": identity}
     except ValidationError as e:
         return format_error_response(e)

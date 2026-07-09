@@ -98,6 +98,25 @@ class Settings(BaseSettings):
     # Write/...) prompt the operator in Teams. (Our own reply tool is always auto-allowed.)
     channel_auto_pass_tools: str = "Read,Glob,Grep"
 
+    # Layer C non-consumption recovery (ECA-71 / ADR-0029). The sidecar must never hold a claim
+    # it cannot inject: on a pushed message the consumer never processes, it BOUNCEs the sender
+    # (mesh reply "consumer not live") instead of the old silent 30-min drop — always on. The
+    # FAST liveness signal below shortcuts the full reply_timeout by watching the hook status
+    # file: a live consumer advances updated_at within a few seconds of a push (UserPromptSubmit
+    # -> status="working"). It is DEFAULT-OFF, gated on open spike #2 (does a channel-injected
+    # push actually fire UserPromptSubmit? — untestable headlessly). Flip to true once verified
+    # on a live attended session; until then the guaranteed reply_timeout bounce still applies.
+    # A live-but-slow turn (status DID advance) is never bounced early — it gets the full
+    # reply_timeout; only a non-advancing (dead/parked) consumer bounces fast.
+    channel_liveness_check_enabled: bool = False
+    # Seconds after a push to wait for the status file's updated_at to advance before treating
+    # the message as unconsumed (fast path only).
+    channel_liveness_window_s: float = 90.0
+    # After this many CONSECUTIVE non-consumptions the sidecar disarms its claim loop and
+    # re-announces channel=false/status=degraded so the brain stops pushing and reroutes to
+    # notify+pull. It re-arms when the status file shows the consumer live again.
+    channel_degrade_after: int = 3
+
     # Live-session sidecar (fast-mcp-claude-session) — STRICT opt-in, default off. The
     # launch wrapper starts ONE per interactive dev session. It is the SOLE announcer of
     # that session's presence (role="live-session"), heartbeating announce() with a status

@@ -58,16 +58,37 @@ def cycle_prompt(repo: str) -> str:
 
 
 def restore_prompt(repo: str) -> str:
+    # RE-GROUND ONLY, then stop (symmetric with cycle_prompt's "do not do work").
+    # This turn must NOT carry out the standing task: a restore that also worked
+    # crammed a whole unit of work into one turn (natsbus epoch: 19 min / 49 SDK
+    # turns / $4), which is only "done" if it beats the wall clock — sandbox's did
+    # not (state=timeout). The follow-up work runs as a separate kind='prompt' turn
+    # (_after_turn enqueues continue_prompt) under a fresh wall-clock/budget, which
+    # also re-arms auto-cycle (it only fires on 'prompt'). ECA-84.
     return (
         "You are a fresh context taking over from your previous epoch. "
         "Restore using the LEAN path: "
         "(1) run `/handover restore` if this repo has the handover skill; otherwise read "
         f"the newest file in {repo}/.claude/handovers/ "
-        "(NOT your home directory) and continue its next steps. "
+        "(NOT your home directory). "
         "(2) If the handover references a DEV-PLAN, read that file for authoritative task scope. "
         "(3) Treat code on disk as the ground truth for current state. "
         "Do NOT re-read the design-doc corpus or ADR collection wholesale — the handover "
-        "already distilled what matters. Begin working immediately after reading handover + DEV-PLAN."
+        "already distilled what matters. "
+        "Then STOP: reply with a 2-4 sentence summary of your restored state and the immediate "
+        "next steps, and END YOUR TURN. Do NOT begin the work itself — a separate follow-up turn "
+        "carries it out under a fresh budget."
+    )
+
+
+def continue_prompt() -> str:
+    # The work half of a cycle, enqueued after a bounded restore re-grounds (ECA-84).
+    # Runs as kind='prompt' so it gets a fresh wall-clock/budget and auto-cycle re-arms.
+    return (
+        "You have re-grounded from your handover. Continue your standing task now, picking up "
+        "at the handover's immediate next steps. Work in bounded increments — your context "
+        "auto-cycles when it fills and you can hand off again. If the handover shows the task is "
+        "already complete, briefly confirm completion and stop."
     )
 
 
@@ -693,6 +714,19 @@ class Engine:
             await self._reg.set_worker_status(name, "retired")
             self._events.emit(name, "worker_retired")
             self._kick(name)  # loop observes retired and exits
+            return
+        if kind == "restore":
+            # Bounded restore (ECA-84): the restore turn only RE-GROUNDS (see
+            # restore_prompt) — it does not carry out the work. Auto-enqueue ONE
+            # continuation work-turn so autonomous work still proceeds, under a
+            # FRESH wall-clock/budget and as kind='prompt' so context-pressure
+            # auto-cycle re-arms (it never fires on a 'restore' turn). Guard on an
+            # empty queue: a manual cycle where the orchestrator already queued its
+            # own next prompt must not get a racing continuation stacked behind it.
+            if await self._reg.next_queued_turn(name) is None:
+                await self._reg.enqueue_turn(name, continue_prompt(), kind="prompt")
+                self._events.emit(name, "restore_continued")
+                self._kick(name)
             return
         # Auto-cycle on context pressure (FR-WS6/ECA-49), only off a clean turn
         # with an empty queue (never stack cycles behind pending work).

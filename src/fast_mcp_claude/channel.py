@@ -633,39 +633,53 @@ async def _push(write_stream: Any, msg: dict[str, Any]) -> None:
     await write_stream.send(SessionMessage(message=JSONRPCMessage(notif)))
 
 
-async def _await_consumption(cfg: ChannelConfig, rt: "_Runtime", baseline_ts: float | None) -> bool:
-    """Wait for the in-flight message to be CONSUMED and return True (the agent called `reply`,
-    setting reply_event), or False on NON-CONSUMPTION (ECA-71 Layer C).
+# _await_consumption verdicts (ECA-71 Layer C).
+_CONSUMED = "consumed"  # the agent called reply() -> reply_event set (happy path)
+_DEAD = "dead"  # POSITIVE non-consumption evidence -> bounce + count toward degrade
+_UNKNOWN = "unknown"  # ambiguous timeout -> do NOT bounce (leave un-finalized; late reply wins)
 
-    Fast path off (default, spike-#2-pending): wait the full reply_timeout; False on timeout.
 
-    Fast path on (channel_liveness_check_enabled): within liveness_window_s of the push, wait for
-    either a reply OR a sign of life — the status file's updated_at advancing past `baseline_ts`
-    (a live consumer bumps it via the UserPromptSubmit hook). No reply AND no advance ⇒ the
-    consumer is dead/parked ⇒ return False fast (bounce, don't wait 30 min). A live-but-slow turn
-    (status advanced) is never bounced early: it gets the remaining reply_timeout."""
-    if not cfg.liveness_check_enabled:
+async def _await_consumption(cfg: ChannelConfig, rt: "_Runtime", baseline_ts: float | None) -> str:
+    """Classify how a pushed message ended (ECA-71 Layer C). Returns:
+
+      _CONSUMED  — the agent replied (reply_event set).
+      _DEAD      — POSITIVE evidence the consumer never processed it: only the fast liveness
+                   signal produces this (status file present + no updated_at advance within
+                   liveness_window_s of the push -> the consumer is not loaded / parked). Safe to
+                   bounce: a genuinely dead consumer won't later produce a real reply to clobber.
+      _UNKNOWN   — the reply budget elapsed but we have NO death evidence (fast signal off, or a
+                   live-but-slow turn whose status DID advance). We must NOT bounce here: mesh
+                   reply() FINALIZES the message, so a real late reply would be discarded by
+                   record_reply's CAS and the sender would get a false "not delivered". Leave the
+                   message un-finalized (pre-ECA-71 behavior) so a late real reply still lands.
+
+    The fast path requires a status file — without one there is no liveness signal, so we cannot
+    tell dead from slow and fall back to the ambiguous (never-bounce) path."""
+    fast = cfg.liveness_check_enabled and bool(cfg.status_file)
+    if not fast:
         try:
             await asyncio.wait_for(rt.reply_event.wait(), timeout=cfg.reply_timeout)
-            return True
+            return _CONSUMED
         except asyncio.TimeoutError:
-            return False
+            return _UNKNOWN
 
     try:
         await asyncio.wait_for(rt.reply_event.wait(), timeout=cfg.liveness_window_s)
-        return True  # replied inside the liveness window
+        return _CONSUMED  # replied inside the liveness window
     except asyncio.TimeoutError:
         pass
     now_ts = _status_updated_at(cfg)
     advanced = now_ts is not None and (baseline_ts is None or now_ts > baseline_ts)
     if not advanced:
-        return False  # no reply, no sign of life -> dead/parked consumer
+        return _DEAD  # no reply, no sign of life within the window -> dead/parked consumer
+    # Consumer is alive (status advanced) but slow: give it the remaining budget. If it still
+    # doesn't reply it is slow, NOT dead -> ambiguous (don't bounce/clobber a working turn).
     remaining = max(0.0, cfg.reply_timeout - cfg.liveness_window_s)
     try:
         await asyncio.wait_for(rt.reply_event.wait(), timeout=remaining)
-        return True
+        return _CONSUMED
     except asyncio.TimeoutError:
-        return False
+        return _UNKNOWN
 
 
 _NON_CONSUMPTION_BOUNCE = (
@@ -751,20 +765,29 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                     await _push(write_stream, msg)
                     _log(f"pushed message {msg.get('id')} from {msg.get('sender')}; awaiting reply")
                     try:
-                        consumed = await _await_consumption(cfg, rt, baseline_ts)
+                        verdict = await _await_consumption(cfg, rt, baseline_ts)
                     finally:
                         rt.inflight = None
-                    if consumed:
+                    # A reply may have raced in right at the boundary — treat that as consumed.
+                    if verdict == _CONSUMED or rt.reply_event.is_set():
                         rt.consecutive_nonconsumption = 0
                         continue
-                    # Layer C: NON-CONSUMPTION. Bounce the sender so the brain's
-                    # wait_for_completion unblocks with a failure instead of a silent 30-min
-                    # black hole. Double-check reply_event: a reply may have raced in.
-                    if rt.reply_event.is_set():
-                        rt.consecutive_nonconsumption = 0
+                    if verdict == _UNKNOWN:
+                        # No death evidence (fast signal off, or a live-but-slow turn). Do NOT
+                        # bounce: mesh reply() finalizes the message and would clobber a real late
+                        # reply via record_reply's CAS. Leave it un-finalized and claim next — a
+                        # late reply still lands via the reply tool (pre-ECA-71 behavior). Does
+                        # NOT count toward degrade (no evidence the consumer is dead).
+                        _log(
+                            f"no reply for {msg.get('id')} within budget and no death evidence; "
+                            "claiming next (late reply still lands; not bouncing)"
+                        )
                         continue
+                    # verdict == _DEAD: POSITIVE non-consumption evidence (fast signal). Bounce so
+                    # the brain's wait_for_completion unblocks with a failure instead of a silent
+                    # black hole; a genuinely dead consumer won't produce a real reply to clobber.
                     _log(
-                        f"NON-CONSUMPTION of {msg.get('id')} (no reply / no sign of life); "
+                        f"NON-CONSUMPTION of {msg.get('id')} (consumer showed no life); "
                         "bouncing to the sender so it is not black-holed"
                     )
                     await _mesh_reply(cfg, str(msg.get("id", "")), _NON_CONSUMPTION_BOUNCE)
@@ -1340,6 +1363,18 @@ async def _serve(cfg: ChannelConfig) -> None:
         return
 
     _log(f"starting channel sidecar (identity={cfg.identity!r}, local={cfg.local_url})")
+    if cfg.liveness_check_enabled and not cfg.status_file:
+        # The fast liveness signal reads the hook status file; without one it can't tell a dead
+        # consumer from a slow one, so _await_consumption falls back to the never-bounce path.
+        _log(
+            "WARNING: channel_liveness_check_enabled but no status file configured — the fast "
+            "non-consumption signal is INERT (falling back to ambiguous timeout, no bounce)."
+        )
+    # Known tradeoff (ECA-71): on a fast RESTART the new process mints a new announce_token while
+    # the dead process's presence row is still timestamp-fresh, so the identity guard refuses this
+    # process (and the inbox loop stays disarmed) for up to poll_heartbeat_s*3 until the old row
+    # goes stale. Self-healing, no message loss (they park in the mailbox), but a claim-latency gap
+    # on relaunch. Accepted for v1; a graceful presence handoff would shrink it (follow-up).
     async with stdio_server() as (read_stream, write_stream):
         tee_send, tee_recv = anyio.create_memory_object_stream(256)
         async with anyio.create_task_group() as tg:

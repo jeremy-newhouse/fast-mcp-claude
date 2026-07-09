@@ -103,12 +103,17 @@ class Settings(BaseSettings):
     # (mesh reply "consumer not live") instead of the old silent 30-min drop — always on. The
     # FAST liveness signal below shortcuts the full reply_timeout by watching the hook status
     # file: a live consumer advances updated_at within a few seconds of a push (UserPromptSubmit
-    # -> status="working"). It is DEFAULT-OFF, gated on open spike #2 (does a channel-injected
-    # push actually fire UserPromptSubmit? — untestable headlessly). Flip to true once verified
-    # on a live attended session; until then the guaranteed reply_timeout bounce still applies.
-    # A live-but-slow turn (status DID advance) is never bounced early — it gets the full
-    # reply_timeout; only a non-advancing (dead/parked) consumer bounces fast.
-    channel_liveness_check_enabled: bool = False
+    # -> status="working"). Spike #2 RESOLVED YES (2026-07-09, live-verified on mini2/eca1 with
+    # the new sidecar): a channel-injected push DOES fire UserPromptSubmit, advancing updated_at
+    # at turn START (~26s before the Stop bump on a 12s task) — so this is now DEFAULT-ON. Without
+    # a status file the fast path is inert (+ a startup warning): the sidecar cannot tell dead from
+    # slow, so it takes the ambiguous NEVER-BOUNCE path (waits reply_timeout, then leaves the
+    # message un-finalized — pre-ECA-71 behavior; there is NO timeout bounce). Only a status-file
+    # consumer that does not advance in-window bounces fast; a turn that DOES advance in-window gets
+    # the full reply_timeout. KNOWN LIMITATION (ECA-83): a push queued behind a long (> window)
+    # in-flight turn shows no in-window advance and can be false-bounced — hardening tracked there.
+    # Override per-host with CHANNEL_LIVENESS_CHECK=0.
+    channel_liveness_check_enabled: bool = True
     # Seconds after a push to wait for the status file's updated_at to advance before treating
     # the message as unconsumed (fast path only).
     channel_liveness_window_s: float = 90.0

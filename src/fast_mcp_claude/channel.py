@@ -350,7 +350,9 @@ def _resolve_config(argv: list[str]) -> ChannelConfig:
     decision_timeout, reply_timeout = 300.0, 1800.0
     auto_pass = frozenset({"Read", "Glob", "Grep"})
     status_file_default = None
-    liveness_check_enabled, liveness_window_s, degrade_after = False, 90.0, 3
+    # Mirror the config default (ECA-71: the liveness fast-bounce is default-on) so a get_settings()
+    # failure below doesn't silently disable it. Still gated on a status file by `fast` (below).
+    liveness_check_enabled, liveness_window_s, degrade_after = True, 90.0, 3
     try:
         from .config import get_settings
 

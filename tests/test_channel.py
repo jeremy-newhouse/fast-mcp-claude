@@ -33,6 +33,8 @@ _CHANNEL_ENV = (
     "CHANNEL_REPLY_TIMEOUT_S",
     "CHANNEL_AUTO_PASS_TOOLS",
     "CRM_SESSION_STATUS_FILE",
+    "CHANNEL_LIVENESS_CHECK",
+    "CHANNEL_LIVENESS_WINDOW_S",
 )
 
 
@@ -118,6 +120,20 @@ def test_cli_no_enabled_wins_over_env_and_settings(env, fake_settings):
     fake_settings(channel_enabled=True)
     env.setenv("CHANNEL_ENABLED", "true")
     assert channel_mod._resolve_config(["--no-enabled"]).enabled is False
+
+
+def test_liveness_check_enabled_default_is_true():
+    # ECA-71: the fast non-consumption bounce is DEFAULT-ON. The fast-path tests set
+    # liveness_check_enabled explicitly on ChannelConfig, so an accidental revert of the Settings
+    # default to False would leave them all green — this pins the source of the default directly.
+    assert Settings.model_fields["channel_liveness_check_enabled"].default is True
+
+
+def test_liveness_check_env_can_disable_default(env, fake_settings):
+    # Per-host opt-out documented in config.py: CHANNEL_LIVENESS_CHECK=0 overrides the default-on.
+    fake_settings()
+    env.setenv("CHANNEL_LIVENESS_CHECK", "0")
+    assert channel_mod._resolve_config([]).liveness_check_enabled is False
 
 
 # ----------------------------------------------------------- identity precedence

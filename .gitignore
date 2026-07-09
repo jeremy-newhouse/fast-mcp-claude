@@ -55,6 +55,10 @@ htmlcov/
 .env
 .env.local
 .env.*.local
+# Backups / pre-change snapshots of env files — never commit (may hold endpoints/creds)
+.env.bak*
+*.env.bak*
+spawner/.env.bak*
 
 # Logs
 *.log

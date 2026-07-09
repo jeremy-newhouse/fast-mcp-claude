@@ -181,8 +181,11 @@ async def test_epoch_budget_refuses_next_turn(make_engine, registry, repo):
     assert "budget exhausted" in turn2["error"]
 
 
-async def test_manual_cycle_rolls_epoch_and_restores(make_engine, registry, repo, events):
-    engine, _ = make_engine([[r("s1")], [r("s2")], [r("s3")]])
+async def test_manual_cycle_rolls_epoch_restores_and_continues(make_engine, registry, repo, events):
+    # ECA-84: the restore turn only re-grounds; the supervisor then auto-enqueues one
+    # continuation work-turn (kind='prompt') so autonomous work proceeds under a fresh
+    # budget. Expected chain: prompt -> cycle_handover -> restore -> prompt (continuation).
+    engine, _ = make_engine([[r("s1")], [r("s2")], [r("s3")], [r("s4")]])
     await engine.spawn("w1", str(repo))
     t1 = await engine.prompt("w1", "work")
     await terminal_turn(registry, t1)
@@ -194,14 +197,53 @@ async def test_manual_cycle_rolls_epoch_and_restores(make_engine, registry, repo
 
     await wait_until(_cycled)
 
-    async def _restored():
-        rows = await registry.history("w1", limit=10)
-        return [t for t in rows if t["kind"] == "restore" and t["state"] == "done"] or None
+    async def _continued():
+        rows = list(reversed(await registry.history("w1", limit=10)))
+        kinds = [t["kind"] for t in rows]
+        if kinds == ["prompt", "cycle_handover", "restore", "prompt"] and rows[-1]["state"] == "done":
+            return kinds
+        return None
 
-    await wait_until(_restored)
-    kinds = [t["kind"] for t in reversed(await registry.history("w1", limit=10))]
-    assert kinds == ["prompt", "cycle_handover", "restore"]
+    kinds = await wait_until(_continued)
+    assert kinds == ["prompt", "cycle_handover", "restore", "prompt"]
     assert any(e["event"] == "epoch_cycled" for e in events.read("w1"))
+    assert any(e["event"] == "restore_continued" for e in events.read("w1"))
+
+
+async def test_restore_continuation_is_guarded_by_a_pending_queue(
+    make_engine, registry, repo, events, monkeypatch
+):
+    """ECA-84: a bounded restore auto-enqueues ONE continuation only when the queue is
+    empty. If the orchestrator already queued its own next prompt, we must not stack a
+    racing continuation behind it. Driven by calling _after_turn directly with _kick
+    stubbed, so the assertion is on the enqueue decision, not on loop timing."""
+    engine, _ = make_engine([[r("s1")]])
+    monkeypatch.setattr(engine, "_kick", lambda name: None)  # isolate the enqueue decision
+    await engine.spawn("w1", str(repo))
+
+    async def _finished_restore() -> int:
+        tid = await registry.enqueue_turn("w1", "restore", kind="restore")
+        await registry.claim_turn(tid)
+        await registry.start_turn(tid, None)
+        await registry.finish_turn(tid, "done", session_id=f"s{tid}")
+        return tid
+
+    # Empty queue -> exactly one continuation prompt is enqueued.
+    await engine._after_turn("w1", await _finished_restore())
+    queued = [
+        t for t in await registry.history("w1", limit=20)
+        if t["kind"] == "prompt" and t["state"] == "queued"
+    ]
+    assert len(queued) == 1
+    assert any(e["event"] == "restore_continued" for e in events.read("w1"))
+
+    # Non-empty queue (the continuation above is still pending) -> a second bounded
+    # restore adds NOTHING; the guard defers to the already-pending work.
+    before = len(await registry.history("w1", limit=50))
+    await _finished_restore()
+    after = len(await registry.history("w1", limit=50))
+    assert after == before + 1  # only the restore row itself; no extra continuation
+    assert sum(e["event"] == "restore_continued" for e in events.read("w1")) == 1
 
 
 async def test_resume_skips_unpersisted_session(cfg, registry, events, repo, monkeypatch):

@@ -49,6 +49,11 @@ class WorkerPolicy:
     guard_hooks: dict[str, str] = field(default_factory=dict)  # tool -> .claude/hooks script
     model: str | None = None
     limits: dict[str, Any] = field(default_factory=dict)  # per-worker Limits overrides
+    # Per-lane MCP grant (ECA-100): server-name -> SDK McpServerConfig, passed to
+    # ClaudeAgentOptions.mcp_servers. Any credential a server needs lives in ITS
+    # own env/headers block here, NOT the worker's process env (envbuild's A3
+    # scrub stays intact). Empty = no MCP tools for the lane.
+    mcp_servers: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_json(cls, raw: str) -> "WorkerPolicy":
@@ -59,6 +64,7 @@ class WorkerPolicy:
             guard_hooks=data.get("guard_hooks", {}),
             model=data.get("model"),
             limits=data.get("limits", {}),
+            mcp_servers=data.get("mcp_servers", {}),
         )
 
     def to_json(self) -> str:
@@ -69,6 +75,7 @@ class WorkerPolicy:
                 "guard_hooks": self.guard_hooks,
                 "model": self.model,
                 "limits": self.limits,
+                "mcp_servers": self.mcp_servers,
             }
         )
 
@@ -81,6 +88,12 @@ class WorkerPolicy:
         names: list[str] = []
         for spec in self.allowed_tools:
             base = spec.split("(", 1)[0].strip()
+            # MCP tool existence is governed by the connected mcp_servers, not by
+            # the built-in --tools floor; a literal 'mcp__server__*' here would be
+            # meaningless (and could confuse the flag). Skip it — the ceiling still
+            # gates the calls (ceiling_allows handles the name wildcard).
+            if base.startswith("mcp__"):
+                continue
             if base and base not in names:
                 names.append(base)
         for required in _ALWAYS_BASE_TOOLS:
@@ -93,7 +106,15 @@ class WorkerPolicy:
         prefix matcher on the command field (Claude Code matcher semantics)."""
         for spec in self.allowed_tools:
             base, _, matcher = spec.partition("(")
-            if base.strip() != tool_name:
+            base = base.strip()
+            # Tool-NAME wildcard (ECA-100): a spec ending in '*' with no '(...)'
+            # matcher grants every tool whose name shares that prefix — the way to
+            # allow a whole MCP server, e.g. 'mcp__jira__*' -> mcp__jira__search.
+            if not matcher and base.endswith("*"):
+                if tool_name.startswith(base[:-1]):
+                    return True
+                continue
+            if base != tool_name:
                 continue
             if not matcher:  # bare tool name: all inputs
                 return True

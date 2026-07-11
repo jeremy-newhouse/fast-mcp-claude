@@ -171,6 +171,21 @@ class Registry:
             )
         await self.db.commit()
 
+    async def delete_worker(self, name: str) -> bool:
+        """Purge a worker and ALL its history (questions -> turns -> epochs -> row).
+
+        Children first because foreign_keys=ON. Returns False if no such worker.
+        Frees the workers.name PRIMARY KEY so the name can be re-spawned (ECA-99).
+        """
+        if await self.get_worker(name) is None:
+            return False
+        await self.db.execute("DELETE FROM questions WHERE worker = ?", (name,))
+        await self.db.execute("DELETE FROM turns WHERE worker = ?", (name,))
+        await self.db.execute("DELETE FROM epochs WHERE worker = ?", (name,))
+        await self.db.execute("DELETE FROM workers WHERE name = ?", (name,))
+        await self.db.commit()
+        return True
+
     # -- epochs ---------------------------------------------------------------
 
     async def _open_epoch(self, worker: str, seq: int) -> int:

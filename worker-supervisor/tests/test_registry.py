@@ -77,6 +77,28 @@ async def test_boot_reconcile_redelivers_and_normalizes(registry):
     assert await registry.pending_questions() == []
 
 
+async def test_delete_worker_frees_name_for_respawn(registry):
+    """ECA-99: delete_worker purges the row (+ history) so the PK name is reusable."""
+    await registry.spawn_worker("w1", "/tmp/r", {})
+    tid = await registry.enqueue_turn("w1", "p")
+    await registry.claim_turn(tid)
+    await registry.finish_turn(tid, "done", session_id="s1", cost_usd=0.1)
+    await registry.park_question(tid, "w1", [{"question": "?"}])
+
+    assert await registry.delete_worker("w1") is True
+    assert await registry.get_worker("w1") is None
+    # History gone with the row (children-first delete, no FK violation).
+    assert await registry.history("w1") == []
+    assert await registry.pending_questions("w1") == []
+    # The freed name re-spawns cleanly (no "already exists").
+    respawned = await registry.spawn_worker("w1", "/tmp/r", {})
+    assert respawned["name"] == "w1" and respawned["status"] == "idle"
+
+
+async def test_delete_worker_missing_is_false(registry):
+    assert await registry.delete_worker("nope") is False
+
+
 async def test_question_resolution_is_cas(registry):
     await registry.spawn_worker("w1", "/tmp/r", {})
     tid = await registry.enqueue_turn("w1", "p")

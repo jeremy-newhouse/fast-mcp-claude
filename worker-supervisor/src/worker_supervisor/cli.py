@@ -61,6 +61,27 @@ def _parse_limits(ns: argparse.Namespace) -> dict[str, Any]:
     return limits
 
 
+def _load_mcp_config(spec: str) -> dict[str, Any]:
+    """Resolve --mcp-config: a path to a JSON file OR inline JSON. Accepts either a
+    bare server map or a {"mcpServers": {...}} wrapper (the ~/.claude.json shape).
+
+    Each server's credentials live in ITS OWN env/headers block here — they are
+    passed to the MCP server subprocess, not merged into the worker's own env.
+    """
+    import os
+
+    raw = spec
+    if os.path.exists(spec):
+        with open(spec, encoding="utf-8") as f:
+            raw = f.read()
+    data = json.loads(raw)
+    if isinstance(data, dict) and "mcpServers" in data:
+        data = data["mcpServers"]
+    if not isinstance(data, dict):
+        raise ValueError("--mcp-config must be a JSON object of server-name -> config")
+    return data
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="workers", description="worker-supervisor control CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -75,6 +96,12 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--wall-clock", type=int, default=None, metavar="S")
     sp.add_argument("--max-turns", type=int, default=None)
     sp.add_argument("--budget", type=float, default=None, metavar="USD")
+    sp.add_argument(
+        "--mcp-config",
+        metavar="PATH_OR_JSON",
+        help="per-lane MCP servers: a path to a JSON file or inline JSON "
+        "({\"mcpServers\": {...}} or a bare server map)",
+    )
 
     pp = sub.add_parser("prompt", help="enqueue a turn")
     pp.add_argument("name")
@@ -94,6 +121,11 @@ def main(argv: list[str] | None = None) -> None:
 
     kp = sub.add_parser("kill", help="terminate a worker (registry + logs retained)")
     kp.add_argument("name")
+
+    rp = sub.add_parser(
+        "remove", help="purge a killed/retired worker + its history (frees the name)"
+    )
+    rp.add_argument("name")
 
     ep = sub.add_parser("events", help="a worker's recorded events")
     ep.add_argument("name")
@@ -129,6 +161,8 @@ def main(argv: list[str] | None = None) -> None:
             args["guard_hooks"] = hooks
         if ns.model:
             args["model"] = ns.model
+        if ns.mcp_config:
+            args["mcp_servers"] = _load_mcp_config(ns.mcp_config)
         limits = _parse_limits(ns)
         if limits:
             args["limits"] = limits
@@ -145,6 +179,8 @@ def main(argv: list[str] | None = None) -> None:
         rc = asyncio.run(_call("cycle", {"name": ns.name}))
     elif ns.cmd == "kill":
         rc = asyncio.run(_call("kill", {"name": ns.name}))
+    elif ns.cmd == "remove":
+        rc = asyncio.run(_call("remove", {"name": ns.name}))
     elif ns.cmd == "events":
         rc = asyncio.run(_call("events", {"name": ns.name, "limit": ns.limit}))
     elif ns.cmd == "attach":

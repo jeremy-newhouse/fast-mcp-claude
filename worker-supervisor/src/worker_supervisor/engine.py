@@ -41,6 +41,15 @@ from .registry import Registry, WORKER_GONE
 # usage was seen. query() exposes no direct context-fill signal.
 CONTEXT_WINDOW_TOKENS = 200_000
 
+# Lifecycle (handover/restore/retire) turns must run even in a budget-exhausted
+# epoch, or a lane that hit its cap can never cycle or retire out — the cycle's own
+# handover-write turn is enqueued into the exhausted epoch and would be refused,
+# so the epoch never rolls and the lane wedges forever (ECA-99 self-cycle deadlock).
+# They are exempted from the pre-spawn budget gate and given a reserved SDK budget
+# floor so a real `/handover write` isn't clamped to the $0.01 no-op floor.
+LIFECYCLE_KINDS = frozenset({"cycle_handover", "restore", "retire_handover"})
+LIFECYCLE_BUDGET_RESERVE_USD = 5.0
+
 # Lifecycle prompts embed the ABSOLUTE handover dir: a weak model given a bare
 # ".claude/handovers/" resolved it against $HOME, missed the repo's handover,
 # and restored as a fresh start (proven live on haiku).
@@ -255,6 +264,23 @@ class Engine:
         self._events.emit(name, "worker_killed")
         self._kick(name)
 
+    async def remove(self, name: str) -> None:
+        """Purge a terminal (killed/retired) worker and its history, freeing the
+        PRIMARY-KEY name for a fresh spawn (ECA-99: `kill` retains the row, so a
+        same-name respawn hits the duplicate guard). Refuses to purge a live worker
+        — kill it first; its loop must have exited before the row is deleted."""
+        worker = await self._reg.get_worker(name)
+        if worker is None:
+            raise ValueError(f"no such worker: {name}")
+        if worker["status"] not in WORKER_GONE:
+            raise ValueError(
+                f"worker {name!r} is {worker['status']}; kill it before remove"
+            )
+        await self._reg.delete_worker(name)
+        for bookkeeping in (self._runners, self._kicks, self._current):
+            bookkeeping.pop(name, None)
+        self._events.emit(name, "worker_removed")
+
     async def maybe_retire_idle(self) -> list[str]:
         """Idle-retirement sweep (Amendment A8): enqueue a final handover-write
         turn for workers idle past the timeout; retirement completes in _after_turn."""
@@ -342,9 +368,13 @@ class Engine:
         epoch = await self._reg.current_epoch(name)
         assert epoch is not None
 
-        # Budget gate, pre-spawn (AC-WS-5): a breached epoch refuses new turns.
+        # Budget gate, pre-spawn (AC-WS-5): a breached epoch refuses new turns —
+        # EXCEPT lifecycle turns (ECA-99), which must run so a capped lane can
+        # cycle/retire out instead of wedging (see LIFECYCLE_KINDS).
+        is_lifecycle = turn["kind"] in LIFECYCLE_KINDS
+        budget_floor = LIFECYCLE_BUDGET_RESERVE_USD if is_lifecycle else 0.01
         remaining_budget = limits.max_budget_usd_per_epoch - (epoch["cost_usd"] or 0.0)
-        if remaining_budget <= 0:
+        if remaining_budget <= 0 and not is_lifecycle:
             await self._reg.finish_turn(
                 turn_id, "budget_refused",
                 error=f"epoch budget exhausted (cap {limits.max_budget_usd_per_epoch} USD)",
@@ -365,9 +395,10 @@ class Engine:
             "tools": policy.base_tools(),
             "allowed_tools": policy.allowed_tools,
             "max_turns": limits.max_turns,
-            "max_budget_usd": round(remaining_budget, 4),
+            "max_budget_usd": max(budget_floor, round(remaining_budget, 4)),
             "model": policy.model,
             "allow_env": policy.allow_env,
+            "mcp_servers": sorted(policy.mcp_servers.keys()),
             "wall_clock_s": limits.wall_clock_s,
         }
 
@@ -398,7 +429,7 @@ class Engine:
                 # would bypass can_use_tool and the tool errors headless.
                 allowed_tools=[],
                 max_turns=limits.max_turns,
-                max_budget_usd=max(0.01, round(remaining_budget, 4)),
+                max_budget_usd=max(budget_floor, round(remaining_budget, 4)),
                 model=policy.model,
                 # AC#2 (ECA-72): retain the default Claude Code system prompt and
                 # append live per-turn limits so the agent can self-pace without
@@ -413,6 +444,13 @@ class Engine:
                     policy.allow_env,
                     mcp_tool_timeout_ms=(self._cfg.question_timeout_s + 300) * 1000,
                 ),
+                # Per-lane MCP grant (ECA-100): the supervisor hands the worker
+                # EXACTLY the servers in its policy — strict mode when any are
+                # granted so an ambient repo .mcp.json can't widen the surface;
+                # off (default discovery, which finds nothing at the workspace
+                # root) when the lane has no MCP grant, preserving prior behavior.
+                mcp_servers=policy.mcp_servers,
+                strict_mcp_config=bool(policy.mcp_servers),
                 can_use_tool=gate,
                 # AskUserQuestion never reaches can_use_tool (UI tool) — the
                 # bridge intercepts it as a PreToolUse hook. The matcher timeout

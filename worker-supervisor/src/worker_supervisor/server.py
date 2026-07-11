@@ -120,6 +120,7 @@ class ControlServer:
                 guard_hooks=args.get("guard_hooks", {}),
                 model=args.get("model"),
                 limits=args.get("limits", {}),
+                mcp_servers=args.get("mcp_servers", {}),
             )
             worker = await self._engine.spawn(args["name"], args["repo"], policy)
             return {"worker": worker}
@@ -142,6 +143,9 @@ class ControlServer:
         if verb == "kill":
             await self._engine.kill(args["name"])
             return {"killed": args["name"]}
+        if verb == "remove":
+            await self._engine.remove(args["name"])
+            return {"removed": args["name"]}
         if verb == "events":
             return {"events": self._events.read(args["name"], limit=args.get("limit", 100))}
         if verb == "history":

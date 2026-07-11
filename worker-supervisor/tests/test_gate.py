@@ -119,3 +119,36 @@ def test_base_tools_always_include_escalation_and_skills():
     base = policy.base_tools()
     assert "AskUserQuestion" in base and "Skill" in base
     assert "Bash" in base and "Read" in base
+
+
+def test_mcp_name_wildcard_grants_whole_server(events, repo):
+    """ECA-100: 'mcp__jira__*' grants every tool from that server (name-prefix),
+    but not other servers or off-ceiling tools."""
+    policy = WorkerPolicy(allowed_tools=["Read", "mcp__jira__*"])
+    assert policy.ceiling_allows("mcp__jira__search", {})
+    assert policy.ceiling_allows("mcp__jira__create_issue", {})
+    assert policy.ceiling_allows("Read", {})
+    assert not policy.ceiling_allows("mcp__langfuse__trace", {})  # a different server
+    assert not policy.ceiling_allows("WebSearch", {})
+
+
+def test_base_tools_skips_mcp_specs():
+    """MCP tool existence comes from mcp_servers, not the built-in --tools floor:
+    a literal 'mcp__server__*' must never leak into base_tools()."""
+    policy = WorkerPolicy(allowed_tools=["Read", "mcp__jira__*", "Bash"])
+    base = policy.base_tools()
+    assert "Read" in base and "Bash" in base
+    assert "Skill" in base and "AskUserQuestion" in base
+    assert not any(t.startswith("mcp__") for t in base)
+
+
+def test_policy_mcp_servers_round_trip():
+    """The per-lane MCP grant survives the workers.policy JSON round-trip."""
+    servers = {
+        "jira": {"type": "stdio", "command": "npx", "args": ["-y", "mcp-remote", "u"]},
+        "langfuse": {"type": "http", "url": "https://lf/api/public/mcp"},
+    }
+    p = WorkerPolicy(allowed_tools=["Read", "mcp__jira__*"], mcp_servers=servers)
+    assert WorkerPolicy.from_json(p.to_json()).mcp_servers == servers
+    # Default (no grant) round-trips to empty, never None.
+    assert WorkerPolicy.from_json(WorkerPolicy().to_json()).mcp_servers == {}

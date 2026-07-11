@@ -181,6 +181,44 @@ async def test_epoch_budget_refuses_next_turn(make_engine, registry, repo):
     assert "budget exhausted" in turn2["error"]
 
 
+async def test_lifecycle_turn_runs_despite_exhausted_budget(make_engine, registry, repo):
+    """ECA-99: an exhausted epoch must NOT refuse a lifecycle (cycle_handover) turn —
+    otherwise the lane can never cycle out (the handover-write lives in the exhausted
+    epoch). The cycle runs, rolls the epoch, and its SDK budget floors to the lifecycle
+    reserve instead of the $0.01 no-op floor a normal over-budget turn would get."""
+    engine, calls = make_engine([[r("s1", cost=2.0)], [r("s2")], [r("s3")]])  # cap is 1.0
+    await engine.spawn("w1", str(repo))
+    t1 = await engine.prompt("w1", "expensive")
+    await terminal_turn(registry, t1)  # epoch now exhausted (2.0 > 1.0 cap)
+    await engine.cycle("w1")
+
+    async def _cycled():
+        epoch = await registry.current_epoch("w1")
+        return epoch if epoch["seq"] == 2 else None
+
+    await wait_until(_cycled)  # hangs (timeout) if the cycle_handover was budget_refused
+
+    cycle_turns = [
+        t for t in await registry.history("w1", limit=10) if t["kind"] == "cycle_handover"
+    ]
+    assert cycle_turns and cycle_turns[0]["state"] == "done"
+    assert calls[1].max_budget_usd == pytest.approx(5.0)  # lifecycle reserve, not 0.01
+
+
+async def test_remove_requires_terminal_then_frees_name(make_engine, registry, repo):
+    """ECA-99: engine.remove refuses a live worker; after kill it purges the row so the
+    same name re-spawns (kill alone keeps the PK row and blocks respawn)."""
+    engine, _ = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo))
+    with pytest.raises(ValueError, match="kill it before remove"):
+        await engine.remove("w1")  # idle worker is live — refused
+    await engine.kill("w1")
+    await engine.remove("w1")
+    assert await registry.get_worker("w1") is None
+    again = await engine.spawn("w1", str(repo))  # name freed
+    assert again["name"] == "w1" and again["status"] == "idle"
+
+
 async def test_manual_cycle_rolls_epoch_restores_and_continues(make_engine, registry, repo, events):
     # ECA-84: the restore turn only re-grounds; the supervisor then auto-enqueues one
     # continuation work-turn (kind='prompt') so autonomous work proceeds under a fresh

@@ -22,9 +22,14 @@
 #           gen-evolv-ultra-mcp-config.py; 0600; creds in each server's own headers, worker
 #           env stays scrubbed — envbuild A3).
 #
-# DEFERRED (see ECA-100): fast-mcp-claude-channel is a per-live-session stdio sidecar, not a
-# standalone server a supervisor lane can attach to; teams (:8326) direct-send is omitted on
-# purpose — lanes report to ultra0 (the Teams/channel bridge) via the supervisor.
+# DEFERRED (see ECA-100): playwright (disabled per operator 2026-07-11 — flaky npx stdio and
+# unused by evolv-ultra skills; browser-test is Bash/CLI-driven, chromium installed on mbpm2);
+# fast-mcp-claude-channel is a per-live-session stdio sidecar, not a standalone server a
+# supervisor lane can attach to; teams (:8326) direct-send is omitted on purpose — lanes report
+# to ultra0 (the Teams/channel bridge) via the supervisor.
+#
+# greptile uses the operator API key at ~/.worker-supervisor/secrets/greptile.token (0600),
+# NOT the built-in greptile plugin (its OAuth expired).
 #
 # bash 3.2 (macOS default) — NO associative arrays (ECA-97). case + indexed args only.
 set -euo pipefail
@@ -34,7 +39,7 @@ WORKERS="$HOME/repos/fast-mcp-claude/worker-supervisor/.venv/bin/workers"
 WORKSPACES="$HOME/worker-repos"
 MCP_CONFIG="$HOME/.worker-supervisor/mcp-configs/evolv-ultra.json"
 BUDGET=1000000
-TOOLS="Read,Write,Edit,Glob,Grep,Bash,Skill,mcp__jira__*,mcp__confluence__*,mcp__langfuse__*,mcp__greptile__*,mcp__context7__*,mcp__playwright__*"
+TOOLS="Read,Write,Edit,Glob,Grep,Bash,Skill,mcp__jira__*,mcp__confluence__*,mcp__langfuse__*,mcp__greptile__*,mcp__context7__*"
 
 ALL_LANES="ultra1 ultra2 ultra3 ultra4 ultra5 ultra6"
 LANES="${*:-$ALL_LANES}"

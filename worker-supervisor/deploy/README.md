@@ -11,8 +11,9 @@ This is deployment config, not supervisor code — it lives here only because mb
 | Lanes | ultra1–ultra6 |
 | Models | ultra1–4 = `claude-sonnet-5`, ultra5 = `claude-opus-4-8`, ultra6 = `claude-fable-5` |
 | Budget | uncapped (`--budget 1000000`; daemon `SUPERVISOR_MAX_BUDGET_USD_PER_EPOCH` also high) — `context_pct` is the only binding cycle constraint (subscription billing; ECA-99 #5) |
+| Limits | `--max-turns 150 --wall-clock 3600` (pr-review ran 70 SDK turns / ~10 min live; these are now the runaway backstops since budget is uncapped) |
 | cwd | `~/worker-repos/<lane>/evolv-ultra` (repo root → project `/pr-review` skill loads; be/fe siblings at `../`) |
-| Tools | `Read,Write,Edit,Glob,Grep,Bash,Skill` + MCP `jira, confluence, langfuse, greptile, context7` |
+| Tools | `Read,Write,Edit,Glob,Grep,Bash,Skill,Task` + MCP `jira, confluence, langfuse, greptile, context7` (`Task` = pr-review's subagent fan-out) |
 | MCP creds | materialised at runtime into `~/.worker-supervisor/mcp-configs/evolv-ultra.json` (0600, **not committed**); each server's creds in its own headers block — worker process env stays scrubbed (envbuild A3) |
 
 ## Run
@@ -33,7 +34,9 @@ and copying `evolv-ultra-be/.env` from an existing lane before running the scrip
 ## Prerequisites (one-time)
 
 - Deployed supervisor code with the ECA-100/99 changes (per-lane `mcp_servers`, `remove`
-  verb, lifecycle-budget exemption) — `git pull` + `pm2 restart worker-supervisor`.
+  verb, lifecycle-budget exemption) **and the envbuild PATH augmentation** (worker PATH
+  prepends `/usr/local/bin`, `/opt/homebrew/bin` so `docker`/brew tools resolve) —
+  `git pull` + `pm2 restart worker-supervisor` (the restart is what applies the PATH fix).
 - `SUPERVISOR_MAX_BUDGET_USD_PER_EPOCH` set high in `worker-supervisor/.env`.
 - `MCP_API_KEY` in `~/repos/fast-mcp-claude/.env` (jira/confluence localhost bearer).
 - `langfuse` server def in a `~/.claude.json` project scope (Basic pk/sk auth; the AWS-dev

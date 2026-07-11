@@ -17,7 +17,9 @@
 #           discovers the on-disk /pr-review skill; be/fe are siblings at ../ per the skill's
 #           docker-compose bind-mount model. The old workspace-root cwd is why lanes could not
 #           invoke /pr-review and improvised via Bash.)
-#   tools:  Read,Write,Edit,Glob,Grep,Bash,Skill + MCP name-wildcards for the granted servers
+#   tools:  Read,Write,Edit,Glob,Grep,Bash,Skill,Task + MCP name-wildcards for the granted
+#           servers (Task = pr-review's subagent fan-out: backend-reviewer/security/simplifier)
+#   limits: --max-turns 150 --wall-clock 3600 (pr-review ran 70 turns/~10min live)
 #   mcp:    ~/.worker-supervisor/mcp-configs/evolv-ultra.json (generated fresh each run by
 #           gen-evolv-ultra-mcp-config.py; 0600; creds in each server's own headers, worker
 #           env stays scrubbed — envbuild A3).
@@ -39,7 +41,12 @@ WORKERS="$HOME/repos/fast-mcp-claude/worker-supervisor/.venv/bin/workers"
 WORKSPACES="$HOME/worker-repos"
 MCP_CONFIG="$HOME/.worker-supervisor/mcp-configs/evolv-ultra.json"
 BUDGET=1000000
-TOOLS="Read,Write,Edit,Glob,Grep,Bash,Skill,mcp__jira__*,mcp__confluence__*,mcp__langfuse__*,mcp__greptile__*,mcp__context7__*"
+# pr-review is the primary workload: it fans out to subagents (Task) and ran 70 SDK
+# turns / ~10min live, so lift max-turns above the 50 default and give a 1h wall-clock.
+# Budget is uncapped (ECA-99), so max-turns + wall-clock + context_pct are the backstops.
+MAX_TURNS=150
+WALL_CLOCK=3600
+TOOLS="Read,Write,Edit,Glob,Grep,Bash,Skill,Task,mcp__jira__*,mcp__confluence__*,mcp__langfuse__*,mcp__greptile__*,mcp__context7__*"
 
 ALL_LANES="ultra1 ultra2 ultra3 ultra4 ultra5 ultra6"
 LANES="${*:-$ALL_LANES}"
@@ -79,6 +86,8 @@ for lane in $LANES; do
   "$WORKERS" spawn "$lane" "$cwd" \
     --model "$model" \
     --budget "$BUDGET" \
+    --max-turns "$MAX_TURNS" \
+    --wall-clock "$WALL_CLOCK" \
     --tools "$TOOLS" \
     --mcp-config "$MCP_CONFIG"
 done

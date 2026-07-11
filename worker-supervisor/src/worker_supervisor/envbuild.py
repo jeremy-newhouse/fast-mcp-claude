@@ -93,4 +93,14 @@ def build_worker_env(
     # G6: must exceed the longest in-tool block or the CLI kills the call —
     # AskUserQuestion parks inside can_use_tool for up to the question timeout.
     env["MCP_TOOL_TIMEOUT"] = str(mcp_tool_timeout_ms)
+    # The pm2-launched daemon's PATH can omit the standard macOS tool dirs, so a
+    # worker's `docker`/homebrew binaries aren't resolvable (proven live: pr-review
+    # hit `docker: command not found`). Prepend the common locations to whatever
+    # PATH the (post-scrub) parent carries so real tooling resolves without a
+    # per-command PATH= workaround. No secret — PATH is already in MINIMAL_BASE.
+    base_path = snapshot.get("PATH", "")
+    missing = [d for d in ("/usr/local/bin", "/opt/homebrew/bin")
+               if d not in base_path.split(os.pathsep)]
+    if missing:
+        env["PATH"] = os.pathsep.join([*missing, base_path]) if base_path else os.pathsep.join(missing)
     return env

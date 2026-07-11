@@ -25,9 +25,26 @@ SNAPSHOT = {
 }
 
 
-def test_built_env_contains_only_allowed_names_plus_timeout():
+def test_built_env_contains_only_allowed_names_plus_timeout_and_path():
     env = build_worker_env(SNAPSHOT, ["MY_TOOL_FLAG"], mcp_tool_timeout_ms=1000)
-    assert env == {"MY_TOOL_FLAG": "1", "MCP_TOOL_TIMEOUT": "1000"}
+    # SNAPSHOT PATH is "/usr/bin", so the standard macOS dirs are prepended.
+    assert env == {
+        "MY_TOOL_FLAG": "1",
+        "MCP_TOOL_TIMEOUT": "1000",
+        "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin",
+    }
+
+
+def test_path_not_augmented_when_dirs_already_present():
+    snap = {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin"}
+    env = build_worker_env(snap, [], mcp_tool_timeout_ms=1000)
+    assert "PATH" not in env  # already covered -> no override emitted
+
+
+def test_path_augmented_preserves_existing_when_dir_missing():
+    snap = {"PATH": "/opt/homebrew/bin:/usr/bin"}  # only /usr/local/bin missing
+    env = build_worker_env(snap, [], mcp_tool_timeout_ms=1000)
+    assert env["PATH"] == "/usr/local/bin:/opt/homebrew/bin:/usr/bin"
 
 
 def test_credential_vars_never_reach_a_worker_even_when_present():

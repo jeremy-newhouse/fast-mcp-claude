@@ -264,7 +264,14 @@ async def test_bridge_announce_failure_escapes_to_outer_reconnect(monkeypatch):
     # for this to finish inside the window). Pre-fix, the swallow means exactly ONE client is
     # ever built no matter how long this runs; this asserts on that count, not on a stall/hang —
     # the test still completes promptly either way via the timeout.
+    #
+    # Window sizing: reaching 2 client rebuilds only needs the FIRST backoff sleep (starts at
+    # 1.0s) to complete. An independent review measured ~1.73s real wall time against an earlier
+    # 1.5s window — reliable in that testing, but with limited margin. 3.5s leaves generous
+    # headroom for scheduler jitter on a slow/contended CI runner without meaningfully slowing
+    # the suite — exactly the kind of marginal timing assumption a fix for a reconnect/timing bug
+    # shouldn't itself carry.
     with pytest.raises(TimeoutError):
-        await asyncio.wait_for(session_mod._bridge(cfg), timeout=1.5)
+        await asyncio.wait_for(session_mod._bridge(cfg), timeout=3.5)
 
     assert len(clients_built) >= 2

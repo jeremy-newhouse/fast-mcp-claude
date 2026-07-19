@@ -5,6 +5,7 @@ from the hook-written status file, the inbox watcher (filters to THIS identity, 
 once per new message, NEVER claims), badge writing, and the parent-pid lifetime watch.
 """
 
+import asyncio
 import json
 
 import pytest
@@ -214,3 +215,56 @@ def test_parent_dead_logic(monkeypatch):
     monkeypatch.setattr(session_mod.os, "getppid", lambda: 999)
     assert session_mod._parent_dead(999) is False  # still our parent
     assert session_mod._parent_dead(12345) is True  # reparented -> session gone
+
+
+# --------------------------------------------------------- ECA-61: reconnect after a dead
+# connection (a mesh-server restart). The bug: announce()/list_messages() failures were
+# swallowed inside the INNER loop forever, so _bridge's outer reconnect handler (which rebuilds
+# the client) was unreachable.
+
+
+async def test_check_inbox_failure_propagates_not_swallowed():
+    # _check_inbox used to swallow call_tool failures and return silently, which meant _bridge's
+    # caller never saw them either. It must now propagate so the caller's reconnect logic fires.
+    class _RaisingClient:
+        async def call_tool(self, tool, args):
+            raise ConnectionError("dead mesh")
+
+    with pytest.raises(ConnectionError, match="dead mesh"):
+        await session_mod._check_inbox(
+            _RaisingClient(), _cfg(identity="mini2.demo"), session_mod._Watch()
+        )
+
+
+async def test_bridge_announce_failure_escapes_to_outer_reconnect(monkeypatch):
+    cfg = _cfg(identity="mini2.demo", poll=0.001, heartbeat=0.001)
+    clients_built = []
+
+    class _FlakyBridgeClient:
+        def __init__(self):
+            clients_built.append(self)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def call_tool(self, name, args):
+            from types import SimpleNamespace
+
+            if name == "announce":
+                raise ConnectionError("dead mesh")
+            return SimpleNamespace(data={"success": True, "messages": []}, content=[])
+
+    monkeypatch.setattr("fastmcp.Client", lambda *a, **k: _FlakyBridgeClient())
+
+    # _bridge never exits on its own — bound it with a REAL wall-clock timeout (asyncio.sleep is
+    # NOT faked here, so the loop's own outer backoff sleep is what the fix must actually reach
+    # for this to finish inside the window). Pre-fix, the swallow means exactly ONE client is
+    # ever built no matter how long this runs; this asserts on that count, not on a stall/hang —
+    # the test still completes promptly either way via the timeout.
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(session_mod._bridge(cfg), timeout=1.5)
+
+    assert len(clients_built) >= 2

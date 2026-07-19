@@ -1001,3 +1001,113 @@ def test_await_consumption_fast_signal_inert_without_status_file():
         return await channel_mod._await_consumption(cfg, rt, baseline_ts=None)
 
     assert asyncio.run(run()) == channel_mod._UNKNOWN
+
+
+# ------------------------------------------------- ECA-61: presence-loop reconnect after a dead
+# connection (a mesh-server restart). The bug: announce() failures were swallowed inside the
+# INNER loop forever, so the outer reconnect handler (_reconnect_sleep, which rebuilds the
+# client) was unreachable. These tests exercise _presence_loop directly (not through a watcher
+# wrapper — there isn't one in this file; the loop is launched standalone by _serve).
+
+
+class _FlakyAnnounceClient:
+    """Raises on every announce() call — simulates a dead connection post-mesh-restart."""
+
+    def __init__(self, fail_exc):
+        self._fail_exc = fail_exc
+        self.calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def call_tool(self, name, args):
+        assert name == "announce"
+        self.calls += 1
+        raise self._fail_exc
+
+
+def test_presence_loop_announce_failure_escapes_to_reconnect(monkeypatch):
+    cfg = _cfg(enabled=True, heartbeat=0.001)
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+
+    clients_built = []
+
+    def fake_make_client(cfg, timeout=None):
+        c = _FlakyAnnounceClient(ConnectionError("dead mesh"))
+        clients_built.append(c)
+        return c
+
+    monkeypatch.setattr(channel_mod, "_make_client", fake_make_client)
+
+    reconnects = []
+
+    async def fake_reconnect_sleep(what, exc, backoff):
+        reconnects.append((what, str(exc)))
+        if len(reconnects) >= 2:
+            raise asyncio.CancelledError
+        return backoff
+
+    monkeypatch.setattr(channel_mod, "_reconnect_sleep", fake_reconnect_sleep)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(asyncio.wait_for(channel_mod._presence_loop(cfg), timeout=5.0))
+    finally:
+        channel_mod._RT = None
+
+    # THE FIX: announce()'s exception escaped the inner loop and reached _reconnect_sleep — the
+    # pre-fix swallow-and-continue shape meant this list would stay empty and the test would hang
+    # until the 5s asyncio.wait_for timeout (a TimeoutError, not the expected CancelledError).
+    assert len(reconnects) == 2
+    assert all("dead mesh" in msg for _, msg in reconnects)
+    assert reconnects[0][0] == "presence"
+    # A fresh client per reconnect attempt — proof the dead one was actually dropped, not reused.
+    assert len(clients_built) == 2
+
+
+def test_presence_loop_identity_live_elsewhere_does_not_reconnect(monkeypatch):
+    # A WELL-FORMED rejection (a working connection, just a refused identity) must NOT be treated
+    # like a dead connection — this is the one response shape the fix deliberately keeps handled
+    # in place, without reconnecting.
+    cfg = _cfg(enabled=True, heartbeat=0.001)
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+
+    class _RefusingClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def call_tool(self, name, args):
+            assert name == "announce"
+            self.calls += 1
+            if self.calls >= 3:
+                raise asyncio.CancelledError  # end the test after a few heartbeats
+            return _Res({"success": False, "error": {"code": "IDENTITY_LIVE_ELSEWHERE"}})
+
+    client = _RefusingClient()
+    monkeypatch.setattr(channel_mod, "_make_client", lambda cfg, timeout=None: client)
+
+    reconnect_calls = []
+
+    async def fake_reconnect_sleep(what, exc, backoff):
+        reconnect_calls.append(what)
+        return backoff
+
+    monkeypatch.setattr(channel_mod, "_reconnect_sleep", fake_reconnect_sleep)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(asyncio.wait_for(channel_mod._presence_loop(cfg), timeout=5.0))
+    finally:
+        channel_mod._RT = None
+
+    assert reconnect_calls == []  # never reconnected — the refusal was handled in place
+    assert client.calls == 3

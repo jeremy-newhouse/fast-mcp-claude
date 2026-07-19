@@ -537,7 +537,16 @@ async def _presence_loop(cfg: ChannelConfig) -> None:
     so the inbox loop stops claiming and this session never fights the real owner for messages.
     When Layer C has degraded the session, presence advertises channel=false/status=degraded so
     the brain stops pushing; the loop re-arms when the status file shows the consumer live again.
-    """
+
+    ECA-61: `call_tool("announce", ...)` is DELIBERATELY not wrapped in its own try/except — a
+    transport/connection failure must escape to the outer handler below so the dead client gets
+    rebuilt (`_reconnect_sleep`, which already has the auth-lockout-aware backoff). The prior
+    swallow-and-continue shape here meant a mesh-server restart was undetectable: every heartbeat
+    kept calling `announce` on the same dead client forever, so presence never recovered without
+    relaunching the session. Only a WELL-FORMED-but-rejected response (still a real `data` dict,
+    e.g. IDENTITY_LIVE_ELSEWHERE) is handled without reconnecting — that's a working connection
+    telling us something else, not a broken one. Reference: worker-supervisor's
+    `Presence.run()`/`_announce_all` (the exact model this loop now mirrors)."""
     assert _RT is not None
     rt = _RT
     backoff = 1.0
@@ -553,38 +562,35 @@ async def _presence_loop(cfg: ChannelConfig) -> None:
                         meta["channel"] = False
                         meta["status"] = "degraded"
                         summary = f"{summary} [DEGRADED: channel consumer not live]"[:280]
-                    try:
-                        res = await c.call_tool(
-                            "announce",
-                            {"identity": cfg.identity, "summary": summary, "metadata": meta},
-                        )
-                        data = _result_data(res)
-                        if data.get("success"):
-                            rt.announce_confirmed.set()
-                            rt.announce_refused_logged = False
-                        elif _error_code(data) == "IDENTITY_LIVE_ELSEWHERE":
-                            # A different live process holds this identity (typically a claude.ai
-                            # background fork reusing CRM_IDENTITY). Disarm claiming so we never
-                            # race it for messages, and log LOUDLY once so the operator can kill
-                            # the offender. First-announcer-wins (ADR-0029): we do NOT arbitrate.
-                            rt.announce_confirmed.clear()
-                            if not rt.announce_refused_logged:
-                                _log(
-                                    f"announce REFUSED for identity={cfg.identity!r}: another "
-                                    f"live process already holds it (IDENTITY_LIVE_ELSEWHERE). "
-                                    f"This session will NOT claim messages (claim loop disarmed) "
-                                    f"to avoid misroute/black-hole. Kill the duplicate process "
-                                    f"if this session should be the owner. Detail: {data}"
-                                )
-                                rt.announce_refused_logged = True
-                        elif not rt.announce_refused_logged:
+                    res = await c.call_tool(
+                        "announce",
+                        {"identity": cfg.identity, "summary": summary, "metadata": meta},
+                    )
+                    data = _result_data(res)
+                    if data.get("success"):
+                        rt.announce_confirmed.set()
+                        rt.announce_refused_logged = False
+                    elif _error_code(data) == "IDENTITY_LIVE_ELSEWHERE":
+                        # A different live process holds this identity (typically a claude.ai
+                        # background fork reusing CRM_IDENTITY). Disarm claiming so we never
+                        # race it for messages, and log LOUDLY once so the operator can kill
+                        # the offender. First-announcer-wins (ADR-0029): we do NOT arbitrate.
+                        rt.announce_confirmed.clear()
+                        if not rt.announce_refused_logged:
                             _log(
-                                f"announce rejected for identity={cfg.identity!r} "
-                                f"(this session is INVISIBLE to the brain): {data}"
+                                f"announce REFUSED for identity={cfg.identity!r}: another "
+                                f"live process already holds it (IDENTITY_LIVE_ELSEWHERE). "
+                                f"This session will NOT claim messages (claim loop disarmed) "
+                                f"to avoid misroute/black-hole. Kill the duplicate process "
+                                f"if this session should be the owner. Detail: {data}"
                             )
                             rt.announce_refused_logged = True
-                    except Exception as e:
-                        _log(f"announce failed (continuing): {e}")
+                    elif not rt.announce_refused_logged:
+                        _log(
+                            f"announce rejected for identity={cfg.identity!r} "
+                            f"(this session is INVISIBLE to the brain): {data}"
+                        )
+                        rt.announce_refused_logged = True
                     await asyncio.sleep(cfg.heartbeat)
         except asyncio.CancelledError:
             raise

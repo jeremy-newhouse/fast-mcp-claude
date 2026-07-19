@@ -252,7 +252,16 @@ class _Watch:
 
 
 async def _bridge(cfg: SessionConfig) -> None:
-    """Single connection: heartbeat presence + watch inbox -> notify (never claim)."""
+    """Single connection: heartbeat presence + watch inbox -> notify (never claim).
+
+    ECA-61: the announce call_tool below, and `_check_inbox`'s call_tool, are DELIBERATELY not
+    wrapped in a swallowing try/except — a transport/connection failure must escape this inner
+    loop to the outer reconnect handler so the dead client gets rebuilt. The prior shape (an
+    inner try/except around announce, and a separate one inside `_check_inbox` that swallowed
+    and returned) meant neither failure mode could ever reach the outer handler, so this sidecar
+    never re-announced after a mesh-server restart. Only a WELL-FORMED-but-rejected announce
+    response (still a real `data` dict) stays handled without reconnecting, same as channel.py's
+    `_presence_loop` (the two files share this exact anti-pattern and fix)."""
     from fastmcp import Client
     from fastmcp.client.transports import StreamableHttpTransport
 
@@ -297,22 +306,19 @@ async def _bridge(cfg: SessionConfig) -> None:
                                 _log("up-reporting hooks never updated status; presence-"
                                      "unverified (check the --settings hook schema for this CC)")
                                 warned["stale"] = True
-                        try:
-                            res = await c.call_tool(
-                                "announce",
-                                {
-                                    "identity": cfg.identity,
-                                    "summary": summary,
-                                    "metadata": meta,
-                                },
-                            )
-                            data = _result_data(res)
-                            if not data.get("success") and not warned["announce"]:
-                                _log(f"announce REJECTED for identity={cfg.identity!r} "
-                                     f"(invalid? this session is INVISIBLE to the brain): {data}")
-                                warned["announce"] = True
-                        except Exception as e:
-                            _log(f"announce failed (continuing): {e}")
+                        res = await c.call_tool(
+                            "announce",
+                            {
+                                "identity": cfg.identity,
+                                "summary": summary,
+                                "metadata": meta,
+                            },
+                        )
+                        data = _result_data(res)
+                        if not data.get("success") and not warned["announce"]:
+                            _log(f"announce REJECTED for identity={cfg.identity!r} "
+                                 f"(invalid? this session is INVISIBLE to the brain): {data}")
+                            warned["announce"] = True
                         last_announce = now
                     await _check_inbox(c, cfg, watch)
                     await asyncio.sleep(cfg.poll)
@@ -331,18 +337,19 @@ async def _bridge(cfg: SessionConfig) -> None:
 
 
 async def _check_inbox(c: Any, cfg: SessionConfig, watch: _Watch) -> None:
-    """List queued messages for THIS identity (no claim) and notify on new arrivals."""
-    try:
-        # Filter server-side by recipient_session (index-backed) so a busy hub (>200 globally
-        # queued) can't push THIS session's messages out of the newest-N window and lose a
-        # notification. The client-side check below stays as belt-and-braces.
-        res = await c.call_tool(
-            "list_messages",
-            {"status": "queued", "limit": 200, "recipient_session": cfg.identity},
-        )
-    except Exception as e:
-        _log(f"list_messages failed (continuing): {e}")
-        return
+    """List queued messages for THIS identity (no claim) and notify on new arrivals.
+
+    ECA-61: `call_tool` failures are NOT swallowed here — they must propagate to `_bridge`'s
+    caller so a dead connection escapes to the outer reconnect handler, same rationale as the
+    announce call in `_bridge` above. A silent `return` on failure meant `_bridge`'s outer
+    handler never even saw this half of the inner loop's failures."""
+    # Filter server-side by recipient_session (index-backed) so a busy hub (>200 globally
+    # queued) can't push THIS session's messages out of the newest-N window and lose a
+    # notification. The client-side check below stays as belt-and-braces.
+    res = await c.call_tool(
+        "list_messages",
+        {"status": "queued", "limit": 200, "recipient_session": cfg.identity},
+    )
     data = _result_data(res)
     if not data.get("success"):
         return

@@ -3,6 +3,7 @@
 import pytest
 
 from fast_mcp_claude.services.store import Store
+from fast_mcp_claude.tools.presence import who
 
 
 @pytest.mark.asyncio
@@ -151,6 +152,55 @@ async def test_announce_stale_token_reclaimed(store: Store):
     peers = await store.list_presence()
     assert peers[0]["summary"] == "new owner"
     assert peers[0]["metadata"]["announce_token"] == "B"
+
+
+@pytest.fixture
+def wired_who(store: Store, monkeypatch):
+    """who() reads the `store`/`settings` names bound in the presence tool module (imported
+    once from ..server at import time), not a per-test instance -- point them at this test's
+    isolated store/settings so who() observes what this test just announced."""
+    monkeypatch.setattr("fast_mcp_claude.tools.presence.store", store)
+    monkeypatch.setattr("fast_mcp_claude.tools.presence.settings", store.settings)
+    return who
+
+
+@pytest.mark.asyncio
+async def test_who_redacts_announce_token(store: Store, wired_who):
+    """FMC-2: who() must never expose a peer's announce_token (or other credential-shaped
+    metadata key) over the wire, even though the row itself still carries it internally."""
+    await store.announce(
+        "eca2", summary="the real TUI", metadata={"announce_token": "A", "branch": "main"}
+    )
+    result = await wired_who()
+    assert result["success"] is True
+    assert len(result["peers"]) == 1
+    peer = result["peers"][0]
+    assert "announce_token" not in peer["metadata"]
+    assert peer["metadata"] == {"branch": "main"}
+    # The underlying store row is untouched -- forget()/announce()'s own guard reads it directly.
+    raw = await store.list_presence()
+    assert raw[0]["metadata"]["announce_token"] == "A"
+
+
+@pytest.mark.asyncio
+async def test_who_redact_guard_still_lets_reannounce_work(store: Store, wired_who):
+    """AC #2: the forget-then-reannounce owner-token guard must keep working after the who()
+    redaction -- it reads the token via its own raw query, never via the redacted tool output."""
+    a = await store.announce("eca2", metadata={"announce_token": "A"})
+    assert a["success"] is True
+
+    refused = await store.announce("eca2", metadata={"announce_token": "B"})
+    assert refused["success"] is False
+    assert refused["error"]["code"] == "IDENTITY_LIVE_ELSEWHERE"
+
+    deleted = await store.forget_presence("eca2", expected_token="A")
+    assert deleted is True
+
+    reannounced = await store.announce("eca2", metadata={"announce_token": "B"})
+    assert reannounced["success"] is True
+
+    result = await wired_who()
+    assert "announce_token" not in result["peers"][0]["metadata"]
 
 
 @pytest.mark.asyncio

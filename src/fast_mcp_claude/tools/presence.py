@@ -18,11 +18,26 @@ from typing import Annotated, Any
 from pydantic import Field
 
 from ..errors import ValidationError, format_error_response
-from ..logging_config import get_logger
+from ..logging_config import SENSITIVE_LOG_FIELDS_EXACT, SENSITIVE_LOG_SUFFIXES, get_logger
 from ..server import mcp, settings, store
 from ..utils.validation import validate_identity
 
 logger = get_logger(__name__)
+
+
+def _redact_peer_metadata(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Strip credential-shaped keys (announce_token, etc.) before who() exposes a
+    peer's metadata over the wire. store.list_presence() itself is left untouched —
+    it's an internal Store API (tests rely on it to verify the ECA-71 owner-token
+    guard end-to-end) and has no other caller besides this tool."""
+    if not isinstance(metadata, dict):
+        return metadata
+    return {
+        k: v
+        for k, v in metadata.items()
+        if k.lower() not in SENSITIVE_LOG_FIELDS_EXACT
+        and not k.lower().endswith(SENSITIVE_LOG_SUFFIXES)
+    }
 
 
 @mcp.tool(
@@ -119,11 +134,14 @@ async def who(
         elif stale_seconds <= 0:
             stale_seconds = None
         peers = await store.list_presence(stale_after=stale_seconds)
+        sanitized_peers = [
+            {**p, "metadata": _redact_peer_metadata(p.get("metadata"))} for p in peers
+        ]
         return {
             "success": True,
             "self": settings.peer_name,
-            "peers": peers,
-            "count": len(peers),
+            "peers": sanitized_peers,
+            "count": len(sanitized_peers),
         }
     except Exception as e:
         return format_error_response(e)

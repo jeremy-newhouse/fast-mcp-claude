@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to .claude/settings.json in the project where you run the WORKER Claude session. The PreToolUse hook relays each tool-permission decision to the remote controller via fast-mcp-claude. NOTE: the channel adapter (see .mcp.json claude-channel) delivers PROMPTS, not permissions — this hook remains the permission-relay path. Claude Code's native channel permission relay (claude/channel/permission) needs inbound custom-notification handling the Python MCP SDK does not expose yet.",
+  "_comment": "Copy to .claude/settings.json in the project where you run the WORKER Claude session. The PreToolUse hook relays each tool-permission decision to the remote controller via fast-mcp-claude. NOTE: the channel adapter (see .mcp.json fast-mcp-claude-channel) delivers PROMPTS, not permissions — this hook remains the permission-relay path. Claude Code's native channel permission relay (claude/channel/permission) needs inbound custom-notification handling the Python MCP SDK does not expose yet.",
   "hooks": {
     "PreToolUse": [
       {

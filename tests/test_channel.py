@@ -11,6 +11,7 @@ The live two-session push path still requires launching a real worker with
 """
 
 import json
+from pathlib import Path
 
 import anyio
 import pytest
@@ -353,6 +354,31 @@ def test_auto_pass_read_only_yes_consequential_no():
     assert channel_mod._is_auto_pass("Read", cfg) is True
     assert channel_mod._is_auto_pass("Bash", cfg) is False
     assert channel_mod._is_auto_pass("Write", cfg) is False
+
+
+# -------------------------------------------------- SERVER_NAME doc/config consistency (FMC-8)
+#
+# Claude Code names MCP tools mcp__<.mcp.json config key>__<tool>, not by the server's
+# self-declared MCP initialize name — so OUR_REPLY_TOOL et al. (built from the hardcoded
+# SERVER_NAME) only match the real tool name when every documented/example config key
+# equals SERVER_NAME. These guard against that drifting apart again.
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_mcp_json_example_channel_key_matches_server_name():
+    config = json.loads((_REPO_ROOT / ".mcp.json.example").read_text())
+    assert channel_mod.SERVER_NAME in config["mcpServers"]
+
+
+def test_readme_dev_channels_flag_matches_server_name():
+    readme = (_REPO_ROOT / "README.md").read_text()
+    assert f"server:{channel_mod.SERVER_NAME}" in readme
+
+
+def test_worker_command_dev_channels_flag_matches_server_name():
+    worker_md = (_REPO_ROOT / ".claude" / "commands" / "worker.md").read_text()
+    assert f"server:{channel_mod.SERVER_NAME}" in worker_md
 
 
 # -------------------------------------------------- _build_presence (subsumes session.py)

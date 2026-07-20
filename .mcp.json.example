@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to .mcp.json and customize. 'claude-local' is THIS machine's HTTP server (worker tools: reply, announce, wait_for_instruction, ...). 'claude-channel' is the stdio push adapter — it stays INERT until you BOTH set CHANNEL_ENABLED=true (env/.env) AND launch Claude with `--dangerously-load-development-channels server:claude-channel`; only then do a remote controller's prompts surface in your live session automatically (no /worker loop, no MCP idle-timeout). Left disabled (the default), a wired claude-channel entry just completes the MCP handshake and never claims inbox messages, so it is safe to leave configured alongside /worker loop mode — but do NOT double-arm one worker (channel adapter AND /worker for the same identity). Add one 'claude-peer-<name>' entry per remote you want to control. alwaysLoad pins our tools so MCP tool-search never defers them out of context.",
+  "_comment": "Copy to .mcp.json and customize. 'claude-local' is THIS machine's HTTP server (worker tools: reply, announce, wait_for_instruction, ...). 'fast-mcp-claude-channel' is the stdio push adapter — it stays INERT until you BOTH set CHANNEL_ENABLED=true (env/.env) AND launch Claude with `--dangerously-load-development-channels server:fast-mcp-claude-channel`; only then do a remote controller's prompts surface in your live session automatically (no /worker loop, no MCP idle-timeout). Left disabled (the default), a wired fast-mcp-claude-channel entry just completes the MCP handshake and never claims inbox messages, so it is safe to leave configured alongside /worker loop mode — but do NOT double-arm one worker (channel adapter AND /worker for the same identity). This key MUST match channel.py's hardcoded SERVER_NAME exactly: Claude Code names MCP tools mcp__<this-key>__<tool>, and the adapter's own reply/send_teams/etc. auto-allow logic matches by the fully-qualified mcp__fast-mcp-claude-channel__* name — a different key here breaks that auto-allow. Add one 'claude-peer-<name>' entry per remote you want to control. alwaysLoad pins our tools so MCP tool-search never defers them out of context.",
   "mcpServers": {
     "claude-local": {
       "type": "http",
@@ -9,7 +9,7 @@
       },
       "alwaysLoad": true
     },
-    "claude-channel": {
+    "fast-mcp-claude-channel": {
       "type": "stdio",
       "command": "fast-mcp-claude-channel",
       "args": ["--identity", "my-machine"]

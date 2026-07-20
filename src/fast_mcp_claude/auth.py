@@ -73,18 +73,21 @@ class ApiKeyVerifier(TokenVerifier):
         self._rate_limiter = AuthRateLimiter()
 
     async def verify_token(self, token: str) -> AccessToken | None:
+        # Compare first so a correct credential always succeeds, even during an
+        # active lockout - the limiter has no per-connection identity to scope
+        # itself to the attacker, so it must never gate the legitimate peer.
+        if hmac.compare_digest(token.encode("utf-8"), self.api_key.encode("utf-8")):
+            await self._rate_limiter.record_success()
+            return AccessToken(
+                token=token,
+                client_id="api-key-client",
+                scopes=[],
+                expires_at=None,
+                claims={},
+            )
+
         if not await self._rate_limiter.check_rate_limit():
             return None
 
-        if not hmac.compare_digest(token, self.api_key):
-            await self._rate_limiter.record_failure()
-            return None
-
-        await self._rate_limiter.record_success()
-        return AccessToken(
-            token=token,
-            client_id="api-key-client",
-            scopes=[],
-            expires_at=None,
-            claims={},
-        )
+        await self._rate_limiter.record_failure()
+        return None

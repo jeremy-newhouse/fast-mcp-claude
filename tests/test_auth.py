@@ -33,6 +33,27 @@ class TestApiKeyVerifier:
     async def test_case_sensitive(self, verifier):
         assert await verifier.verify_token("TEST-SECRET-KEY-123") is None
 
+    @pytest.mark.asyncio
+    async def test_non_ascii_key_returns_none_not_raises(self, verifier):
+        assert await verifier.verify_token("tëst-sëcret-këy-123") is None
+
+    @pytest.mark.asyncio
+    async def test_non_ascii_failure_counts_toward_lockout(self, verifier):
+        for _ in range(5):
+            assert await verifier.verify_token("tëst-wröng") is None
+        # The 5 non-ASCII failures above must have registered with the rate
+        # limiter (not skipped via an uncaught TypeError) to trigger lockout.
+        assert await verifier._rate_limiter.check_rate_limit() is False
+
+    @pytest.mark.asyncio
+    async def test_valid_key_succeeds_during_active_lockout(self, verifier):
+        for _ in range(5):
+            assert await verifier.verify_token("wrong") is None
+        assert await verifier._rate_limiter.check_rate_limit() is False
+        result = await verifier.verify_token("test-secret-key-123")
+        assert result is not None
+        assert result.client_id == "api-key-client"
+
 
 class TestAuthRateLimiter:
     @pytest.mark.asyncio

@@ -82,3 +82,6 @@ tmp/
 # Claude session state — keep .claude/ committed but ignore session data
 .claude/.session-id
 .claude/sessions/
+
+# Backlog-handover campaign — active handovers may mention machine/env names
+.claude/handovers/

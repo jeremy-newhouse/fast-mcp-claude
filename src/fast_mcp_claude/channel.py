@@ -1060,7 +1060,10 @@ async def _handle_send_teams(
     if result.get("ok"):
         if target:
             where = target
-        elif via_fleet_channel:
+        elif via_fleet_channel and inflight is not None:
+            # via_fleet_channel only actually changes the outbound metadata in the in-flight
+            # branch above (it's a no-op when there's no task to omit an origin from) — only
+            # claim this destination when it had a real effect.
             where = "your eCA Fleet channel thread"
         else:
             where = "the originating chat"

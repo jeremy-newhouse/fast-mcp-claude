@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-07-20 20:25'
-updated_date: '2026-07-20 21:51'
+updated_date: '2026-07-20 21:56'
 labels:
   - security
   - auth
@@ -69,6 +69,8 @@ Two bugs in the same file:
 
 <!-- SECTION:NOTES:BEGIN -->
 Fixed both bugs in src/fast_mcp_claude/auth.py::ApiKeyVerifier.verify_token: (1) reordered so the token comparison runs before consulting AuthRateLimiter — a correct api_key now always succeeds and calls record_success(), even during an active lockout, since verify_token receives no per-connection identity (confirmed: fastmcp.server.auth.TokenVerifier.verify_token(token: str) only) so the limiter can't be scoped to just the attacker; (2) encoded both sides to UTF-8 bytes before hmac.compare_digest so a non-ASCII bearer falls through to the normal wrong-token path (None/401) instead of raising TypeError, and now correctly counts toward record_failure(). Added 3 tests to tests/test_auth.py: test_non_ascii_key_returns_none_not_raises, test_non_ascii_failure_counts_toward_lockout, test_valid_key_succeeds_during_active_lockout. Verified: uv run pytest tests/test_auth.py -v -> 10 passed; uv run pytest (full suite) -> 251 passed; uv run ruff check src/ tests/ -> All checks passed.
+
+Independent adversarial review (subagent) of the branch diff: no blocking findings. Confirmed via the real call path (fastmcp's BearerAuthBackend + Starlette Headers, which decode header bytes as latin-1) that token.encode('utf-8') can never raise regardless of client input, and that the original non-ASCII TypeError propagated as an unhandled 500 (Starlette's AuthenticationMiddleware only catches AuthenticationError). One non-blocking observation flagged as a pre-existing design tradeoff, not a defect in this fix and out of scope for the 2 named bugs: because record_success() unconditionally clears _failed_attempts/_lockout_until on the shared process-global limiter, frequent legitimate traffic (heartbeats/long-polls) can inadvertently wipe an attacker's in-progress lockout count before it reaches max_attempts. Worth a follow-up ticket (e.g. let an active lockout decay naturally instead of clearing on every success) but not required to satisfy FMC-3's ACs.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

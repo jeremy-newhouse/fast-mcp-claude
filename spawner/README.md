@@ -53,7 +53,7 @@ for exercising the pipeline before real model credentials are wired up.
 uv venv && uv sync
 uv run spawner                 # long-running; pm2-managed in production
 uv run ruff check .
-uv run pytest                  # unit tests are fake-backed (_FakeJS/_FakeMsg)
+uv run pytest                  # unit tests are fake-backed (FakeMsg/FakeJs/FakeProcessor/...)
 uv run pytest tests/test_integration_nats.py   # live JetStream round-trip; skips without a nats-server binary
 ```
 

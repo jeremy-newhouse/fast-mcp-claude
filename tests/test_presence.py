@@ -204,6 +204,21 @@ async def test_who_redact_guard_still_lets_reannounce_work(store: Store, wired_w
 
 
 @pytest.mark.asyncio
+async def test_who_redacts_nested_token(store: Store, wired_who):
+    """AC #1 says "any peer credential" -- announce()'s metadata is arbitrary structured
+    context, so a token buried in a nested dict must be redacted too, not just top-level."""
+    await store.announce(
+        "eca2",
+        metadata={"announce_token": "A", "auth": {"refresh_token": "B", "scope": "read"}},
+    )
+    result = await wired_who()
+    peer = result["peers"][0]
+    assert "announce_token" not in peer["metadata"]
+    assert "refresh_token" not in peer["metadata"]["auth"]
+    assert peer["metadata"]["auth"] == {"scope": "read"}
+
+
+@pytest.mark.asyncio
 async def test_identity_addressed_message_routing(store: Store):
     """A message addressed to 'bob' lands in bob's mailbox, not alice's; an
     unaddressed (broadcast) message reaches anyone. This is the N-way contract

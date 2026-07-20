@@ -27,13 +27,14 @@ logger = get_logger(__name__)
 
 def _redact_peer_metadata(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
     """Strip credential-shaped keys (announce_token, etc.) before who() exposes a
-    peer's metadata over the wire. store.list_presence() itself is left untouched —
-    it's an internal Store API (tests rely on it to verify the ECA-71 owner-token
-    guard end-to-end) and has no other caller besides this tool."""
+    peer's metadata over the wire, recursing into nested dicts since announce()'s
+    metadata is arbitrary structured context. store.list_presence() itself is left
+    untouched — it's an internal Store API (tests rely on it to verify the ECA-71
+    owner-token guard end-to-end) and has no other caller besides this tool."""
     if not isinstance(metadata, dict):
         return metadata
     return {
-        k: v
+        k: _redact_peer_metadata(v) if isinstance(v, dict) else v
         for k, v in metadata.items()
         if k.lower() not in SENSITIVE_LOG_FIELDS_EXACT
         and not k.lower().endswith(SENSITIVE_LOG_SUFFIXES)

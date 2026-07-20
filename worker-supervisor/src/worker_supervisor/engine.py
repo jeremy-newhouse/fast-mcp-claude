@@ -116,9 +116,11 @@ def retire_prompt(repo: str) -> str:
 def _discipline_append(limits: Limits, cycle_context_pct: int) -> str:
     """Per-turn system-prompt appendix: renders live limits so the agent can self-pace.
 
-    Encodes the three long-op discipline rules from the ECA-60 dogfood campaign:
-    epoch-2 restores grounded at 69-79% context; epoch-3 landed 44-45% under
-    bounded-turn guidance. Never hardcode the numeric limits here.
+    Encodes the three long-op discipline rules from the ECA-60 dogfood campaign
+    (epoch-2 restores grounded at 69-79% context; epoch-3 landed 44-45% under
+    bounded-turn guidance) plus a command-invocation rule from ECA-6 (decorated
+    allowlisted commands were tripping avoidable launcher approval prompts).
+    Never hardcode the numeric limits here.
     """
     return (
         f"TURN DISCIPLINE (enforced by worker-supervisor): "
@@ -129,7 +131,12 @@ def _discipline_append(limits: Limits, cycle_context_pct: int) -> str:
         f"(2) Commit completed work BEFORE starting any long-running operation. "
         f"(3) Run long shell work (docker builds, big installs) backgrounded with "
         f"nohup + a log file; poll with generous-but-bounded timeouts — "
-        f"never let one foreground command silently burn the whole wall-clock."
+        f"never let one foreground command silently burn the whole wall-clock. "
+        f'(4) Run allowlisted commands (e.g. "uv run pytest") PLAINLY — do not chain or '
+        f'decorate them with extra shell segments (`; echo "EXIT CODE: $?"`, `&&`, etc). '
+        f"Your tool ceiling is matched segment-wise, so an appended segment outside the "
+        f"allowlisted prefix trips an avoidable approval prompt even though the underlying "
+        f"command is safe."
     )
 
 

@@ -382,6 +382,8 @@ async def test_system_prompt_carries_live_limits(make_engine, registry, repo, cf
     assert f"{cfg.limits.max_turns} SDK turns" in append
     assert str(cfg.cycle_context_pct) in append
 
-    # The three discipline clauses must be present.
+    # The four discipline clauses must be present.
     assert "Commit completed work BEFORE" in append
     assert "nohup" in append
+    assert "Run allowlisted commands" in append
+    assert "PLAINLY" in append

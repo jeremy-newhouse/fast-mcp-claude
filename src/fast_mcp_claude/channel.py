@@ -601,8 +601,12 @@ async def _presence_loop(cfg: ChannelConfig) -> None:
             # an explicit IDENTITY_LIVE_ELSEWHERE refusal, never on OUR OWN connection loss — so
             # if this loop's connection dropped while the inbox loop's SEPARATE connection
             # stayed up, a competitor could win the identity guard while the inbox loop kept
-            # claiming, unaware. Clearing it here pauses claiming (the inbox loop already
-            # re-checks this gate every iteration) until we reconnect and reconfirm ownership.
+            # claiming, unaware. Clearing it here pauses claiming BETWEEN inbox iterations (the
+            # inbox loop re-checks this gate every iteration) until we reconnect and reconfirm
+            # ownership. NARROWS, does not fully close, finding #4: an already in-flight
+            # wait_for_instruction poll on the inbox's own connection can still return a message
+            # claimed before this clear lands — see _inbox_loop's own immediate re-check for the
+            # rest of that residual.
             rt.announce_confirmed.clear()
             backoff = await _reconnect_sleep("presence", e, backoff)
 
@@ -613,10 +617,18 @@ async def _graceful_forget(cfg: ChannelConfig) -> None:
     Token-aware on the server side (services/store.py:forget_presence) — the row is only
     deleted if it still carries OUR announce_token, so this can never clobber a successor's
     row. Shrinks the owner-token identity guard's ~poll_heartbeat_s*3 claim-gap (ADR-0029/
-    ECA-71) down to ~0 for a graceful relaunch (pm2 restart, operator relaunch — anything that
-    closes stdin and lets `_serve` return normally). A hard crash (kill -9, OOM) never reaches
-    this call and still waits out the freshness window — accepted; ADR-0029 already flagged
-    this exact gap as a follow-up ("a graceful presence handoff would shrink it").
+    ECA-71) down to ~0 whenever `_serve` returns normally (stdin closes cleanly) — an ASSUMED
+    but unverified fit for pm2 restart / operator relaunch: whether those actually let this
+    subprocess observe a clean stdin EOF, versus signaling the whole process group (same as a
+    hard crash — inert), depends on pm2's signal-forwarding behavior for this exact nested-
+    subprocess topology, which has not been confirmed live. A hard crash (kill -9, OOM) never
+    reaches this call either way and still waits out the freshness window — accepted; ADR-0029
+    already flagged this exact gap as a follow-up ("a graceful presence handoff would shrink it").
+
+    MUST be called only after `tg.cancel_scope.cancel()` (see `_serve`), inside a shielded
+    scope: `_presence_loop` is still free to re-announce with our own token up until it's
+    actually cancelled, and a re-announce landing between this call's delete and `_serve`
+    exiting would resurrect the very row we just freed.
 
     Skipped entirely if we were never a confirmed owner (a refused fork has nothing to forget,
     and must never delete the real owner's row) or have no token (pre-ECA-71 tokenless mode).
@@ -736,13 +748,28 @@ _NON_CONSUMPTION_BOUNCE = (
     "live (not loaded, or the agent loop is parked/forked away). Message not delivered.>"
 )
 
+_IDENTITY_UNCERTAIN_BOUNCE = (
+    "<the addressed live session's identity guard lapsed while this message was already "
+    "in flight (a presence connection drop mid-poll); claimed but not delivered, since this "
+    "process can no longer confirm it owns this identity.>"
+)
+
 
 async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
     """Claim one message at a time -> push -> await its reply -> claim the next.
 
     ECA-71 gate: never claim unless announce is CONFIRMED (Layer B — a refused fork stays
     disarmed) and the session is not DEGRADED (Layer C — a dead consumer stops claiming until it
-    shows life again). On non-consumption the sender is BOUNCED, never silently black-holed."""
+    shows life again). On non-consumption the sender is BOUNCED, never silently black-holed.
+
+    ECA-82 (finding #4 residual): the gate is only re-checked BETWEEN `wait_for_instruction`
+    calls (below), not during one — `wait_for_instruction` already claims (pops) the message
+    server-side before returning, so a presence connection drop mid-poll (which clears
+    announce_confirmed, see `_presence_loop`) can still let an already in-flight poll return a
+    real message on this now-uncertain identity. This narrows finding #4 from a window bounded
+    by presence reconnect time down to one bounded by `cfg.poll` (the long-poll timeout) — NOT
+    a full close. The immediate re-check right after claiming (below) narrows it further, to
+    essentially the gap between claiming and this check."""
     assert _RT is not None
     rt = _RT
     # Don't push before the session has finished initializing (events into an un-initialized
@@ -782,6 +809,21 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                     msg = data.get("message")
                     if not msg:
                         continue  # long-poll timeout, no message — loop again
+                    if not rt.announce_confirmed.is_set():
+                        # ECA-82: already claimed server-side (see the docstring above) — cannot
+                        # be un-claimed, so bounce rather than push it into a session that can no
+                        # longer confirm it owns this identity.
+                        try:
+                            await c.call_tool(
+                                "reply",
+                                {
+                                    "message_id": str(msg.get("id", "")),
+                                    "response": _IDENTITY_UNCERTAIN_BOUNCE,
+                                },
+                            )
+                        except Exception as e:
+                            _log(f"identity-uncertain bounce for {msg.get('id')} failed: {e}")
+                        continue
                     meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
                     if meta.get("expects_reply") is False:
                         # ECA-58: hub-stamped fire-and-forget (FYI notify / broadcast /
@@ -1456,10 +1498,17 @@ async def _serve(cfg: ChannelConfig) -> None:
             tg.start_soon(_tee_reader, read_stream, tee_send, write_stream, cfg, tg)
             # The server loop owns the protocol (handshake, ping, shutdown when stdin closes).
             await _server.run(tee_recv, write_stream, init_options)
-            # Still ahead of cancel_scope.cancel() below, so the other loops are alive and this
-            # runs on the normal (uncancelled) event loop — no anyio shielding needed.
-            await _graceful_forget(cfg)
+            # ECA-82: cancel the OTHER loops first, THEN forget — not the other way around.
+            # `_presence_loop` heartbeats on its own, unrelated connection to the mesh server;
+            # if it were still free to run while `_graceful_forget` awaits its own RPC, it could
+            # re-announce with our (still-valid) token between the forget's delete and this
+            # scope exiting, resurrecting the exact row we just freed and reopening the gap this
+            # fix exists to close. Cancelling first stops it at its next checkpoint (typically
+            # before it can start another announce call); the shield protects the forget call
+            # itself from that same cancellation so it still gets to run.
             tg.cancel_scope.cancel()
+            with anyio.CancelScope(shield=True):
+                await _graceful_forget(cfg)
 
 
 def main() -> None:

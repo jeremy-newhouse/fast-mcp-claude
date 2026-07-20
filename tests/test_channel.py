@@ -237,15 +237,46 @@ def test_serve_enabled_starts_bridge(patched_serve):
 
 def test_serve_calls_graceful_forget_after_server_run(monkeypatch, patched_serve):
     """_graceful_forget must run once _server.run returns (clean exit) -- verifies the wiring,
-    not _graceful_forget's own internal logic (covered separately below)."""
+    not _graceful_forget's own internal logic (covered separately below). The real call sits
+    inside a shielded scope (see _serve), so a real await checkpoint here still must complete
+    without raising -- if a regression ever dropped the shield, this would surface as a
+    propagated CancelledError instead of a silent pass."""
     calls = []
 
     async def fake_graceful_forget(cfg):
+        await anyio.sleep(0)
         calls.append(cfg)
 
     monkeypatch.setattr(channel_mod, "_graceful_forget", fake_graceful_forget)
     anyio.run(channel_mod._serve, _cfg(enabled=True))
     assert len(calls) == 1
+
+
+def test_serve_cancels_other_loops_before_calling_graceful_forget(monkeypatch, patched_serve):
+    """Regression guard for an adversarial-review finding on this branch: the ORIGINAL wiring
+    called `_graceful_forget` BEFORE cancelling the task group, leaving `_presence_loop` free to
+    re-announce with our own (still-valid) token and resurrect the very row the forget just
+    deleted -- reopening the exact claim-gap AC1 exists to close. The fix cancels first (so
+    `_presence_loop` can no longer start another announce) and only then runs the shielded
+    forget. `fake_presence` records whether IT observed cancellation before `fake_graceful_forget`
+    ran; both stubs yield at least once so the event loop actually gets to interleave them."""
+    order = []
+
+    async def fake_presence(cfg):
+        try:
+            await anyio.sleep_forever()
+        except anyio.get_cancelled_exc_class():
+            order.append("presence_cancelled")
+            raise
+
+    async def fake_graceful_forget(cfg):
+        await anyio.sleep(0)  # yield so an already-scheduled cancellation gets to land first
+        order.append("graceful_forget")
+
+    monkeypatch.setattr(channel_mod, "_presence_loop", fake_presence)
+    monkeypatch.setattr(channel_mod, "_graceful_forget", fake_graceful_forget)
+    anyio.run(channel_mod._serve, _cfg(enabled=True))
+    assert order == ["presence_cancelled", "graceful_forget"]
 
 
 def test_serve_disabled_never_calls_graceful_forget(monkeypatch, patched_serve):
@@ -1206,6 +1237,7 @@ def test_presence_loop_identity_live_elsewhere_does_not_reconnect(monkeypatch):
         channel_mod._RT = None
 
     assert reconnect_calls == []  # never reconnected — the refusal was handled in place
+    assert client.calls == 3
 
 
 def test_presence_loop_connection_failure_clears_announce_confirmed(monkeypatch):

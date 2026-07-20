@@ -824,6 +824,7 @@ class Store:
                     return False
             cur = await self.db.execute("DELETE FROM presence WHERE identity=?", (identity,))
             deleted = cur.rowcount > 0
+            await cur.close()
             await self.db.commit()
         if deleted:
             self._notifier.notify(self._presence_key())

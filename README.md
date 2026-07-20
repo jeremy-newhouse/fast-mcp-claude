@@ -23,7 +23,7 @@ The controller calls tools like `send_prompt`, `wait_for_completion`, `approve_t
 
 ## Status
 
-v0.2 — adds Claude Code **Channels** push mode and **N-way** peer presence. Working: peer-to-peer messaging, prompt **push** via a channel adapter (no `/worker` priming, no idle-timeout), identity addressing + presence/roster (`who`), permission relay via PreToolUse hook, file bridge (sandboxed), pub/sub channels, bearer auth with rate-limit lockout. Not yet: permission relay over the native `claude/channel/permission` protocol (needs inbound custom-notification support the Python MCP SDK lacks today — the hook covers approvals meanwhile), end-to-end integration tests against real Claude Code sessions.
+v0.2 — adds Claude Code **Channels** push mode and **N-way** peer presence. Working: peer-to-peer messaging, prompt **push** via a channel adapter (no `/worker` priming, no idle-timeout), identity addressing + presence/roster (`who`), permission relay via the PreToolUse hook *and* over the channel's native `claude/channel/permission` protocol (the channel adapter tees the raw stdio stream to work around a gap in the Python MCP SDK's typed notification API — see CLAUDE.md), file bridge (sandboxed), pub/sub channels, bearer auth with rate-limit lockout. Not yet: end-to-end integration tests against real Claude Code sessions.
 
 ## Install
 
@@ -142,11 +142,11 @@ Channel mode is **strict opt-in** and arming it takes two switches, by design:
 claude --dangerously-load-development-channels server:claude-channel
 ```
 
-Add the `claude-channel` entry from `.mcp.json.example` and install the CLI (`uv tool install .`) so the adapter binary is on PATH. Prompts then arrive as `<channel source="fast-mcp-claude" message_id="..." sender="...">` events; the worker does the task and calls `reply(message_id, ...)`. Channel pushes are fire-and-forget, so the `reply`/outbox path remains the source of truth for delivery (this is the lesson from claude-peers-mcp's silent-message-loss bugs).
+Add the `claude-channel` entry from `.mcp.json.example` and install the CLI (`uv tool install .`) so the adapter binary is on PATH. Prompts then arrive as `<channel source="fast-mcp-claude-channel" message_id="..." sender="...">` events; the worker does the task and calls `reply(message_id, ...)`. Channel pushes are fire-and-forget, so the `reply`/outbox path remains the source of truth for delivery (this is the lesson from claude-peers-mcp's silent-message-loss bugs).
 
 **Coexistence & safety.** Channel mode and the `/worker` long-poll loop read the *same* inbox and coexist with no server change — pick one **per worker launch**, and different peers in a fleet can mix modes freely. The `CHANNEL_ENABLED` switch exists because Claude Code spawns the `claude-channel` adapter whenever it's wired into `.mcp.json`, even when you launched *without* `--dangerously-load-development-channels`. With `CHANNEL_ENABLED=false` (the default) such a wired-but-unintended adapter completes the MCP handshake and then stays **inert** — it never polls, claims, or pushes — so it's safe to leave configured alongside loop mode. Were it to poll while disabled, it would mark inbox messages "delivered" and push them into a channel nobody is listening to: the prompt would vanish and the controller's `wait_for_completion` would hang until TTL. For the same reason, never **double-arm** a single worker — run the channel adapter *or* `/worker` for a given identity, not both.
 
-> Permissions are **not** relayed over the channel yet — Claude Code's native `claude/channel/permission` relay is an inbound custom notification the Python MCP SDK doesn't surface. Keep using the PreToolUse hook (next section) for approvals.
+> Permissions **are** relayed over the channel: the adapter tees the raw stdio read stream to catch `claude/channel/permission_request` (a workaround for a gap in the Python MCP SDK's typed notification handling — see CLAUDE.md's Permission relay section for the protocol detail). The PreToolUse hook (next section) remains the path for *headless launcher* workers, which never run a channel.
 
 ## N-way peer mode (many sessions / many developers)
 
@@ -207,7 +207,16 @@ If the controller doesn't respond within `CRM_DECISION_TIMEOUT` (default 300s), 
 | `publish(channel, payload, sender?)` | Either | Broadcast on a channel |
 | `subscribe(channel, after_id, timeout?)` | Either | Long-poll for new channel messages |
 | `announce(identity, summary?, metadata?)` | Any | Heartbeat presence (channel adapter does this) |
+| `forget(identity, announce_token)` | Any | Best-effort presence delete on a clean session exit |
 | `who(stale_seconds?)` | Any | List peers present on this server |
+| `request_teams_send(text, target?, metadata?)` | Channel | Ask the hub to post a message to Teams |
+| `await_teams_send(request_id, timeout?)` | Channel | Long-poll for the hub's Teams delivery result |
+| `wait_for_pending_teams_send(timeout?)` | Hub | Long-poll for pending Teams-send requests to drain |
+| `complete_teams_send(request_id, ok, detail?)` | Hub | Complete a Teams-send request after posting |
+| `request_session_op(op, payload?, requester_session?)` | Session | Ask the hub to `list`/`send`/`check` against the operator's other sessions |
+| `await_session_op(request_id, timeout?)` | Session | Long-poll for the hub's session-relay result |
+| `wait_for_pending_session_ops(timeout?)` | Hub | Long-poll for pending session-relay ops to drain |
+| `complete_session_op(request_id, ok, result?)` | Hub | Complete a session-relay op after performing it |
 
 All tools return `{"success": bool, ...}` or `{"success": false, "error": {"message": ..., "code": ...}}`.
 
@@ -219,9 +228,15 @@ All tools return `{"success": bool, ...}` or `{"success": false, "error": {"mess
 - **Hook fail-safe**: any error in the permission relay (server down, timeout, parse error) → `permissionDecision: "ask"` → Claude Code's local prompt takes over.
 - **Body-size caps** (see `utils/validation.py`): prompt ≤1MB, response ≤4MB, file ≤10MB, pubsub payload ≤256KB.
 
-## Interactive tooling: herdr-tmux-shim (optional)
+## Standalone tooling
 
-[`herdr-tmux-shim/`](herdr-tmux-shim/) is a standalone, **opt-in** shim for developers who run Claude Code interactively inside herdr (a personal terminal-pane manager) panes: it impersonates the `tmux` binary Claude Code's experimental agent-teams (`teammateMode: "tmux"`) shells out to, so teammate split panes open as native herdr panes (with herdr's idle/working/blocked sidebar) instead of a real tmux session. It has nothing to do with the MCP server or `worker-supervisor`'s headless pm2 lane spawning — see [`herdr-tmux-shim/README.md`](herdr-tmux-shim/README.md) for how it works and install steps.
+Beyond the MCP server itself, this repo hosts several standalone peer-machine tools, each in its own top-level directory with its own README:
+
+- [`worker-supervisor/`](worker-supervisor/README.md) — the SDK worker supervisor (ECA-60): autonomous worker fleets as Claude Agent SDK session chains owned by a local daemon, replacing interactive TUI + channel-sidecar workers for unattended work.
+- [`spawner/`](spawner/README.md) — the per-peer spawner (ECA-65): the sole NATS client and container launcher on a peer, consuming dispatch jobs and launching the hardened agent sandbox.
+- [`sandbox-runner/`](sandbox-runner/README.md) — the in-container SDK runner and hardened image (ECA-64) that `spawner/` launches; the container is the security boundary.
+- [`start-session.sh`](start-session.sh) — launches an interactive Claude Code dev session that's fleet-visible to the eCA brain, wiring up-reporting hooks plus one of two down-delivery mechanisms (notify+pull, or channel push — see [Channels: push mode](#channels-push-mode-recommended) above).
+- [`herdr-tmux-shim/`](herdr-tmux-shim/README.md) — an opt-in shim for developers who run Claude Code interactively inside herdr (a personal terminal-pane manager) panes: it impersonates the `tmux` binary Claude Code's experimental agent-teams (`teammateMode: "tmux"`) shells out to, so teammate split panes open as native herdr panes (with herdr's idle/working/blocked sidebar) instead of a real tmux session. It has nothing to do with the MCP server or `worker-supervisor`'s headless pm2 lane spawning — see [`herdr-tmux-shim/README.md`](herdr-tmux-shim/README.md) for how it works and install steps.
 
 ## Architectural notes
 
@@ -230,7 +245,7 @@ See [CLAUDE.md](CLAUDE.md) for the deep-dive on module layout, the long-poll not
 - **In-process notifier only**: each peer machine has one server process, so cross-process notification is unnecessary.
 - **Push or poll**: the HTTP server is long-poll (the `/worker` loop calls `wait_for_instruction`), but `fast-mcp-claude-channel` adds true push — it long-polls the server out-of-band and emits `notifications/claude/channel` into the live session, so the model never blocks on a tool call to receive work.
 - **MCP idle timeout**: `POLL_MAX_WAIT_S` defaults to 25s to stay below Claude Code's MCP idle limit on the long-poll path. Channel push sidesteps the limit entirely (the wait happens in the adapter process, not a Claude tool call).
-- **Channels (research preview)**: implemented for prompt delivery (see [Channels: push mode](#channels-push-mode-recommended)). The design mirrors Anthropic's [Channels](https://code.claude.com/docs/en/channels) — the channel adapter is exactly the "thin facade" this section once anticipated. Permission relay over the native `claude/channel/permission` protocol remains future work pending inbound custom-notification support in the Python MCP SDK; the PreToolUse hook covers approvals today.
+- **Channels (research preview)**: implemented for both prompt delivery and permission relay (see [Channels: push mode](#channels-push-mode-recommended)). The design mirrors Anthropic's [Channels](https://code.claude.com/docs/en/channels) — the channel adapter is exactly the "thin facade" this section once anticipated. The permission relay works around a gap in the Python MCP SDK's typed notification API by teeing the raw stdio stream (see CLAUDE.md for the protocol detail); the PreToolUse hook remains the path for headless launcher workers, which never run a channel.
 
 ## Reference architecture
 

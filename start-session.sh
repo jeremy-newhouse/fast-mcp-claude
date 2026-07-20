@@ -8,8 +8,10 @@
 #
 #   notify+pull (default):
 #     - the fast-mcp-claude-session SIDECAR (background) — sole announcer of this session's
-#       presence (role="live-session", identity "<peer>.<repo>") + an inbox watcher that fires
-#       a macOS notification when the brain sends a prompt;
+#       presence (role="live-session", identity "<peer>.<repo>.<name-slug>", where <name-slug>
+#       defaults to the git branch and falls back to a short hash of the repo path on detached
+#       HEAD with no SESSION_NAME set — see ADR-0016) + an inbox watcher that fires a macOS
+#       notification when the brain sends a prompt;
 #     - the local mesh server as the "claude-local" MCP server, so /fleet-inbox can pull a
 #       parked prompt (wait_for_instruction) and answer it (reply).
 #
@@ -20,12 +22,14 @@
 #       the mesh (no /fleet-inbox). Tool calls relay through it for approval. The session runs in
 #       --permission-mode default so consequential tools gate (the relay needs an open dialog).
 #       Channels are a research preview (claude.ai auth required — peers have it; the brain is
-#       Bedrock and only POSTs). Proven live on CC 2.1.168. See docs/channels (and ADR-0010
-#       in the evolv-coder-agent repo).
+#       Bedrock and only POSTs). Proven live on CC 2.1.168. See CLAUDE.md's Channel push flow
+#       section (ADR-0012 in the evolv-coder-agent repo) for the full protocol detail.
 #
 # Run this from inside the repo you want to work in:
 #     /path/to/fast-mcp-claude/start-session.sh
-# Optional overrides via env: PEER_NAME, MCP_API_KEY, MCP_LOCAL_URL, FLEET_IDENTITY, CHANNEL_MODE.
+# Optional overrides via env: PEER_NAME, MCP_API_KEY, MCP_PORT, MCP_LOCAL_URL, FLEET_IDENTITY,
+# CHANNEL_MODE, SESSION_NAME, SESSION_DESCRIPTION.
+# Any other CLI args are passed straight through to the final `exec claude ... "$@"`.
 set -euo pipefail
 
 # Resolve the REAL location of this script, following symlinks, so it works when invoked via a

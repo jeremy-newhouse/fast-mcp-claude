@@ -625,13 +625,18 @@ def test_send_teams_via_fleet_channel_unaddressed_admin_not_stamped(send_teams_r
 
 
 def test_send_teams_via_fleet_channel_noop_when_no_inflight(send_teams_rig):
-    # Operator-direct sends already omit conversation_id — via_fleet_channel is a harmless no-op.
+    # Operator-direct sends already omit conversation_id — via_fleet_channel is a harmless no-op,
+    # including in the reported destination text (it must not claim a Fleet-channel delivery it
+    # had no part in).
     send_teams_rig["set_inflight"](None)
-    anyio.run(channel_mod._call_tool, "send_teams", {"text": "x", "via_fleet_channel": True})
+    out = anyio.run(
+        channel_mod._call_tool, "send_teams", {"text": "x", "via_fleet_channel": True}
+    )
     _, target, meta = send_teams_rig["calls"][0]
     assert target is None
     assert meta.get("operator_direct") is True
     assert "conversation_id" not in meta
+    assert "Fleet channel" not in out[0].text
 
 
 def test_send_teams_requires_text(send_teams_rig):

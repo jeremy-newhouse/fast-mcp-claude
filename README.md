@@ -139,10 +139,10 @@ Channel mode is **strict opt-in** and arming it takes two switches, by design:
 2. Launch the worker with the dev-channel flag:
 
 ```bash
-claude --dangerously-load-development-channels server:claude-channel
+claude --dangerously-load-development-channels server:fast-mcp-claude-channel
 ```
 
-Add the `claude-channel` entry from `.mcp.json.example` and install the CLI (`uv tool install .`) so the adapter binary is on PATH. Prompts then arrive as `<channel source="fast-mcp-claude-channel" message_id="..." sender="...">` events; the worker does the task and calls `reply(message_id, ...)`. Channel pushes are fire-and-forget, so the `reply`/outbox path remains the source of truth for delivery (this is the lesson from claude-peers-mcp's silent-message-loss bugs).
+Add the `fast-mcp-claude-channel` entry from `.mcp.json.example` and install the CLI (`uv tool install .`) so the adapter binary is on PATH. The `.mcp.json` key must match this exactly — Claude Code names MCP tools `mcp__<key>__<tool>`, and the adapter auto-allows its own tools (like `reply`) by the fully-qualified `mcp__fast-mcp-claude-channel__*` name, so a different key breaks that auto-allow (see FMC-8). Prompts then arrive as `<channel source="fast-mcp-claude-channel" message_id="..." sender="...">` events; the worker does the task and calls `reply(message_id, ...)`. Channel pushes are fire-and-forget, so the `reply`/outbox path remains the source of truth for delivery (this is the lesson from claude-peers-mcp's silent-message-loss bugs).
 
 **Coexistence & safety.** Channel mode and the `/worker` long-poll loop read the *same* inbox and coexist with no server change — pick one **per worker launch**, and different peers in a fleet can mix modes freely. The `CHANNEL_ENABLED` switch exists because Claude Code spawns the `claude-channel` adapter whenever it's wired into `.mcp.json`, even when you launched *without* `--dangerously-load-development-channels`. With `CHANNEL_ENABLED=false` (the default) such a wired-but-unintended adapter completes the MCP handshake and then stays **inert** — it never polls, claims, or pushes — so it's safe to leave configured alongside loop mode. Were it to poll while disabled, it would mark inbox messages "delivered" and push them into a channel nobody is listening to: the prompt would vanish and the controller's `wait_for_completion` would hang until TTL. For the same reason, never **double-arm** a single worker — run the channel adapter *or* `/worker` for a given identity, not both.
 

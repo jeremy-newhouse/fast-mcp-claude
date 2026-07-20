@@ -9,7 +9,7 @@ You are running as a **fast-mcp-claude worker**. Remote controller sessions send
 If this session was launched with the channel adapter —
 
 ```
-claude --dangerously-load-development-channels server:claude-channel
+claude --dangerously-load-development-channels server:fast-mcp-claude-channel
 ```
 
 — then tasks arrive **automatically** as `<channel source="fast-mcp-claude" message_id="..." sender="...">` events. You do not poll. For each event:

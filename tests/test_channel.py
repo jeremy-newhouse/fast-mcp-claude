@@ -572,6 +572,68 @@ def test_send_teams_operator_direct_posts(send_teams_rig):
     assert "posted to Teams" in out[0].text
 
 
+def test_send_teams_via_fleet_channel_omits_origin_when_inflight(send_teams_rig):
+    # ECA-113: a routine progress post fired while a task is still in-flight must NOT inherit
+    # that task's own origin (which would echo it back to whoever dispatched the task) — it
+    # omits conversation_id/origin_message_id entirely so the hub's fleet.py falls through to
+    # deliver_via_thread instead.
+    send_teams_rig["set_inflight"](
+        {"id": "m1", "recipient_session": "x",
+         "metadata": {"triggering_admin": True, "conversation_id": "conv-1"}}
+    )
+    out = anyio.run(
+        channel_mod._call_tool, "send_teams",
+        {"text": "wave 2 kicked off", "via_fleet_channel": True},
+    )
+    text, target, meta = send_teams_rig["calls"][0]
+    assert text == "wave 2 kicked off" and target is None
+    assert meta["triggering_admin"] is True
+    assert "conversation_id" not in meta
+    assert "origin_message_id" not in meta
+    assert "Fleet channel thread" in out[0].text
+
+
+def test_send_teams_via_fleet_channel_ignored_when_target_given(send_teams_rig):
+    # An explicit target always wins — via_fleet_channel must not suppress the normal origin
+    # stamping when the caller also names a destination.
+    send_teams_rig["set_inflight"](
+        {"id": "m1", "recipient_session": "x",
+         "metadata": {"triggering_admin": True, "conversation_id": "conv-1"}}
+    )
+    anyio.run(
+        channel_mod._call_tool, "send_teams",
+        {"text": "x", "target": "Eng", "via_fleet_channel": True},
+    )
+    _, target, meta = send_teams_rig["calls"][0]
+    assert target == "Eng"
+    assert meta["conversation_id"] == "conv-1"
+    assert meta["origin_message_id"] == "m1"
+
+
+def test_send_teams_via_fleet_channel_unaddressed_admin_not_stamped(send_teams_rig):
+    # The triggering_admin gate still applies unchanged under via_fleet_channel — an unaddressed
+    # pushed task still fails safe (refused), not silently promoted.
+    send_teams_rig["set_inflight"](
+        {"id": "m1", "recipient_session": None, "metadata": {"triggering_admin": True}}
+    )
+    out = anyio.run(
+        channel_mod._call_tool, "send_teams", {"text": "x", "via_fleet_channel": True}
+    )
+    _, _, meta = send_teams_rig["calls"][0]
+    assert meta["triggering_admin"] is False
+    assert "NOT posted" in out[0].text
+
+
+def test_send_teams_via_fleet_channel_noop_when_no_inflight(send_teams_rig):
+    # Operator-direct sends already omit conversation_id — via_fleet_channel is a harmless no-op.
+    send_teams_rig["set_inflight"](None)
+    anyio.run(channel_mod._call_tool, "send_teams", {"text": "x", "via_fleet_channel": True})
+    _, target, meta = send_teams_rig["calls"][0]
+    assert target is None
+    assert meta.get("operator_direct") is True
+    assert "conversation_id" not in meta
+
+
 def test_send_teams_requires_text(send_teams_rig):
     send_teams_rig["set_inflight"]({"id": "m1", "recipient_session": "x", "metadata": {}})
     out = anyio.run(channel_mod._call_tool, "send_teams", {"text": "   "})

@@ -506,6 +506,11 @@ def _build_presence(cfg: ChannelConfig) -> tuple[str | None, dict[str, Any]]:
         "status": status,
         "last": last or None,
         "status_updated_at": st.get("updated_at"),
+        # ECA-23: operator-set free-text purpose + the underlying Claude Code session id, both
+        # sourced from the status file (session_description seeded by start-session.sh,
+        # claude_session_id written by session_hook.py from the CC hook event).
+        "session_description": st.get("session_description") or None,
+        "claude_session_id": st.get("claude_session_id") or None,
         # ECA-71 owner-token: identifies THIS process to the server's duplicate-identity guard.
         "announce_token": cfg.announce_token or None,
     }

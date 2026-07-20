@@ -54,6 +54,10 @@ def main(argv: list[str] | None = None) -> None:
             st["cwd"] = event["cwd"]
         if not st.get("repo") and st.get("cwd"):
             st["repo"] = os.path.basename(str(st["cwd"]).rstrip("/"))
+        # Every CC hook event carries session_id (same field hook.py:69 already reads); publish
+        # it so presence can surface which underlying Claude session this live session is (ECA-23).
+        if event.get("session_id"):
+            st["claude_session_id"] = event["session_id"]
 
         if name == "UserPromptSubmit":
             st["status"] = "working"

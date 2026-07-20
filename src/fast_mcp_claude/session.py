@@ -211,6 +211,9 @@ def _build_presence(cfg: SessionConfig) -> tuple[str | None, dict[str, Any]]:
         "last": last or None,
         "session_pid": cfg.parent_pid,
         "status_updated_at": st.get("updated_at"),
+        # ECA-23: same status-file-sourced fields as channel.py's twin.
+        "session_description": st.get("session_description") or None,
+        "claude_session_id": st.get("claude_session_id") or None,
     }
     return summary, {k: v for k, v in meta.items() if v is not None}
 

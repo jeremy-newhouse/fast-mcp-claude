@@ -87,6 +87,12 @@ REPO_HASH="$(printf '%s' "$REPO_ROOT" | cksum | cut -d' ' -f1)"
 SESSION_NAME="${SESSION_NAME:-}"
 if [ -z "$SESSION_NAME" ] && [ "$BRANCH" != "?" ]; then SESSION_NAME="$BRANCH"; fi
 NAME_SLUG="$(printf '%s' "$SESSION_NAME" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/^[-.]*//; s/[-.]*$//')"
+
+# Session DESCRIPTION (ECA-23): free-text purpose, operator-set only (no default, unlike
+# SESSION_NAME) — published in presence so the brain/operator can tell sessions apart by what
+# they're working on, not just name/branch. Not slugged: it flows through the status file/
+# presence metadata as-is, never into the mesh identity.
+SESSION_DESCRIPTION="${SESSION_DESCRIPTION:-}"
 if [ -n "$NAME_SLUG" ]; then
   IDENTITY="${FLEET_IDENTITY:-${PEER_NAME}.${REPO_SLUG}.${NAME_SLUG}}"
 else
@@ -132,12 +138,13 @@ STATUS_FILE="$SESS_DIR/$IDENTITY.json"
 BADGE_FILE="$SESS_DIR/$IDENTITY.badge"
 
 # seed the status file (valid JSON via python so the hook/sidecar merge cleanly)
-python3 - "$STATUS_FILE" "$IDENTITY" "$PEER_NAME" "$REPO_BASE" "$REPO_ROOT" "$BRANCH" "$NAME_SLUG" <<'PY'
+python3 - "$STATUS_FILE" "$IDENTITY" "$PEER_NAME" "$REPO_BASE" "$REPO_ROOT" "$BRANCH" "$NAME_SLUG" "$SESSION_DESCRIPTION" <<'PY'
 import json, sys, time
-path, identity, machine, repo, cwd, branch, name = sys.argv[1:8]
+path, identity, machine, repo, cwd, branch, name, description = sys.argv[1:9]
 json.dump({"identity": identity, "machine": machine, "repo": repo, "cwd": cwd,
-           "branch": branch, "name": name or None, "status": "starting",
-           "started_at": time.time(), "updated_at": time.time(), "last": ""}, open(path, "w"))
+           "branch": branch, "name": name or None, "session_description": description or None,
+           "status": "starting", "started_at": time.time(), "updated_at": time.time(),
+           "last": ""}, open(path, "w"))
 PY
 
 # --- ensure the /fleet-inbox pull command is installed at user level ---------------------

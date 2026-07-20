@@ -392,6 +392,29 @@ def test_presence_includes_name(tmp_path):
     assert "planning" in summary
 
 
+def test_presence_includes_description_and_claude_session_id(tmp_path):
+    # ADR-0016 Amendment 1 (ECA-23): both fields ride the same status-file pipeline as name.
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({
+        "machine": "mini2", "repo": "evolv-coder-agent",
+        "session_description": "fixing the auth bug", "claude_session_id": "abc-123",
+        "branch": "dev", "status": "active",
+    }))
+    cfg = _cfg(identity="mini2.eca", status_file=str(sf))
+    _, meta = channel_mod._build_presence(cfg)
+    assert meta["session_description"] == "fixing the auth bug"
+    assert meta["claude_session_id"] == "abc-123"
+
+
+def test_presence_omits_description_and_claude_session_id_when_absent(tmp_path):
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({"machine": "mini2", "repo": "evolv-coder-agent", "status": "active"}))
+    cfg = _cfg(identity="mini2.eca", status_file=str(sf))
+    _, meta = channel_mod._build_presence(cfg)
+    assert "session_description" not in meta
+    assert "claude_session_id" not in meta
+
+
 # -------------------------------------------------- permission relay routing
 
 

@@ -147,6 +147,19 @@ def test_build_presence_includes_name(tmp_path):
     assert "planning" in summary
 
 
+def test_build_presence_includes_description_and_claude_session_id(tmp_path):
+    # ADR-0016 Amendment 1 (ECA-23): same status-file pipeline as name.
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({
+        "machine": "mini2", "repo": "api",
+        "session_description": "fixing the auth bug", "claude_session_id": "abc-123",
+        "branch": "feat-x", "status": "working", "updated_at": 1.0,
+    }))
+    _, meta = session_mod._build_presence(_cfg(status_file=str(sf)))
+    assert meta["session_description"] == "fixing the auth bug"
+    assert meta["claude_session_id"] == "abc-123"
+
+
 # ----------------------------------------------------------------- inbox watcher (no claim)
 
 

@@ -62,6 +62,21 @@ def test_long_prompt_is_truncated(tmp_path, monkeypatch):
     assert len(json.loads(sf.read_text())["last"]) == 200
 
 
+def test_session_id_is_captured(tmp_path, monkeypatch):
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({"repo": "r"}))
+    _run(monkeypatch,
+         {"hook_event_name": "SessionStart", "session_id": "abc-123"}, str(sf))
+    assert json.loads(sf.read_text())["claude_session_id"] == "abc-123"
+
+
+def test_missing_session_id_does_not_clear_existing(tmp_path, monkeypatch):
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({"repo": "r", "claude_session_id": "abc-123"}))
+    _run(monkeypatch, {"hook_event_name": "Stop"}, str(sf))
+    assert json.loads(sf.read_text())["claude_session_id"] == "abc-123"
+
+
 def test_bad_stdin_does_not_raise(tmp_path, monkeypatch):
     sf = tmp_path / "s.json"
     sf.write_text(json.dumps({"repo": "r"}))

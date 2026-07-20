@@ -851,11 +851,14 @@ async def _list_tools() -> list[types.Tool]:
             description=(
                 "Post a message to a Microsoft Teams chat via the eCA hub. `text` is the "
                 "message; `target` is the destination chat name (omit to post back to the chat "
-                "that sent you the current task). The hub posts only for admin-triggered tasks "
-                "and resolves the chat name; this returns whether it was delivered. Format per "
-                "the Teams conventions in the server instructions before sending: pipe-tables "
-                "with each row on its own line; every JIRA key / PR / commit / URL as a Markdown "
-                "link (no bare refs); no emojis."
+                "that sent you the current task). Set `via_fleet_channel` true (with `target` "
+                "omitted) to post routine progress/results into your OWN eCA Fleet channel "
+                "thread instead of the current task's origin chat — use this for status you'd "
+                "otherwise dump into the asker's chat mid-task; it has no effect if `target` is "
+                "given. The hub posts only for admin-triggered tasks and resolves the chat name; "
+                "this returns whether it was delivered. Format per the Teams conventions in the "
+                "server instructions before sending: pipe-tables with each row on its own line; "
+                "every JIRA key / PR / commit / URL as a Markdown link (no bare refs); no emojis."
             ),
             inputSchema={
                 "type": "object",
@@ -864,6 +867,13 @@ async def _list_tools() -> list[types.Tool]:
                     "target": {
                         "type": "string",
                         "description": "Destination chat name; omit for the originating chat",
+                    },
+                    "via_fleet_channel": {
+                        "type": "boolean",
+                        "description": (
+                            "Post to your own eCA Fleet channel thread instead of the current "
+                            "task's origin chat. Ignored if `target` is given."
+                        ),
                     },
                 },
                 "required": ["text"],
@@ -1021,6 +1031,7 @@ async def _handle_send_teams(
     text = str(arguments.get("text") or "")
     target = arguments.get("target")
     target = str(target).strip() if target else None
+    via_fleet_channel = bool(arguments.get("via_fleet_channel")) and not target
     # Stamp the hub-trusted context. Two trusted origins:
     #   * NO in-flight task -> the OPERATOR is driving this session directly (their own action on
     #     their own machine), trusted exactly as the channel already treats the operator's local
@@ -1034,16 +1045,25 @@ async def _handle_send_teams(
     else:
         in_meta = inflight.get("metadata") if isinstance(inflight.get("metadata"), dict) else {}
         addressed = inflight.get("recipient_session") == cfg.identity
-        metadata = {
-            "triggering_admin": bool(in_meta.get("triggering_admin")) and addressed,
-            "conversation_id": in_meta.get("conversation_id"),
-            "origin_message_id": inflight.get("id"),
-        }
+        metadata = {"triggering_admin": bool(in_meta.get("triggering_admin")) and addressed}
+        if via_fleet_channel:
+            # ECA-113: omit the in-flight task's own origin so the hub's fleet.py normalizer
+            # falls through to its deliver_via_thread branch (ECA-107) instead of echoing this
+            # post back to whoever dispatched the still-in-flight task.
+            pass
+        else:
+            metadata["conversation_id"] = in_meta.get("conversation_id")
+            metadata["origin_message_id"] = inflight.get("id")
     if not text.strip():
         return [types.TextContent(type="text", text="send_teams: `text` is required")]
     result = await _mesh_send_teams(cfg, text, target, metadata)
     if result.get("ok"):
-        where = target or "the originating chat"
+        if target:
+            where = target
+        elif via_fleet_channel:
+            where = "your eCA Fleet channel thread"
+        else:
+            where = "the originating chat"
         return [types.TextContent(type="text", text=f"posted to Teams ({where})")]
     detail = result.get("detail") or result.get("error") or "unknown error"
     return [types.TextContent(type="text", text=f"NOT posted to Teams: {detail}")]

@@ -160,6 +160,14 @@ def test_build_presence_includes_description_and_claude_session_id(tmp_path):
     assert meta["claude_session_id"] == "abc-123"
 
 
+def test_build_presence_omits_description_and_claude_session_id_when_absent(tmp_path):
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({"machine": "mini2", "repo": "api", "status": "working"}))
+    _, meta = session_mod._build_presence(_cfg(status_file=str(sf)))
+    assert "session_description" not in meta
+    assert "claude_session_id" not in meta
+
+
 # ----------------------------------------------------------------- inbox watcher (no claim)
 
 

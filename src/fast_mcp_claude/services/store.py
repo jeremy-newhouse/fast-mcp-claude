@@ -784,7 +784,15 @@ class Store:
 
     async def list_presence(self, stale_after: float | None = None) -> list[dict[str, Any]]:
         """Return known peers, freshest first. If stale_after is set, drop rows
-        whose last heartbeat is older than that many seconds."""
+        whose last heartbeat is older than that many seconds.
+
+        WARNING: each peer's `metadata` dict is returned VERBATIM, including
+        `announce_token` (the credential the ECA-71/82 owner-token identity guard
+        checks in `announce`/`forget_presence` above). This is intentional so tests
+        can verify that guard end-to-end — but any caller exposing this externally
+        (e.g. the `who()` MCP tool) MUST redact credential-shaped keys first; see
+        `tools/presence.py`'s `_redact_peer_metadata`.
+        """
         cur = await self.db.execute("SELECT * FROM presence ORDER BY updated_at DESC")
         rows = await cur.fetchall()
         await cur.close()

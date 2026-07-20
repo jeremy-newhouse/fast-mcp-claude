@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-07-20 20:25'
-updated_date: '2026-07-20 22:07'
+updated_date: '2026-07-20 22:12'
 labels:
   - security
   - presence
@@ -100,6 +100,32 @@ fast_mcp_claude.tools.presence.store/settings to the test's Store instance.
 Verified: `uv run pytest tests/test_presence.py -v` (15 passed, all
 pre-existing tests passing unchanged); full `uv run pytest` (253 passed);
 `uv run ruff check src/ tests/` (clean).
+
+Adversarial review (independent subagent, reviewed git diff dev...HEAD fresh):
+no blocking issues. Verified independently that the leak is closed (traced
+every path: who()'s exception handler never echoes raw peer data; no logger
+call passes metadata as a single extra field bypassing per-key redaction;
+announce()'s IDENTITY_LIVE_ELSEWHERE error never echoes token values) and
+that uv run pytest / ruff check pass.
+
+Two non-blocking findings, both addressed:
+1. store.list_presence()/_row_to_presence() stay "leaky by default" with no
+   signal at the definition site -- a future caller added directly in
+   store.py would reproduce this bug class with zero warning. Fixed: added a
+   WARNING docstring on list_presence() in services/store.py pointing future
+   callers at tools/presence.py's _redact_peer_metadata.
+2. _redact_peer_metadata was shallow (top-level keys only); a token nested
+   under an arbitrary sub-dict (announce()'s metadata is documented as
+   arbitrary structured context, and AC #1 says "any peer credential", not
+   just announce_token specifically) would have leaked through. Not
+   exploitable by the current real announcers (channel.py/launcher.py only
+   send flat metadata) but didn't fully satisfy AC #1's broader wording.
+   Fixed: _redact_peer_metadata now recurses into nested dicts. Added
+   test_who_redacts_nested_token to tests/test_presence.py covering it.
+
+Re-verified after both fixes: uv run pytest tests/test_presence.py -v (16
+passed); full uv run pytest (254 passed); uv run ruff check src/ tests/
+(clean).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

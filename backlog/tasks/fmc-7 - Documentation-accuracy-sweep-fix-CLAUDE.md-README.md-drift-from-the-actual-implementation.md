@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-07-20 20:26'
-updated_date: '2026-07-20 21:05'
+updated_date: '2026-07-20 21:09'
 labels:
   - documentation
 dependencies: []
@@ -64,6 +64,8 @@ Verified all 6 clusters against CURRENT repo state (not the stale line numbers i
 - start-session.sh header: rewrote lines 1-32 — identity example corrected to <peer>.<repo>.<name-slug> with the <peer>.<repo>-<hash> detached-HEAD fallback (verified against the actual logic at lines 72-100); added SESSION_NAME/SESSION_DESCRIPTION/MCP_PORT to the env-override list (all three grep-verified as read by the script); added the arg-passthrough note (both exec branches end in "$@"); replaced the dangling docs/channels reference (confirmed no docs/ dir exists in this repo) and reconciled ADR-0010 -> ADR-0012 to match CLAUDE.md's own citation for the same feature.
 
 Verification: `uv run ruff check src/ tests/` -> all checks passed (no src/*.py touched). `bash -n start-session.sh` -> syntax OK. Every AC re-checked by grepping/reading the actual current file content at each claim, not by trusting the task description's line numbers.
+
+Adversarial branch review (independent subagent, dev...feature/FMC-7 diff): confirmed doc-only scope (zero src/*.py touched) and verified every new factual claim against current source. One cosmetic finding: spawner/README.md's Run & test section named the fake test classes as _FakeJS/_FakeMsg (lifted from a comment describing a DIFFERENT codebase's tests in test_integration_nats.py) instead of spawner's own FakeMsg/FakeJs/FakeProcessor/etc. (test_consumer.py). Fixed and committed.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

@@ -51,6 +51,45 @@ async def test_forget_presence(store: Store):
     assert await store.list_presence() == []
 
 
+# --------------------------------------------------- ECA-82: token-aware forget_presence
+
+
+@pytest.mark.asyncio
+async def test_forget_presence_token_match_deletes(store: Store):
+    """A graceful shutdown forgets its OWN row when the token still matches."""
+    await store.announce("eca2", metadata={"announce_token": "A"})
+    deleted = await store.forget_presence("eca2", expected_token="A")
+    assert deleted is True
+    assert await store.list_presence() == []
+
+
+@pytest.mark.asyncio
+async def test_forget_presence_token_mismatch_is_noop(store: Store):
+    """A stale/superseded process's forget must NEVER clobber a successor's row."""
+    await store.announce("eca2", summary="new owner", metadata={"announce_token": "B"})
+    deleted = await store.forget_presence("eca2", expected_token="A")
+    assert deleted is False
+    peers = await store.list_presence()
+    assert len(peers) == 1
+    assert peers[0]["metadata"]["announce_token"] == "B"
+
+
+@pytest.mark.asyncio
+async def test_forget_presence_tokenless_row_with_expected_token_is_noop(store: Store):
+    """A legacy tokenless row has no token to match — an expected_token forget must not delete it
+    (missing != any specific token, same "skip guard" direction as announce's own comparison)."""
+    await store.announce("legacy", summary="pre-ECA-71 announcer")
+    deleted = await store.forget_presence("legacy", expected_token="A")
+    assert deleted is False
+    assert len(await store.list_presence()) == 1
+
+
+@pytest.mark.asyncio
+async def test_forget_presence_missing_identity_with_token_is_noop(store: Store):
+    deleted = await store.forget_presence("nobody", expected_token="A")
+    assert deleted is False
+
+
 # ------------------------------------------------------- ECA-71 owner-token identity guard
 # ADR-0029 Layer B: a channel sidecar is the SOLE announcer for its identity. A second live
 # process reusing the identity (a claude.ai background fork of the TUI session) used to clobber

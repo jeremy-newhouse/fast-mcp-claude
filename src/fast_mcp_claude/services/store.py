@@ -796,11 +796,38 @@ class Store:
             out.append(_row_to_presence(r, now))
         return out
 
-    async def forget_presence(self, identity: str) -> None:
-        """Drop a peer's presence row (called on adapter shutdown)."""
-        await self.db.execute("DELETE FROM presence WHERE identity=?", (identity,))
-        await self.db.commit()
-        self._notifier.notify(self._presence_key())
+    async def forget_presence(self, identity: str, expected_token: str | None = None) -> bool:
+        """Drop a peer's presence row (called on adapter shutdown).
+
+        ECA-82: when `expected_token` is given, the row is only deleted if it still carries
+        that token — so a graceful shutdown can never clobber a successor's row it doesn't
+        own (a token mismatch, or no row at all, is a silent no-op). `expected_token=None`
+        keeps the old unconditional-delete behavior. Runs under `_db_lock` so it can't race
+        `announce`'s own read-check-upsert. Returns whether a row was actually deleted.
+        """
+        async with self._db_lock:
+            if expected_token is not None:
+                cur = await self.db.execute(
+                    "SELECT metadata FROM presence WHERE identity=?", (identity,)
+                )
+                row = await cur.fetchone()
+                await cur.close()
+                if row is None:
+                    return False
+                existing_meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                existing_token = (
+                    existing_meta.get("announce_token")
+                    if isinstance(existing_meta, dict)
+                    else None
+                )
+                if existing_token != expected_token:
+                    return False
+            cur = await self.db.execute("DELETE FROM presence WHERE identity=?", (identity,))
+            deleted = cur.rowcount > 0
+            await self.db.commit()
+        if deleted:
+            self._notifier.notify(self._presence_key())
+        return deleted
 
     # ------------------------------------------------------------- notifier keys
 

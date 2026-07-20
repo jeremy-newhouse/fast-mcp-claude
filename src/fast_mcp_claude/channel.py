@@ -595,7 +595,48 @@ async def _presence_loop(cfg: ChannelConfig) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            # ECA-82 (finding #4, the split-connection takeover edge): a transport failure
+            # means our heartbeats have stopped renewing the row, so we no longer have positive
+            # confirmation we still own the identity. Previously this flag was only cleared on
+            # an explicit IDENTITY_LIVE_ELSEWHERE refusal, never on OUR OWN connection loss — so
+            # if this loop's connection dropped while the inbox loop's SEPARATE connection
+            # stayed up, a competitor could win the identity guard while the inbox loop kept
+            # claiming, unaware. Clearing it here pauses claiming (the inbox loop already
+            # re-checks this gate every iteration) until we reconnect and reconfirm ownership.
+            rt.announce_confirmed.clear()
             backoff = await _reconnect_sleep("presence", e, backoff)
+
+
+async def _graceful_forget(cfg: ChannelConfig) -> None:
+    """ECA-82: on a clean session exit, best-effort forget our OWN presence row.
+
+    Token-aware on the server side (services/store.py:forget_presence) — the row is only
+    deleted if it still carries OUR announce_token, so this can never clobber a successor's
+    row. Shrinks the owner-token identity guard's ~poll_heartbeat_s*3 claim-gap (ADR-0029/
+    ECA-71) down to ~0 for a graceful relaunch (pm2 restart, operator relaunch — anything that
+    closes stdin and lets `_serve` return normally). A hard crash (kill -9, OOM) never reaches
+    this call and still waits out the freshness window — accepted; ADR-0029 already flagged
+    this exact gap as a follow-up ("a graceful presence handoff would shrink it").
+
+    Skipped entirely if we were never a confirmed owner (a refused fork has nothing to forget,
+    and must never delete the real owner's row) or have no token (pre-ECA-71 tokenless mode).
+    Best-effort: any failure (including a hung/unreachable server) is logged and swallowed —
+    this must never delay or block shutdown.
+    """
+    assert _RT is not None
+    if not cfg.announce_token or not _RT.announce_confirmed.is_set():
+        return
+
+    async def _do() -> None:
+        async with _make_client(cfg, timeout=3.0) as c:
+            await c.call_tool(
+                "forget", {"identity": cfg.identity, "announce_token": cfg.announce_token}
+            )
+
+    try:
+        await asyncio.wait_for(_do(), timeout=3.0)
+    except Exception as e:
+        _log(f"graceful presence forget on shutdown failed (best-effort, ignoring): {e}")
 
 
 def _maybe_rearm(cfg: ChannelConfig, rt: "_Runtime") -> None:
@@ -1405,7 +1446,8 @@ async def _serve(cfg: ChannelConfig) -> None:
     # the dead process's presence row is still timestamp-fresh, so the identity guard refuses this
     # process (and the inbox loop stays disarmed) for up to poll_heartbeat_s*3 until the old row
     # goes stale. Self-healing, no message loss (they park in the mailbox), but a claim-latency gap
-    # on relaunch. Accepted for v1; a graceful presence handoff would shrink it (follow-up).
+    # on relaunch. ECA-82 shrinks this to ~0 for a GRACEFUL exit via `_graceful_forget` below; a
+    # hard crash still waits out the freshness window (accepted — see that function's docstring).
     async with stdio_server() as (read_stream, write_stream):
         tee_send, tee_recv = anyio.create_memory_object_stream(256)
         async with anyio.create_task_group() as tg:
@@ -1414,6 +1456,9 @@ async def _serve(cfg: ChannelConfig) -> None:
             tg.start_soon(_tee_reader, read_stream, tee_send, write_stream, cfg, tg)
             # The server loop owns the protocol (handshake, ping, shutdown when stdin closes).
             await _server.run(tee_recv, write_stream, init_options)
+            # Still ahead of cancel_scope.cancel() below, so the other loops are alive and this
+            # runs on the normal (uncancelled) event loop — no anyio shielding needed.
+            await _graceful_forget(cfg)
             tg.cancel_scope.cancel()
 
 

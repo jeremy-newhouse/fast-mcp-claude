@@ -232,6 +232,35 @@ def test_serve_enabled_starts_bridge(patched_serve):
     assert patched_serve == {"presence": 1, "inbox": 1, "tee": 1}
 
 
+# ------------------------------------------------------- ECA-82: graceful forget wiring in _serve
+
+
+def test_serve_calls_graceful_forget_after_server_run(monkeypatch, patched_serve):
+    """_graceful_forget must run once _server.run returns (clean exit) -- verifies the wiring,
+    not _graceful_forget's own internal logic (covered separately below)."""
+    calls = []
+
+    async def fake_graceful_forget(cfg):
+        calls.append(cfg)
+
+    monkeypatch.setattr(channel_mod, "_graceful_forget", fake_graceful_forget)
+    anyio.run(channel_mod._serve, _cfg(enabled=True))
+    assert len(calls) == 1
+
+
+def test_serve_disabled_never_calls_graceful_forget(monkeypatch, patched_serve):
+    # The disabled path returns from its own inert handshake before the bridge (and this call)
+    # are ever reached.
+    calls = []
+
+    async def fake_graceful_forget(cfg):
+        calls.append(cfg)
+
+    monkeypatch.setattr(channel_mod, "_graceful_forget", fake_graceful_forget)
+    anyio.run(channel_mod._serve, _cfg(enabled=False))
+    assert calls == []
+
+
 # ============================================================ two-way + permission relay (v1)
 
 
@@ -1177,4 +1206,121 @@ def test_presence_loop_identity_live_elsewhere_does_not_reconnect(monkeypatch):
         channel_mod._RT = None
 
     assert reconnect_calls == []  # never reconnected — the refusal was handled in place
-    assert client.calls == 3
+
+
+def test_presence_loop_connection_failure_clears_announce_confirmed(monkeypatch):
+    """ECA-82 (finding #4, the split-connection takeover edge): a connection failure must clear
+    announce_confirmed too, not just an explicit IDENTITY_LIVE_ELSEWHERE refusal — otherwise the
+    inbox loop (on its own, separately-connected client) would keep claiming on a stale grant
+    while a competitor wins the identity guard, unaware the presence loop's confirmation lapsed."""
+    cfg = _cfg(enabled=True, heartbeat=0.001)
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    channel_mod._RT.announce_confirmed.set()  # simulate: confirmed right before the connection drop
+
+    def fake_make_client(cfg, timeout=None):
+        return _FlakyAnnounceClient(ConnectionError("dead mesh"))
+
+    monkeypatch.setattr(channel_mod, "_make_client", fake_make_client)
+
+    async def fake_reconnect_sleep(what, exc, backoff):
+        # End the test right after the first failure; the flag must already be cleared by then.
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(channel_mod, "_reconnect_sleep", fake_reconnect_sleep)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(asyncio.wait_for(channel_mod._presence_loop(cfg), timeout=5.0))
+        assert not channel_mod._RT.announce_confirmed.is_set()
+    finally:
+        channel_mod._RT = None
+
+
+# ---------------------------------------------------------- ECA-82: graceful forget on shutdown
+
+
+class _ForgetClient:
+    """Records forget() calls; stands in for the fresh client _make_client returns."""
+
+    def __init__(self, raise_exc=None):
+        self._raise_exc = raise_exc
+        self.calls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def call_tool(self, name, args):
+        self.calls.append((name, args))
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        return _Res({"success": True, "identity": args.get("identity"), "deleted": True})
+
+
+def test_graceful_forget_calls_tool_when_confirmed(monkeypatch):
+    cfg = _cfg(enabled=True, announce_token="tok-A")
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    channel_mod._RT.announce_confirmed.set()
+
+    client = _ForgetClient()
+    monkeypatch.setattr(channel_mod, "_make_client", lambda cfg, timeout=None: client)
+
+    try:
+        asyncio.run(channel_mod._graceful_forget(cfg))
+    finally:
+        channel_mod._RT = None
+
+    assert client.calls == [("forget", {"identity": cfg.identity, "announce_token": "tok-A"})]
+
+
+def test_graceful_forget_skips_when_never_confirmed(monkeypatch):
+    """A refused fork (never confirmed) must never call forget — it never owned the row, so
+    calling would be pointless at best and risky at worst if the token check ever loosened."""
+    cfg = _cfg(enabled=True, announce_token="tok-A")
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    # announce_confirmed deliberately left unset.
+
+    client = _ForgetClient()
+    monkeypatch.setattr(channel_mod, "_make_client", lambda cfg, timeout=None: client)
+
+    try:
+        asyncio.run(channel_mod._graceful_forget(cfg))
+    finally:
+        channel_mod._RT = None
+
+    assert client.calls == []
+
+
+def test_graceful_forget_skips_without_token(monkeypatch):
+    cfg = _cfg(enabled=True, announce_token="")
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    channel_mod._RT.announce_confirmed.set()
+
+    client = _ForgetClient()
+    monkeypatch.setattr(channel_mod, "_make_client", lambda cfg, timeout=None: client)
+
+    try:
+        asyncio.run(channel_mod._graceful_forget(cfg))
+    finally:
+        channel_mod._RT = None
+
+    assert client.calls == []
+
+
+def test_graceful_forget_swallows_errors(monkeypatch):
+    """Best-effort: a broken/unreachable server must never propagate out of shutdown."""
+    cfg = _cfg(enabled=True, announce_token="tok-A")
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    channel_mod._RT.announce_confirmed.set()
+
+    client = _ForgetClient(raise_exc=ConnectionError("mesh unreachable"))
+    monkeypatch.setattr(channel_mod, "_make_client", lambda cfg, timeout=None: client)
+
+    try:
+        asyncio.run(channel_mod._graceful_forget(cfg))  # must not raise
+    finally:
+        channel_mod._RT = None
+
+    assert len(client.calls) == 1

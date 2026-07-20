@@ -73,6 +73,34 @@ async def announce(
 
 @mcp.tool(
     description=(
+        "[Any] Best-effort presence forget on a clean session exit (ECA-82). Requires the "
+        "caller's own announce_token — the row is only deleted if it still carries that "
+        "token, so this can never clobber a different (successor) process's presence. "
+        "Shrinks the owner-token identity guard's claim-latency gap on a graceful relaunch "
+        "(pm2 restart / operator relaunch) down to ~0; a hard crash skips this and still "
+        "waits out the normal freshness window."
+    )
+)
+async def forget(
+    identity: Annotated[str, Field(description="The identity to forget")],
+    announce_token: Annotated[
+        str, Field(description="This process's own announce_token, as sent to announce()")
+    ],
+) -> dict[str, Any]:
+    try:
+        identity = validate_identity(identity)
+        if not isinstance(announce_token, str) or not announce_token:
+            raise ValidationError("announce_token is required", field="announce_token")
+        deleted = await store.forget_presence(identity, expected_token=announce_token)
+        return {"success": True, "identity": identity, "deleted": deleted}
+    except ValidationError as e:
+        return format_error_response(e)
+    except Exception as e:
+        return format_error_response(e)
+
+
+@mcp.tool(
+    description=(
         "[Any] List peers currently present on this server (freshest first). Use "
         "the returned `identity` values as recipient_session in send_prompt to "
         "message a specific peer. stale_seconds drops peers whose last heartbeat "

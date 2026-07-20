@@ -8,6 +8,8 @@ Guidance for Claude Code when working in this repository.
 
 The architecture is intentionally peer-symmetric: every server stores its own inbox/outbox/permissions/pubsub state and exposes the same tools. There is no central hub.
 
+This repo also hosts standalone peer-machine tooling that isn't part of the MCP server itself, each in its own top-level directory with its own README: `worker-supervisor/`, `spawner/`, `sandbox-runner/`, and [`herdr-tmux-shim/`](herdr-tmux-shim/README.md) (opt-in shim so Claude Code's experimental agent-team split panes render as native herdr panes for developers using herdr as their terminal multiplexer — interactive-only, unrelated to `worker-supervisor`'s headless lane spawning).
+
 ## Commands
 
 ```bash

@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""tmux shim for herdr — lets Claude Code agent-team split panes open as herdr panes.
+
+Claude Code's split-pane teammate mode (teammateMode: "tmux") drives tmux via a
+small, fixed set of CLI calls. When this script is first on PATH (see the
+claude-in-herdr launcher) and the caller is inside a herdr-managed pane
+(HERDR_ENV=1), it translates those calls into `herdr pane ...` commands, so
+teammates appear as native herdr panes next to the leader — with herdr's
+agent-status sidebar working for each teammate.
+
+Outside herdr, it transparently execs the real tmux.
+
+Verified against the TmuxBackend in @anthropic-ai/claude-code 2.1.215, which uses:
+  tmux -V
+  tmux -L claude-swarm-<pid> has-session -t claude-swarm
+  tmux -L ... new-session -d -s claude-swarm -n swarm-view -P -F '#{pane_id}' -- cat
+  tmux -L ... list-windows -t claude-swarm -F '#{window_name}'
+  tmux -L ... new-window -t claude-swarm -n swarm-view -P -F '#{pane_id}' -- cat
+  tmux -L ... list-panes -t <win> -F '#{pane_id}'
+  tmux -L ... split-window -d -t <pane> [-h|-v] [-l 70%] -P -F '#{pane_id}' -- cat
+  tmux -L ... select-pane -t <pane> -T <title>
+  tmux -L ... set-option -p -t <pane> window-style|pane-border-format|remain-on-exit ...
+  tmux -L ... set-option -w -t <win> pane-border-status top
+  tmux -L ... respawn-pane -k -t <pane> -- <command string>
+  tmux -L ... select-layout -t <win> tiled|main-vertical
+  tmux -L ... resize-pane -t <pane> -x 30%
+  tmux -L ... kill-pane -t <pane> / kill-session -t <session>
+  tmux [-S sock] display-message [-t pane] -p '#{pane_id}'|'#{window_id}'  (in-tmux path)
+"""
+
+import fcntl
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+
+HERDR_BIN = os.environ.get("HERDR_BIN", "herdr")
+DEBUG = os.environ.get("HERDR_TMUX_SHIM_DEBUG")
+
+
+def log(msg):
+    if DEBUG:
+        with open(os.path.join(tempfile.gettempdir(), "herdr-tmux-shim.log"), "a") as f:
+            f.write(msg + "\n")
+
+
+def real_tmux(argv):
+    """Exec the real tmux (first `tmux` on PATH that isn't this script)."""
+    me = os.path.realpath(__file__)
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        cand = os.path.join(d, "tmux")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK) and os.path.realpath(cand) != me:
+            os.execv(cand, ["tmux"] + argv)
+    sys.stderr.write("tmux: command not found (herdr shim: no real tmux on PATH)\n")
+    sys.exit(127)
+
+
+def herdr(args):
+    p = subprocess.run([HERDR_BIN] + args, capture_output=True, text=True)
+    log(f"herdr {' '.join(args)} -> {p.returncode} {p.stdout.strip()[:200]} {p.stderr.strip()[:200]}")
+    return p
+
+
+def herdr_json(args):
+    p = herdr(args)
+    if p.returncode != 0:
+        raise RuntimeError(f"herdr {' '.join(args)} failed: {p.stderr.strip() or p.stdout.strip()}")
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"herdr returned non-JSON: {p.stdout[:200]}")
+
+
+class State:
+    """Synthetic tmux world (sessions/windows/panes) persisted per socket name."""
+
+    def __init__(self, socket_name):
+        d = os.path.join(tempfile.gettempdir(), f"herdr-tmux-shim-{os.getuid()}")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        self.path = os.path.join(d, f"{socket_name or 'default'}.json")
+        self.lock_path = self.path + ".lock"
+
+    def __enter__(self):
+        self.lock = open(self.lock_path, "w")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        if os.path.exists(self.path):
+            with open(self.path) as f:
+                self.data = json.load(f)
+        else:
+            self.data = {"next": 1, "sessions": {}, "panes": {}}
+        return self
+
+    def __exit__(self, *exc):
+        with open(self.path, "w") as f:
+            json.dump(self.data, f)
+        fcntl.flock(self.lock, fcntl.LOCK_UN)
+        self.lock.close()
+
+    # panes: {"%1": {"herdr": "w1:p2", "window": "sess:win", "occupied": false, "title": ""}}
+    def new_pane_id(self):
+        pid = f"%{self.data['next']}"
+        self.data["next"] += 1
+        return pid
+
+    def panes_in(self, window):
+        return [k for k, v in sorted(self.data["panes"].items(), key=lambda kv: int(kv[0][1:]))
+                if v["window"] == window]
+
+    def resolve(self, target):
+        """tmux -t target -> our pane entry (pane id, window name, or session)."""
+        panes = self.data["panes"]
+        if target in panes:
+            return target
+        # window or session target: last pane in it
+        cands = [k for k, v in sorted(panes.items(), key=lambda kv: int(kv[0][1:]))
+                 if v["window"] == target or v["window"].split(":")[0] == target]
+        return cands[-1] if cands else None
+
+
+def parse_flags(args, flags_with_value):
+    """Split tmux-style args into (opts, positionals, after_ddash)."""
+    opts, pos, rest = {}, [], []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            rest = args[i + 1:]
+            break
+        if a.startswith("-") and len(a) > 1:
+            if a in flags_with_value:
+                opts[a] = args[i + 1]
+                i += 2
+                continue
+            opts[a] = True
+            i += 1
+            continue
+        pos.append(a)
+        i += 1
+    return opts, pos, rest
+
+
+def split_herdr_pane(anchor, direction, ratio=None, focus=False):
+    args = ["pane", "split", "--pane", anchor, "--direction", direction]
+    if ratio:
+        args += ["--ratio", str(ratio)]
+    args += ["--focus"] if focus else ["--no-focus"]
+    resp = herdr_json(args)
+    pane_id = (resp.get("result") or {}).get("pane", {}).get("pane_id")
+    if not pane_id:
+        # tolerate schema variations
+        def find_pane_id(o):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if k == "pane_id" and isinstance(v, str):
+                        return v
+                    r = find_pane_id(v)
+                    if r:
+                        return r
+            elif isinstance(o, list):
+                for v in o:
+                    r = find_pane_id(v)
+                    if r:
+                        return r
+        pane_id = find_pane_id(resp)
+    if not pane_id:
+        raise RuntimeError("could not read pane_id from herdr pane split response")
+    return pane_id
+
+
+def pick_direction(st, window, opts):
+    if opts.get("-h"):
+        return "right"
+    if opts.get("-v"):
+        return "down"
+    # tiled-ish default: alternate by pane count like Claude Code does
+    return "down" if len(st.panes_in(window)) % 2 == 1 else "right"
+
+
+def create_pane(st, window, direction, ratio, anchor_herdr):
+    herdr_id = split_herdr_pane(anchor_herdr, direction, ratio)
+    tid = st.new_pane_id()
+    st.data["panes"][tid] = {"herdr": herdr_id, "window": window, "occupied": False, "title": ""}
+    return tid
+
+
+def main():
+    argv = sys.argv[1:]
+
+    in_herdr = os.environ.get("HERDR_ENV") == "1" and os.environ.get("HERDR_PANE_ID")
+    if not in_herdr:
+        real_tmux(argv)
+
+    # global flags
+    socket_name = "default"
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("-L", "-S"):
+            socket_name = os.path.basename(argv[i + 1])
+            del argv[i:i + 2]
+            continue
+        if argv[i] == "-V":
+            print("tmux 3.5a")
+            return 0
+        if argv[i].startswith("-") and argv[i] not in ("-L", "-S"):
+            i += 1
+            continue
+        break
+
+    if not argv:
+        # bare `tmux` — don't start a server inside herdr
+        sys.stderr.write("herdr tmux shim: interactive tmux not supported inside herdr\n")
+        return 1
+
+    cmd, args = argv[0], argv[1:]
+    anchor = os.environ["HERDR_PANE_ID"]
+
+    with State(socket_name) as st:
+        if cmd == "has-session":
+            opts, _, _ = parse_flags(args, {"-t"})
+            sess = opts.get("-t", "")
+            live = any(v["window"].split(":")[0] == sess for v in st.data["panes"].values())
+            return 0 if live else 1
+
+        if cmd in ("new-session", "new-window"):
+            opts, _, _ = parse_flags(args, {"-t", "-s", "-n", "-F", "-x", "-y", "-c"})
+            sess = opts.get("-s") or opts.get("-t") or "claude-swarm"
+            win = opts.get("-n", "0")
+            window = f"{sess}:{win}"
+            tid = create_pane(st, window, "right", 0.5, anchor)
+            if opts.get("-P"):
+                print(tid)
+            return 0
+
+        if cmd == "list-windows":
+            opts, _, _ = parse_flags(args, {"-t", "-F"})
+            sess = opts.get("-t", "")
+            wins = sorted({v["window"].split(":", 1)[1] for v in st.data["panes"].values()
+                           if v["window"].split(":")[0] == sess})
+            print("\n".join(wins))
+            return 0
+
+        if cmd == "list-panes":
+            opts, _, _ = parse_flags(args, {"-t", "-F"})
+            target = opts.get("-t", "")
+            ids = [k for k in st.panes_in(target)] or \
+                  [k for k, v in st.data["panes"].items() if k == st.resolve(target)]
+            print("\n".join(ids))
+            return 0
+
+        if cmd == "split-window":
+            opts, _, _ = parse_flags(args, {"-t", "-F", "-l", "-c", "-e"})
+            target = opts.get("-t", "")
+            tref = st.resolve(target)
+            base = st.data["panes"][tref]["herdr"] if tref else anchor
+            window = st.data["panes"][tref]["window"] if tref else "claude-swarm:0"
+            ratio = None
+            l = opts.get("-l")
+            if isinstance(l, str) and l.endswith("%"):
+                ratio = int(l[:-1]) / 100.0
+            direction = pick_direction(st, window, opts)
+            tid = create_pane(st, window, direction, ratio, base)
+            if opts.get("-P"):
+                print(tid)
+            return 0
+
+        if cmd == "select-pane":
+            opts, _, _ = parse_flags(args, {"-t", "-T", "-P"})
+            tref = st.resolve(opts.get("-t", ""))
+            title = opts.get("-T")
+            if tref and isinstance(title, str):
+                st.data["panes"][tref]["title"] = title
+                herdr(["pane", "rename", st.data["panes"][tref]["herdr"], title])
+            return 0
+
+        if cmd == "respawn-pane":
+            opts, _, rest = parse_flags(args, {"-t"})
+            tref = st.resolve(opts.get("-t", ""))
+            if not tref:
+                sys.stderr.write("can't find pane\n")
+                return 1
+            entry = st.data["panes"][tref]
+            command = rest[0] if len(rest) == 1 else " ".join(shlex.quote(a) for a in rest)
+            if entry["occupied"]:
+                # -k semantics: replace whatever is running — close and re-split
+                herdr(["pane", "close", entry["herdr"]])
+                neighbors = [v["herdr"] for k, v in st.data["panes"].items()
+                             if k != tref and v["window"] == entry["window"]]
+                entry["herdr"] = split_herdr_pane(neighbors[-1] if neighbors else anchor,
+                                                  "down" if neighbors else "right")
+                if entry["title"]:
+                    herdr(["pane", "rename", entry["herdr"], entry["title"]])
+            p = herdr(["pane", "run", entry["herdr"], command])
+            if p.returncode != 0:
+                sys.stderr.write(p.stderr)
+                return 1
+            entry["occupied"] = True
+            return 0
+
+        if cmd == "send-keys":
+            opts, keys, _ = parse_flags(args, {"-t"})
+            tref = st.resolve(opts.get("-t", ""))
+            if not tref:
+                return 1
+            hid = st.data["panes"][tref]["herdr"]
+            for k in keys:
+                if k in ("Enter", "Escape", "Tab", "Up", "Down", "Left", "Right", "Space") \
+                        or k.startswith(("C-", "M-")):
+                    herdr(["pane", "send-keys", hid, k.lower()])
+                else:
+                    herdr(["pane", "send-text", hid, k])
+            return 0
+
+        if cmd == "kill-pane":
+            opts, _, _ = parse_flags(args, {"-t"})
+            tref = st.resolve(opts.get("-t", ""))
+            if tref:
+                herdr(["pane", "close", st.data["panes"][tref]["herdr"]])
+                del st.data["panes"][tref]
+            return 0
+
+        if cmd == "kill-session":
+            opts, _, _ = parse_flags(args, {"-t"})
+            sess = opts.get("-t", "")
+            for k in [k for k, v in st.data["panes"].items()
+                      if v["window"].split(":")[0] == sess]:
+                herdr(["pane", "close", st.data["panes"][k]["herdr"]])
+                del st.data["panes"][k]
+            return 0
+
+        if cmd == "display-message":
+            opts, _, _ = parse_flags(args, {"-t", "-p", "-F"})
+            fmt = opts.get("-p") if isinstance(opts.get("-p"), str) else \
+                (args[-1] if args else "")
+            if "pane_id" in str(fmt):
+                print(os.environ.get("TMUX_PANE", anchor))
+            elif "window_id" in str(fmt):
+                print("@0")
+            else:
+                print("")
+            return 0
+
+        if cmd in ("set-option", "set-window-option", "select-layout", "resize-pane",
+                   "set-environment", "set-hook", "refresh-client"):
+            return 0  # cosmetic in herdr; herdr manages layout/borders itself
+
+        sys.stderr.write(f"herdr tmux shim: unsupported command: {cmd}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except RuntimeError as e:
+        sys.stderr.write(str(e) + "\n")
+        sys.exit(1)

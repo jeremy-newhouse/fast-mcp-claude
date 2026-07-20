@@ -219,6 +219,10 @@ All tools return `{"success": bool, ...}` or `{"success": false, "error": {"mess
 - **Hook fail-safe**: any error in the permission relay (server down, timeout, parse error) → `permissionDecision: "ask"` → Claude Code's local prompt takes over.
 - **Body-size caps** (see `utils/validation.py`): prompt ≤1MB, response ≤4MB, file ≤10MB, pubsub payload ≤256KB.
 
+## Interactive tooling: herdr-tmux-shim (optional)
+
+[`herdr-tmux-shim/`](herdr-tmux-shim/) is a standalone, **opt-in** shim for developers who run Claude Code interactively inside herdr (a personal terminal-pane manager) panes: it impersonates the `tmux` binary Claude Code's experimental agent-teams (`teammateMode: "tmux"`) shells out to, so teammate split panes open as native herdr panes (with herdr's idle/working/blocked sidebar) instead of a real tmux session. It has nothing to do with the MCP server or `worker-supervisor`'s headless pm2 lane spawning — see [`herdr-tmux-shim/README.md`](herdr-tmux-shim/README.md) for how it works and install steps.
+
 ## Architectural notes
 
 See [CLAUDE.md](CLAUDE.md) for the deep-dive on module layout, the long-poll notifier pattern, and the permission-relay protocol. Highlights:

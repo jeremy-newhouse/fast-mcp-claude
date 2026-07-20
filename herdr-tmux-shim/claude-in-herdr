@@ -1,0 +1,22 @@
+#!/bin/sh
+# Launch Claude Code inside a herdr pane with teammate split panes mapped to herdr.
+#
+# Usage: run this instead of `claude` inside a herdr pane:
+#   claude-in-herdr [claude args...]
+#
+# It prepends the shim directory to PATH (so Claude Code's TmuxBackend talks to
+# the shim, not real tmux) and forces split-pane teammate mode for this session.
+
+set -eu
+
+if [ "${HERDR_ENV:-}" != "1" ] || [ -z "${HERDR_PANE_ID:-}" ]; then
+    echo "claude-in-herdr: not inside a herdr pane; running plain claude" >&2
+    exec claude "$@"
+fi
+
+SHIM_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+# Ensure the shim wins PATH resolution for `tmux` in the claude process only.
+PATH="$SHIM_DIR:$PATH" \
+CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
+exec claude --teammate-mode tmux "$@"

@@ -25,18 +25,18 @@ def build_auth_provider(settings: Settings) -> ApiKeyVerifier | None:
     auth is enabled but no usable key is configured -- the prior fail-open
     behavior silently served every MCP tool to any caller with network access.
     """
-    if settings.mcp_auth_enabled:
-        if not settings.mcp_api_key:
-            raise RuntimeError(
-                "MCP_AUTH_ENABLED=true but MCP_API_KEY is not set (or empty). "
-                "Refusing to start with authentication enabled and no usable key, "
-                "since that would silently serve every MCP tool unauthenticated. "
-                "Set MCP_API_KEY, or explicitly set MCP_AUTH_ENABLED=false for "
-                "local-only use."
-            )
-        return ApiKeyVerifier(api_key=settings.mcp_api_key)
-    logger.warning("MCP_AUTH_ENABLED=false - endpoint is UNAUTHENTICATED")
-    return None
+    if not settings.mcp_auth_enabled:
+        logger.warning("MCP_AUTH_ENABLED=false - endpoint is UNAUTHENTICATED")
+        return None
+    if not settings.mcp_auth_effective:
+        raise RuntimeError(
+            "MCP_AUTH_ENABLED=true but MCP_API_KEY is not set (or empty). "
+            "Refusing to start with authentication enabled and no usable key, "
+            "since that would silently serve every MCP tool unauthenticated. "
+            "Set MCP_API_KEY, or explicitly set MCP_AUTH_ENABLED=false for "
+            "local-only use."
+        )
+    return ApiKeyVerifier(api_key=settings.mcp_api_key)
 
 
 settings = get_settings()

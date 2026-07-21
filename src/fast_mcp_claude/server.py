@@ -11,11 +11,33 @@ from fastmcp import FastMCP
 from fastmcp.server.lifespan import lifespan
 
 from .auth import ApiKeyVerifier
-from .config import get_settings
+from .config import Settings, get_settings
 from .logging_config import get_logger
 from .services.store import Store
 
 logger = get_logger(__name__)
+
+
+def build_auth_provider(settings: Settings) -> ApiKeyVerifier | None:
+    """Decide the FastMCP auth provider, failing closed on misconfiguration.
+
+    Raises RuntimeError instead of starting an unauthenticated server when
+    auth is enabled but no usable key is configured -- the prior fail-open
+    behavior silently served every MCP tool to any caller with network access.
+    """
+    if settings.mcp_auth_enabled:
+        if not settings.mcp_api_key:
+            raise RuntimeError(
+                "MCP_AUTH_ENABLED=true but MCP_API_KEY is not set (or empty). "
+                "Refusing to start with authentication enabled and no usable key, "
+                "since that would silently serve every MCP tool unauthenticated. "
+                "Set MCP_API_KEY, or explicitly set MCP_AUTH_ENABLED=false for "
+                "local-only use."
+            )
+        return ApiKeyVerifier(api_key=settings.mcp_api_key)
+    logger.warning("MCP_AUTH_ENABLED=false - endpoint is UNAUTHENTICATED")
+    return None
+
 
 settings = get_settings()
 
@@ -23,16 +45,7 @@ settings = get_settings()
 store = Store(settings)
 
 # Authentication
-auth_provider: ApiKeyVerifier | None = None
-if settings.mcp_api_key and settings.mcp_auth_enabled:
-    auth_provider = ApiKeyVerifier(api_key=settings.mcp_api_key)
-elif not settings.mcp_auth_enabled:
-    logger.warning("MCP_AUTH_ENABLED=false - endpoint is UNAUTHENTICATED")
-else:
-    logger.warning(
-        "MCP_API_KEY not set - endpoint is UNAUTHENTICATED. "
-        "Set MCP_API_KEY for any non-localhost deployment."
-    )
+auth_provider = build_auth_provider(settings)
 
 
 @lifespan

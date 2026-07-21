@@ -24,7 +24,7 @@ def main() -> None:
             "peer_name": settings.peer_name,
             "host": settings.mcp_host,
             "port": settings.mcp_port,
-            "auth_enabled": settings.mcp_api_key is not None and settings.mcp_auth_enabled,
+            "auth_enabled": settings.mcp_auth_effective,
             "known_peers": [p.name for p in settings.peers],
             "workspace_roots": [str(p) for p in settings.workspace_roots_resolved],
         },

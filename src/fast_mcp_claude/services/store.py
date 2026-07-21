@@ -14,6 +14,7 @@ server process) — that's fine because each peer machine runs its own server.
 """
 
 import asyncio
+import collections
 import json
 import time
 import uuid
@@ -40,8 +41,12 @@ STATUS_EXPIRED = "expired"  # TTL cleanup
 DECISION_ALLOW = "allow"
 DECISION_DENY = "deny"
 
-# Teams-outbox lifecycle (ADR-0013): a peer live session asks the hub to post to Teams.
+# Teams-outbox / session-relay lifecycle (ADR-0013 / ADR-0015): a peer live session asks
+# the hub to post to Teams or perform a session-relay op. pending -> claimed -> done: a
+# drain call atomically claims a row (FMC-12 AC#1/#2) before the hub performs the side
+# effect, so a second concurrent drain call can never observe the same row as claimable.
 OUTBOX_PENDING = "pending"  # created, awaiting the hub controller to drain + post
+OUTBOX_CLAIMED = "claimed"  # atomically claimed by exactly one drain call; not yet completed
 OUTBOX_DONE = "done"  # the hub posted (or failed) and completed the request
 
 
@@ -132,26 +137,54 @@ class Notifier:
     replace it with a fresh one so subsequent waits block again. notify_prefix()
     fans that out across every key sharing a prefix; forget() evicts a resolved
     key once no waiter is parked on it, so _events doesn't grow without bound.
+
+    `inbox:`/`pubsub:` keys are never forgotten by name (FMC-5 assumed they're
+    "bounded by live identities", but recipient_session/channel are validated
+    only for format, not for corresponding to a real identity/channel — FMC-12
+    AC#3). `_events` is therefore an LRU-ordered map capped at `max_events`:
+    once over capacity, the least-recently-used keys with no active waiter are
+    evicted, bounding memory even under an unbounded stream of fabricated keys.
     """
 
-    def __init__(self) -> None:
-        self._events: dict[str, asyncio.Event] = {}
-        # Active wait_for() calls currently parked per key, so forget() can
-        # refuse to evict a key out from under a live waiter (FMC-5 AC#2).
+    def __init__(self, max_events: int = 10_000) -> None:
+        self._events: "collections.OrderedDict[str, asyncio.Event]" = collections.OrderedDict()
+        # Active wait_for() calls currently parked per key, so forget() (and the
+        # capacity eviction below) can refuse to evict a key out from under a
+        # live waiter (FMC-5 AC#2).
         self._waiters: dict[str, int] = {}
+        self._max_events = max_events
 
     def _get(self, key: str) -> asyncio.Event:
         ev = self._events.get(key)
-        if ev is None:
-            ev = asyncio.Event()
-            self._events[key] = ev
+        if ev is not None:
+            self._events.move_to_end(key)
+            return ev
+        ev = asyncio.Event()
+        self._events[key] = ev
+        self._evict_if_over_capacity()
         return ev
+
+    def _evict_if_over_capacity(self) -> None:
+        """Bound `_events` (FMC-12 AC#3): evict least-recently-used keys with no
+        active waiter until back at capacity. A key someone is actively parked
+        on is never evicted regardless of capacity, mirroring forget()'s guard.
+        """
+        if len(self._events) <= self._max_events:
+            return
+        for key in list(self._events):
+            if len(self._events) <= self._max_events:
+                return
+            if self._waiters.get(key, 0) > 0:
+                continue
+            self._events.pop(key, None)
+            self._waiters.pop(key, None)
 
     def notify(self, key: str) -> None:
         ev = self._events.get(key)
         if ev is not None:
             ev.set()
             self._events[key] = asyncio.Event()
+            self._events.move_to_end(key)
 
     def notify_prefix(self, prefix: str) -> None:
         """Notify every key currently registered under `prefix`.
@@ -186,6 +219,12 @@ class Notifier:
 
         Returns the first non-None result from `check()`, or None on timeout.
         """
+        if timeout <= 0:
+            # Never going to wait on the event, so never create/register one —
+            # a caller hammering a fabricated key with timeout=0 must not leak a
+            # permanent Notifier entry per call (FMC-12 AC#3).
+            return await check()
+
         # Capture the event reference BEFORE checking DB so we don't miss a
         # notification that arrives between check and wait.
         ev = self._get(key)
@@ -193,9 +232,6 @@ class Notifier:
         result = await check()
         if result is not None:
             return result
-
-        if timeout <= 0:
-            return None
 
         deadline = time.monotonic() + timeout
         self._waiters[key] = self._waiters.get(key, 0) + 1
@@ -570,13 +606,32 @@ class Store:
         return request_id
 
     async def list_pending_teams_sends(self, limit: int = 50) -> list[dict[str, Any]]:
-        cur = await self.db.execute(
-            "SELECT * FROM teams_outbox WHERE status=? ORDER BY created_at ASC LIMIT ?",
-            (OUTBOX_PENDING, limit),
-        )
-        rows = await cur.fetchall()
-        await cur.close()
-        return [_row_to_teams_send(r) for r in rows]
+        """Atomically claim (pending -> claimed) the oldest pending teams-sends this
+        caller observes, mirroring pop_next_for_worker's select+update-in-one-critical-
+        section pattern. Without this, two concurrent hub drain calls could both see
+        (and both act on) the same row — e.g. posting the same Teams message twice
+        (FMC-12 AC#1).
+        """
+        async with self._db_lock:
+            cur = await self.db.execute(
+                "SELECT * FROM teams_outbox WHERE status=? ORDER BY created_at ASC LIMIT ?",
+                (OUTBOX_PENDING, limit),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            if not rows:
+                return []
+            ids = [row["id"] for row in rows]
+            placeholders = ",".join("?" * len(ids))
+            await self.db.execute(
+                f"UPDATE teams_outbox SET status=? WHERE status=? AND id IN ({placeholders})",
+                (OUTBOX_CLAIMED, OUTBOX_PENDING, *ids),
+            )
+            await self.db.commit()
+        claimed = [_row_to_teams_send(r) for r in rows]
+        for c in claimed:
+            c["status"] = OUTBOX_CLAIMED
+        return claimed
 
     async def wait_for_pending_teams_sends(
         self, timeout: float, limit: int = 50
@@ -596,8 +651,16 @@ class Store:
         async with self._db_lock:
             cur = await self.db.execute(
                 "UPDATE teams_outbox SET status=?, ok=?, detail=?, completed_at=? "
-                "WHERE id=? AND status=?",
-                (OUTBOX_DONE, 1 if ok else 0, detail, time.time(), request_id, OUTBOX_PENDING),
+                "WHERE id=? AND status IN (?, ?)",
+                (
+                    OUTBOX_DONE,
+                    1 if ok else 0,
+                    detail,
+                    time.time(),
+                    request_id,
+                    OUTBOX_PENDING,
+                    OUTBOX_CLAIMED,
+                ),
             )
             await self.db.commit()
             updated = cur.rowcount
@@ -661,13 +724,32 @@ class Store:
         return request_id
 
     async def list_pending_session_ops(self, limit: int = 50) -> list[dict[str, Any]]:
-        cur = await self.db.execute(
-            "SELECT * FROM session_relay WHERE status=? ORDER BY created_at ASC LIMIT ?",
-            (OUTBOX_PENDING, limit),
-        )
-        rows = await cur.fetchall()
-        await cur.close()
-        return [_row_to_session_op(r) for r in rows]
+        """Atomically claim (pending -> claimed) the oldest pending session-relay ops
+        this caller observes, mirroring pop_next_for_worker's select+update-in-one-
+        critical-section pattern. Without this, two concurrent hub drain calls could
+        both see (and both act on) the same row — e.g. re-routing/re-executing the
+        same session-relay send twice (FMC-12 AC#2).
+        """
+        async with self._db_lock:
+            cur = await self.db.execute(
+                "SELECT * FROM session_relay WHERE status=? ORDER BY created_at ASC LIMIT ?",
+                (OUTBOX_PENDING, limit),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            if not rows:
+                return []
+            ids = [row["id"] for row in rows]
+            placeholders = ",".join("?" * len(ids))
+            await self.db.execute(
+                f"UPDATE session_relay SET status=? WHERE status=? AND id IN ({placeholders})",
+                (OUTBOX_CLAIMED, OUTBOX_PENDING, *ids),
+            )
+            await self.db.commit()
+        claimed = [_row_to_session_op(r) for r in rows]
+        for c in claimed:
+            c["status"] = OUTBOX_CLAIMED
+        return claimed
 
     async def wait_for_pending_session_ops(
         self, timeout: float, limit: int = 50
@@ -687,7 +769,7 @@ class Store:
         async with self._db_lock:
             cur = await self.db.execute(
                 "UPDATE session_relay SET status=?, ok=?, result=?, completed_at=? "
-                "WHERE id=? AND status=?",
+                "WHERE id=? AND status IN (?, ?)",
                 (
                     OUTBOX_DONE,
                     1 if ok else 0,
@@ -695,6 +777,7 @@ class Store:
                     time.time(),
                     request_id,
                     OUTBOX_PENDING,
+                    OUTBOX_CLAIMED,
                 ),
             )
             await self.db.commit()
@@ -990,13 +1073,21 @@ class Store:
                 "DELETE FROM approvals WHERE decision IS NOT NULL AND created_at<?",
                 (cutoff,),
             )
-            # Expire stale pending teams-sends (so they don't dangle in the pending set),
-            # then delete completed ones. Same mark-then-delete sweep as messages above; at the
-            # 7-day TTL no awaiter is still waiting, so this is hygiene, not a wake path.
+            # Expire stale pending/claimed teams-sends (so they don't dangle forever —
+            # including a row claimed by a drain call that crashed before completing,
+            # FMC-12), then delete completed ones. Same mark-then-delete sweep as
+            # messages above; at the 7-day TTL no awaiter is still waiting, so this is
+            # hygiene, not a wake path.
             await self.db.execute(
                 "UPDATE teams_outbox SET status=?, ok=0, detail=? "
-                "WHERE status=? AND created_at<?",
-                (OUTBOX_DONE, "expired: no hub pickup in time", OUTBOX_PENDING, cutoff),
+                "WHERE status IN (?, ?) AND created_at<?",
+                (
+                    OUTBOX_DONE,
+                    "expired: no hub pickup in time",
+                    OUTBOX_PENDING,
+                    OUTBOX_CLAIMED,
+                    cutoff,
+                ),
             )
             cur = await self.db.execute(
                 "SELECT id FROM teams_outbox WHERE status=? AND created_at<?",
@@ -1008,14 +1099,16 @@ class Store:
                 "DELETE FROM teams_outbox WHERE status=? AND created_at<?",
                 (OUTBOX_DONE, cutoff),
             )
-            # Same mark-then-delete hygiene for the session-relay queue.
+            # Same mark-then-delete hygiene for the session-relay queue (pending and
+            # claimed alike — see the teams_outbox comment above, FMC-12).
             await self.db.execute(
                 "UPDATE session_relay SET status=?, ok=0, result=? "
-                "WHERE status=? AND created_at<?",
+                "WHERE status IN (?, ?) AND created_at<?",
                 (
                     OUTBOX_DONE,
                     '{"error": "expired: no hub pickup in time"}',
                     OUTBOX_PENDING,
+                    OUTBOX_CLAIMED,
                     cutoff,
                 ),
             )

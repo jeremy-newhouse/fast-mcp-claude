@@ -7,7 +7,7 @@ import asyncio
 
 import pytest
 
-from fast_mcp_claude.services.store import OUTBOX_DONE, OUTBOX_PENDING, Store
+from fast_mcp_claude.services.store import OUTBOX_CLAIMED, OUTBOX_DONE, Store
 from fast_mcp_claude.tools.session_relay import complete_session_op, request_session_op
 from fast_mcp_claude.utils.validation import MAX_METADATA_BYTES
 
@@ -22,7 +22,9 @@ async def test_round_trip_send(store: Store):
 
     pending = await store.list_pending_session_ops()
     assert [p["id"] for p in pending] == [rid]
-    assert pending[0]["status"] == OUTBOX_PENDING
+    # list_pending_session_ops atomically claims the row (FMC-12 AC#2): it is no
+    # longer bare "pending" once a drain call has observed it.
+    assert pending[0]["status"] == OUTBOX_CLAIMED
     assert pending[0]["op"] == "send"
     assert pending[0]["requester"] == "mini2.frontend"
     assert pending[0]["payload"]["target"] == "mbpm2.backend"
@@ -56,6 +58,23 @@ async def test_list_op_no_payload(store: Store):
     assert pending[0]["id"] == rid
     assert pending[0]["op"] == "list"
     assert pending[0]["payload"] is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_drain_claims_op_exactly_once(store: Store):
+    """Regression (FMC-12 AC#2): two concurrent hub-side drain calls racing for the
+    same pending row must not both observe it as claimable — pre-fix, list_pending_
+    session_ops was a bare SELECT with no claim step, so both concurrent callers
+    would see (and both act on, e.g. re-route/re-execute) the same row. Combined
+    across both calls, the row must surface exactly once."""
+    rid = await store.create_session_op(requester="r", op="list")
+
+    results = await asyncio.gather(
+        store.list_pending_session_ops(),
+        store.list_pending_session_ops(),
+    )
+    claimed_ids = [p["id"] for lst in results for p in lst]
+    assert claimed_ids == [rid]  # not [], and not [rid, rid]
 
 
 @pytest.mark.asyncio
@@ -98,6 +117,18 @@ async def test_cleanup_removes_stale_pending(store: Store):
     await store._cleanup_once(cutoff=2000.0)
     assert await store.get_session_op(rid) is None
     assert await store.list_pending_session_ops() == []
+
+
+@pytest.mark.asyncio
+async def test_cleanup_removes_stale_claimed(store: Store):
+    """Regression (FMC-12): a row claimed by a drain call that then crashed before
+    completing must not dangle in the claimed state forever -- cleanup's stale-expiry
+    sweep must catch CLAIMED rows too, not just PENDING ones."""
+    rid = await store.create_session_op(requester="r", op="list")
+    await store.list_pending_session_ops()  # claims it; hub then "crashes" (never completes)
+    await store.db.execute("UPDATE session_relay SET created_at=? WHERE id=?", (1000.0, rid))
+    await store._cleanup_once(cutoff=2000.0)
+    assert await store.get_session_op(rid) is None
 
 
 @pytest.mark.asyncio

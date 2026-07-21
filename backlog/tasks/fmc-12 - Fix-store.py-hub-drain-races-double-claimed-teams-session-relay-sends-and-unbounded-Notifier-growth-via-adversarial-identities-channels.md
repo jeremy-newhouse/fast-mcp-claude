@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@jeremy'
 created_date: '2026-07-21 14:44'
-updated_date: '2026-07-21 18:44'
+updated_date: '2026-07-21 18:56'
 labels:
   - reliability
   - store
@@ -115,6 +115,24 @@ uv run ruff check src/ tests/ clean. ruff format flags the same pre-existing
 drift class already documented in FMC-4/6/8/14/11 (confirmed store.py's drift
 predates this branch via git show dev:... | ruff format --check); none of my
 touched files (store.py aside, which was already drifting) are newly flagged.
+
+Adversarial subagent review (general-purpose agent, full branch diff dev...HEAD)
+confirmed the core atomic-claim fix (AC#1/#2), the widened completion guard,
+the timeout<=0 short-circuit, and the CLAIMED-row cleanup expiry are all
+correct with no double-claim/double-completion paths, and confirmed the new
+tests trace back to the pre-fix behavior. It also found one real, low-severity
+gap: Notifier.wait_for bumped the active-waiter refcount for `key` only AFTER
+its first `await check()`, not in the same synchronous stretch as _get(key) --
+during that await, a flood of unrelated _get() calls (e.g. concurrent traffic
+fabricating fresh keys) could evict `key`'s just-registered Event before this
+waiter was ever counted as active, since a freshly-inserted, never-revisited
+key is the LRU eviction candidate the moment anything else gets inserted after
+it. Fixed by moving the refcount bump into the same synchronous stretch as
+_get(), before the first check(). Added
+test_wait_for_key_survives_capacity_eviction_during_its_own_check
+(test_storage.py); confirmed via a manual revert-and-rerun that this test fails
+against the pre-review-fix ordering and passes against the corrected ordering.
+Full suite now 327 passed (up from 326); ruff check clean.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
@@ -132,10 +150,20 @@ timeout<=0, closing the cheap/unlimited-rate fabricated-identity DoS vector;
 Notifier._events is now an LRU-capped OrderedDict (default 10_000) that evicts
 least-recently-used, non-actively-waited keys once over capacity, bounding
 growth generally while never evicting a key a live long-poll is parked on.
-Added 11 tests (326 total, up from 315); every new/changed assertion confirmed
-via git stash to fail against the pre-fix code (including a standalone script
-reproducing the literal double-claim) and pass against the fix. Full suite
-passes; ruff check clean; ruff format's pre-existing drift on store.py (and
-other files) confirmed to predate this branch, per the FMC-4/6/8/14/11
-precedent. All 4 ACs checked.
+
+An adversarial subagent review of the full branch diff confirmed the core
+atomicity/completion/cleanup logic is correct, and caught one real gap: the
+waiter refcount that protects a key from capacity eviction was bumped after
+wait_for's first check() rather than in the same synchronous stretch as
+_get(), leaving a narrow window where a flood of concurrent _get() calls
+could evict a just-registered key before it counted as actively waited.
+Fixed, with a dedicated regression test confirmed (via manual revert) to fail
+against the pre-fix ordering.
+
+Added 12 tests total (327 in the suite, up from 315); every new/changed
+assertion confirmed via git stash to fail against the pre-fix code (including
+a standalone script reproducing the literal double-claim) and pass against the
+fix. Full suite passes; ruff check clean; ruff format's pre-existing drift on
+store.py confirmed to predate this branch, per the FMC-4/6/8/14/11 precedent.
+All 4 ACs checked.
 <!-- SECTION:FINAL_SUMMARY:END -->

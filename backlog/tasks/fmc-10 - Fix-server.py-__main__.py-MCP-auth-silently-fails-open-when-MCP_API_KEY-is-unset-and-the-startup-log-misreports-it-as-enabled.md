@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@jeremy-newhouse'
 created_date: '2026-07-21 14:44'
-updated_date: '2026-07-21 17:10'
+updated_date: '2026-07-21 17:16'
 labels:
   - security
   - auth
@@ -63,6 +63,8 @@ Together these mean: a server can start, log that authentication is enabled, and
 Deviated from step 4 of the recorded plan: instead of reloading fast_mcp_claude.server under monkeypatched env vars (risks leaving sys.modules in a broken state on a raise mid-reload), extracted the auth decision into a plain function server.build_auth_provider(settings) that takes a Settings instance directly -- trivially unit-testable with settings_factory, no reload/import gymnastics. Added Settings.mcp_auth_effective (config.py) as the single source of truth both build_auth_provider() and __main__.py's startup log now read, so the two can't independently drift again the way 'mcp_api_key and mcp_auth_enabled' vs 'mcp_api_key is not None and mcp_auth_enabled' did.
 
 Verification: added tests/test_server.py (8 tests). Confirmed they fail against the pre-fix code -- git stash of src/fast_mcp_claude/{server,config,__main__}.py (keeping the new test file) produces an ImportError at collection (build_auth_provider/mcp_auth_effective don't exist yet), not a pass. Restored the fix and reran: 'uv run pytest tests/test_server.py -v' -> 8 passed. Full suite: 'uv run pytest' -> 298 passed (up from 290 pre-branch). 'uv run ruff check src/ tests/' -> All checks passed. 'uv run ruff format --check' on the 4 touched files -> already formatted.
+
+Post-implementation review (adversarial subagent pass, general-purpose agent): no blocking findings. Two minor findings addressed: (1) build_auth_provider re-derived the auth-effective logic by hand instead of delegating to the new mcp_auth_effective property it claimed was the single source of truth -- reordered to check mcp_auth_enabled first, then raise off settings.mcp_auth_effective directly, so there's exactly one place that computes this. (2) .env.example's auth comment was now stale (implied unset-key-with-default-auth-enabled was a supported 'unauthenticated on 127.0.0.1' mode) -- updated to state the server now refuses to start in that config. Checked and left out of scope: launcher.py:1453's cfg.mcp_auth_enabled/cfg.mcp_api_key_present check is a separate LauncherConfig snapshot for a different CLI process (fast-mcp-claude-launcher checking a peer's remote auth posture before spawning), not Settings itself -- not a drift risk this task should touch. Also noted as a candidate follow-up, not fixed here (not part of the 2 described bugs): a whitespace-only MCP_API_KEY (e.g. " ") is still treated as a valid key by both mcp_auth_effective and build_auth_provider since bool(" ") is True. Re-verified after these changes: 'uv run pytest' 298 passed, 'uv run ruff check'/'format --check' clean.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

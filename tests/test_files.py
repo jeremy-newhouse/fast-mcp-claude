@@ -194,6 +194,19 @@ class TestReadFileToctou:
         assert result["success"] is True
         assert result["content"] == "hello world"
 
+    async def test_reads_file_at_exact_size_cap(self, sandbox):
+        from fast_mcp_claude.utils.validation import MAX_FILE_BYTES
+
+        root, _ = sandbox
+        f = root / "big.txt"
+        f.write_bytes(b"x" * MAX_FILE_BYTES)
+
+        result = await files_mod.read_file(path=str(f))
+
+        assert result["success"] is True
+        assert result["size"] == MAX_FILE_BYTES
+        assert len(result["content"]) == MAX_FILE_BYTES
+
 
 class TestWriteFileToctou:
     async def test_swapped_target_file_fails_closed(self, sandbox, monkeypatch):
@@ -235,6 +248,19 @@ class TestWriteFileToctou:
 
         assert result["success"] is True
         assert target.read_text() == "written"
+
+    async def test_writes_content_at_exact_size_cap(self, sandbox):
+        from fast_mcp_claude.utils.validation import MAX_FILE_BYTES
+
+        root, _ = sandbox
+        target = root / "big.txt"
+        content = "x" * MAX_FILE_BYTES
+
+        result = await files_mod.write_file(path=str(target), content=content)
+
+        assert result["success"] is True
+        assert result["bytes_written"] == MAX_FILE_BYTES
+        assert target.stat().st_size == MAX_FILE_BYTES
 
     async def test_overwrite_false_still_refuses_existing_file(self, sandbox):
         root, _ = sandbox

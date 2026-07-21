@@ -3,9 +3,11 @@ id: FMC-16
 title: >-
   Fix launcher.py: unbounded subprocess output buffering, an incomplete
   process-group kill, and a startup race that can bypass the approval gate
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@claude'
 created_date: '2026-07-21 14:44'
+updated_date: '2026-07-21 22:20'
 labels:
   - security
   - launcher
@@ -31,8 +33,46 @@ Discovered by a second-opinion review (OpenAI Codex, gpt-5.6-sol, ultra effort) 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A spawned claude -p task that produces a very large volume of stdout and/or stderr no longer causes the launcher process's memory usage to grow unbounded while that subprocess is running or awaiting its timeout; output is bounded/streamed as it is produced rather than being fully accumulated in memory and only truncated after the fact, and other tasks running concurrently in the same launcher process are unaffected by one task's excessive output.
-- [ ] #2 When a spawned task's process group must be killed (per-task timeout or launcher shutdown), the kill sequence verifies that every process in that group has actually exited before considering the kill complete, not only the group leader; if any process in the group (including one that ignored SIGTERM or re-parented out of the group) is still alive after the SIGTERM grace period, a group-wide SIGKILL is sent so the group cannot outlive the intended per-task timeout or the launcher's own shutdown sequence.
-- [ ] #3 When the approval hook is enabled, the inbox-claiming bridge does not claim and spawn gated tasks until the approval relay's unix domain socket is confirmed open and accepting connections, so a hook call cannot fall back to an unsupervised "ask" decision (and thereby silently ride an existing --allowedTools grant) purely because the relay had not finished starting yet; additionally, if the relay task dies or exits at any point after startup, the launcher detects this condition (rather than continuing silently) and stops claiming new gated tasks until the relay is confirmed healthy again.
-- [ ] #4 All three fixes above are covered by automated tests: a test demonstrating bounded memory/output handling for a subprocess that produces oversized stdout/stderr, a test proving a SIGTERM-resistant or re-parented child in the same process group is force-killed within the grace period even when the group leader itself exits promptly, and a test proving the bridge cannot claim/spawn gated tasks before the approval relay is confirmed listening and that a relay-task crash after startup is detected rather than silently ignored.
+- [x] #1 A spawned claude -p task that produces a very large volume of stdout and/or stderr no longer causes the launcher process's memory usage to grow unbounded while that subprocess is running or awaiting its timeout; output is bounded/streamed as it is produced rather than being fully accumulated in memory and only truncated after the fact, and other tasks running concurrently in the same launcher process are unaffected by one task's excessive output.
+- [x] #2 When a spawned task's process group must be killed (per-task timeout or launcher shutdown), the kill sequence verifies that every process in that group has actually exited before considering the kill complete, not only the group leader; if any process in the group (including one that ignored SIGTERM or re-parented out of the group) is still alive after the SIGTERM grace period, a group-wide SIGKILL is sent so the group cannot outlive the intended per-task timeout or the launcher's own shutdown sequence.
+- [x] #3 When the approval hook is enabled, the inbox-claiming bridge does not claim and spawn gated tasks until the approval relay's unix domain socket is confirmed open and accepting connections, so a hook call cannot fall back to an unsupervised "ask" decision (and thereby silently ride an existing --allowedTools grant) purely because the relay had not finished starting yet; additionally, if the relay task dies or exits at any point after startup, the launcher detects this condition (rather than continuing silently) and stops claiming new gated tasks until the relay is confirmed healthy again.
+- [x] #4 All three fixes above are covered by automated tests: a test demonstrating bounded memory/output handling for a subprocess that produces oversized stdout/stderr, a test proving a SIGTERM-resistant or re-parented child in the same process group is force-killed within the grace period even when the group leader itself exits promptly, and a test proving the bridge cannot claim/spawn gated tasks before the approval relay is confirmed listening and that a relay-task crash after startup is detected rather than silently ignored.
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. AC#1 (unbounded output): replace proc.communicate() in _run_claude with two concurrent
+   _read_capped() reader tasks (new helper, deque-based rolling TAIL window per stream,
+   O(cap) memory) capped at a new MAX_SUBPROCESS_OUTPUT_BYTES module constant (4 MiB);
+   drain them post-exit/post-kill via a new _drain_capped() bounded by _READ_DRAIN_TIMEOUT_S.
+2. AC#2 (group kill): add _group_alive() (os.killpg(pgid, 0) existence probe) and rewrite
+   _kill_group to poll the WHOLE group's liveness (not just lp.proc.wait() on the leader)
+   for up to KILL_GRACE_S before SIGKILL.
+3. AC#3 (relay startup race): give _approval_relay_server a `ready` Event set once the unix
+   socket is bound+listening; add _run_approval_relay_supervised to run it under a
+   restart-with-backoff supervisor that tracks a `relay_healthy` Event (set only while
+   confirmed listening, cleared on any crash/exit); _bridge gains an optional
+   relay_healthy param and a new _wait_for_relay_healthy_or_reconnect helper, gating
+   claim/spawn both pre-poll and post-poll (mirroring the existing owner_confirmed
+   dual-check pattern) -- deliberately no "give up" escape valve, unlike the owner-token
+   gate, since AC#3's whole point is failing closed forever if the relay can't come up.
+4. AC#4: regression tests in tests/test_launcher.py for all three, each confirmed via
+   git stash to fail against pre-fix code (missing symbols / wrong arity) and pass post-fix.
+5. Adversarial subagent review of the full branch diff before opening the PR (this
+   campaign's established requirement for concurrency/security-boundary fixes).
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented and verified locally: full suite 373 passed (up from 367), ruff check clean, ruff format drift confirmed pre-existing (identical before/after via git stash) and untouched. All 6 new regression tests confirmed via git stash to fail against pre-fix launcher.py and pass post-fix.
+
+Adversarial subagent review of the full branch diff (this campaign's established requirement for concurrency/security-boundary fixes) found 1 blocking + 1 test-quality issue, both fixed: (1) _group_alive only caught ProcessLookupError from os.killpg(pgid, 0), but the reviewer directly reproduced a PermissionError (EPERM) from that exact line under a pgid-recycling race during the polling window -- an uncaught exception that aborted _kill_group before its SIGKILL fallback ever ran, silently defeating AC#2's own guarantee. Fixed by catching (ProcessLookupError, PermissionError) in both _group_alive and the final SIGKILL call; added a dedicated regression test (test_group_alive_treats_permission_error_as_not_alive). (2) The new AC#2 regression test's timing budget (timeout_s=0.2/KILL_GRACE_S=0.3) was too tight for a fresh python3 interpreter to reach os.fork() before the launcher's own timeout fired, making the test flaky when run in isolation/cold-cache (reviewer reproduced 30/30 failures standalone despite passing within the full suite due to warm page cache) -- fixed by matching the proven-reliable budget of the sibling test_spawn_timeout_kills_group (timeout_s=0.5/KILL_GRACE_S=0.5); reverified 15/15 passes in isolation.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Fixed all 3 launcher.py bugs (AC#1-3). AC#1: _run_claude now streams stdout/stderr through a new _read_capped() (deque-based rolling TAIL window, O(cap) memory) capped at MAX_SUBPROCESS_OUTPUT_BYTES=4MiB per stream, replacing proc.communicate()'s full-buffer read; drained post-exit via a bounded _drain_capped(). AC#2: _kill_group now polls group-wide liveness via a new _group_alive() (os.killpg(pgid,0) existence probe, treating both ProcessLookupError and PermissionError as 'gone') for up to KILL_GRACE_S instead of only awaiting the group leader, force-SIGKILLing the group if a grandchild (e.g. same-pgid double-fork survivor) is still alive. AC#3: _approval_relay_server gained a 'ready' Event set once its unix socket is confirmed bound+listening; a new _run_approval_relay_supervised() runs it under a restart-with-backoff supervisor tracking a 'relay_healthy' Event; _bridge gained an optional relay_healthy param gating gated-task claiming both pre-poll and in a post-poll residual recheck (mirroring the existing owner-token gate's dual-check pattern), with a dedicated _wait_for_relay_healthy_or_reconnect() helper that races reconnect_needed but deliberately has NO abandon-and-proceed escape valve (unlike the owner-token gate) since AC#3's entire purpose is failing closed forever on a persistently-unreachable relay. AC#4: added 8 regression tests (test_read_capped_keeps_tail_not_head, test_read_capped_returns_everything_under_cap, test_run_claude_bounds_stdout_stderr_below_cap, test_spawn_timeout_force_kills_lingering_group_member_after_leader_exits, test_group_alive_treats_permission_error_as_not_alive, test_bridge_blocks_then_resumes_claiming_on_relay_health, test_relay_supervisor_detects_crash_and_restarts), every one confirmed via git stash to fail against pre-fix launcher.py and pass post-fix. An adversarial subagent review of the full branch diff found and fixed 1 blocking bug (_group_alive's missing PermissionError handling, directly reproduced) and 1 flaky-test timing issue (fixed, reverified 15/15 stable in isolation) -- see implementation notes. Verified: full suite 374 passed (up from 367), uv run ruff check src/ tests/ clean; ruff format drift confirmed pre-existing (identical via git stash before/after this branch's changes) and untouched, same class already documented on FMC-4/6/8/9/11/12/13/14/15.
+<!-- SECTION:FINAL_SUMMARY:END -->

@@ -39,6 +39,17 @@ Correctness invariants (do not "simplify" away):
   * SCRUBBED ENV. The spawned worker does NOT inherit MCP_API_KEY or CRM_* vars (the
     mesh bearer); it keeps HOME/PATH/etc. Tasks run in their own process group so a
     timeout can SIGTERM/SIGKILL the whole group.
+  * BOUNDED OUTPUT. A task's stdout/stderr are streamed and capped (MAX_SUBPROCESS_OUTPUT_
+    BYTES per stream, a rolling tail window — see `_read_capped`) as they're produced,
+    never accumulated fully in memory; a runaway task's output can't OOM the process.
+  * GROUP-WIDE KILL. On timeout, `_kill_group` verifies the WHOLE process group has
+    exited (polling `_group_alive`, not just the leader) before considering the kill
+    complete, force-SIGKILLing the group if a grandchild outlives the SIGTERM grace.
+  * RELAY-READY GATE (Phase 3). When the approval hook is enabled, gated-task claiming
+    blocks until the approval relay's unix socket is confirmed listening, and stops again
+    if the relay ever dies mid-run — see `_run_approval_relay_supervised` and
+    `_wait_for_relay_healthy_or_reconnect`. An unreachable relay makes the worker hook fall
+    back to "ask", which does NOT override-deny a tool already covered by --allowedTools.
 
 Config (CLI flag, else env, else Settings/.env default):
     --enabled/--no-enabled / LAUNCHER_ENABLED   arm the poll/spawn loop
@@ -63,6 +74,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,8 +86,23 @@ from .utils.validation import SESSION_RE
 VERSION_PROBE_TIMEOUT_S = 10.0
 # Grace between SIGTERM and SIGKILL when killing a task's process group.
 KILL_GRACE_S = 10.0
+# Cadence for probing whether any process is still alive in a killed process group during
+# the SIGTERM grace period. There is no asyncio primitive for "wait for a process GROUP"
+# (only for our single direct child), so we poll group-wide existence instead.
+_KILL_POLL_INTERVAL_S = 0.2
 # Tail of stderr kept on the reply (bytes), before the global reply budget trims more.
 STDERR_TAIL_BYTES = 8192
+# Max bytes of a spawned task's stdout/stderr retained in memory at any time (a rolling
+# TAIL window per stream) while the process is producing output. Bounds the launcher's
+# memory regardless of how much a runaway/misbehaving task emits, instead of the previous
+# proc.communicate(), which read each stream fully to EOF before anything was truncated.
+MAX_SUBPROCESS_OUTPUT_BYTES = 4 * 1024 * 1024
+# Grace period, once a subprocess has exited or been force-killed, for its bounded
+# stdout/stderr reader tasks to observe pipe EOF and hand back their buffered tail.
+_READ_DRAIN_TIMEOUT_S = 5.0
+# Backoff for restarting the approval-relay server if it exits or crashes after startup.
+_RELAY_RESTART_BACKOFF_S = 1.0
+_RELAY_RESTART_BACKOFF_MAX_S = 30.0
 # Env vars stripped from the spawned worker's environment (mesh bearer must not leak).
 _SCRUB_ENV_EXACT = ("MCP_API_KEY",)
 _SCRUB_ENV_PREFIX = ("CRM_",)
@@ -728,6 +755,54 @@ class _LiveProc:
     pgid: int | None
 
 
+async def _read_capped(stream: Any, cap: int) -> bytes:
+    """Read `stream` to EOF, retaining only the LAST `cap` bytes seen (a rolling tail
+    window) instead of accumulating the full stream in memory. Memory held is O(cap) at
+    any time regardless of total stream size -- the fix for AC#1's unbounded
+    proc.communicate() buffering (the ONLY place output was previously bounded was AFTER
+    communicate() returned, in the reply-shaping step, by which point the full buffers
+    already existed).
+
+    Downstream truncation is already tail-oriented (stderr_tail takes the last
+    STDERR_TAIL_BYTES of stdout/stderr; _truncate_middle keeps head+tail of the parsed
+    *result* field), so keeping the tail here preserves exactly the bytes that already
+    matter for a legitimate task's reply. A task whose raw output exceeds `cap` was never
+    going to round-trip through parse_claude_json as valid JSON anyway and already falls
+    back to its is_error=True path.
+    """
+    if stream is None:
+        return b""
+    chunks: deque[bytes] = deque()
+    total = 0
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        while chunks and total - len(chunks[0]) >= cap:
+            total -= len(chunks.popleft())
+    data = b"".join(chunks)
+    return data[-cap:] if len(data) > cap else data
+
+
+async def _drain_capped(
+    stdout_task: "asyncio.Task[bytes]", stderr_task: "asyncio.Task[bytes]"
+) -> tuple[bytes, bytes]:
+    """Best-effort collect the bounded reader tasks once the process has exited (or been
+    force-killed): their pipes reach EOF shortly after, but this must never hang a task
+    handler or shutdown indefinitely."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.gather(stdout_task, stderr_task), timeout=_READ_DRAIN_TIMEOUT_S
+        )
+    except (asyncio.TimeoutError, Exception):
+        for t in (stdout_task, stderr_task):
+            if not t.done():
+                t.cancel()
+        return (b"", b"")
+
+
 async def _run_claude(
     env: TaskEnvelope,
     cfg: LauncherConfig,
@@ -735,7 +810,11 @@ async def _run_claude(
 ) -> RunResult:
     """Spawn `claude -p ...` in its own process group, enforce a wall-clock timeout.
 
-    On timeout: SIGTERM the process GROUP, wait KILL_GRACE_S, then SIGKILL the group.
+    stdout/stderr are streamed and capped as they're produced (AC#1, see _read_capped)
+    rather than accumulated fully via proc.communicate().
+
+    On timeout: SIGTERM the process GROUP, wait KILL_GRACE_S, then SIGKILL the group
+    (AC#2, see _kill_group).
     """
     cmd = _build_cmd(env, cfg)
     started = time.monotonic()
@@ -755,15 +834,24 @@ async def _run_claude(
     live.add(lp)
     _log(f"spawned pid={proc.pid} pgid={pgid} cwd={env.cwd} timeout={env.timeout_s}s")
 
+    stdout_task = asyncio.ensure_future(_read_capped(proc.stdout, MAX_SUBPROCESS_OUTPUT_BYTES))
+    stderr_task = asyncio.ensure_future(_read_capped(proc.stderr, MAX_SUBPROCESS_OUTPUT_BYTES))
+
     timed_out = False
     try:
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=env.timeout_s)
+            await asyncio.wait_for(proc.wait(), timeout=env.timeout_s)
         except asyncio.TimeoutError:
             timed_out = True
             _log(f"pid={proc.pid} timed out after {env.timeout_s}s; killing process group")
             await _kill_group(lp)
-            stdout_b, stderr_b = await _drain(proc)
+            # _kill_group guarantees no process remains in the group; reap the leader
+            # (bounded defensively) so proc.returncode is populated.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_READ_DRAIN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                pass
+        stdout_b, stderr_b = await _drain_capped(stdout_task, stderr_task)
     finally:
         live.discard(lp)
 
@@ -772,21 +860,49 @@ async def _run_claude(
         exit_code=proc.returncode,
         timed_out=timed_out,
         duration_s=duration,
-        stdout=(stdout_b or b"").decode("utf-8", "replace"),
-        stderr=(stderr_b or b"").decode("utf-8", "replace"),
+        stdout=stdout_b.decode("utf-8", "replace"),
+        stderr=stderr_b.decode("utf-8", "replace"),
     )
 
 
 async def _drain(proc: Any) -> tuple[bytes, bytes]:
-    """Best-effort collect any remaining output after a kill."""
+    """Best-effort collect any remaining output after a kill (used only by the approval-hook
+    self-test's throwaway subprocess, whose output is small and launcher-controlled --
+    AC#1's unbounded-buffering concern is specific to arbitrary spawned TASKS, see
+    _read_capped)."""
     try:
         return await asyncio.wait_for(proc.communicate(), timeout=5.0)
     except (asyncio.TimeoutError, Exception):
         return (b"", b"")
 
 
+def _group_alive(pgid: int) -> bool:
+    """True if any process still belongs to process group `pgid`. Signal 0 is a pure
+    existence probe -- no signal is actually delivered; os.killpg raises
+    ProcessLookupError (ESRCH) once no process in that group remains.
+
+    Also treat PermissionError (EPERM) as "not alive": our own spawned descendants are
+    always same-uid, so we always have permission to signal them; EPERM here means the OS
+    has already recycled this pgid for an unrelated process we never spawned (a narrow but
+    real pgid-reuse race under the polling window this function enables) -- there is
+    nothing of OURS left to find, and we must never risk signaling a process group we
+    don't actually own.
+    """
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 async def _kill_group(lp: _LiveProc) -> None:
-    """SIGTERM the process group, grace, then SIGKILL the group."""
+    """SIGTERM the process group, then verify the WHOLE group -- not just the leader --
+    has exited within the grace period before considering the kill complete (AC#2). There
+    is no asyncio primitive for "wait for a process group" (only for our single direct
+    child), so we poll group-wide existence via _group_alive. A grandchild that ignores
+    SIGTERM, or the leader itself lingering, is force-killed with a group-wide SIGKILL if
+    anything is still alive once the grace period elapses.
+    """
     if lp.pgid is None:
         try:
             lp.proc.terminate()
@@ -802,14 +918,19 @@ async def _kill_group(lp: _LiveProc) -> None:
         os.killpg(lp.pgid, signal.SIGTERM)
     except ProcessLookupError:
         return
-    try:
-        await asyncio.wait_for(lp.proc.wait(), timeout=KILL_GRACE_S)
+    deadline = time.monotonic() + KILL_GRACE_S
+    while True:
+        if not _group_alive(lp.pgid):
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(_KILL_POLL_INTERVAL_S, remaining))
+    if not _group_alive(lp.pgid):
         return
-    except asyncio.TimeoutError:
-        pass
     try:
         os.killpg(lp.pgid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
 
 
@@ -1176,12 +1297,46 @@ async def _wait_for_owner_confirmed_or_reconnect(
                     pass
 
 
-async def _bridge(cfg: LauncherConfig) -> None:
+async def _wait_for_relay_healthy_or_reconnect(
+    relay_healthy: "asyncio.Event",
+    reconnect_needed: "asyncio.Event",
+) -> None:
+    """Block until the approval relay is confirmed healthy (AC#3), or abort with
+    _ReconnectNeeded if the heartbeat gives up on THIS mesh connection first -- a relay
+    outage must never wedge `_bridge` behind a dead mesh session it should instead be
+    reconnecting from (mirrors `_wait_for_owner_confirmed_or_reconnect`'s race). Unlike
+    that gate, there is deliberately no "give up waiting" branch here -- see
+    `_run_approval_relay_supervised`'s docstring for why blocking forever on a
+    persistently-unhealthy relay is the CORRECT fail-closed behavior for AC#3, not a bug.
+    """
+    if relay_healthy.is_set():
+        return
+    healthy = asyncio.ensure_future(relay_healthy.wait())
+    dead = asyncio.ensure_future(reconnect_needed.wait())
+    try:
+        await asyncio.wait({healthy, dead}, return_when=asyncio.FIRST_COMPLETED)
+        if not relay_healthy.is_set():
+            raise _ReconnectNeeded()
+    finally:
+        for fut in (healthy, dead):
+            if not fut.done():
+                fut.cancel()
+                try:
+                    await fut
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+
+async def _bridge(cfg: LauncherConfig, relay_healthy: "asyncio.Event | None" = None) -> None:
     """Connect to the local server and pump inbox -> spawn until cancelled.
 
     Reconnect-with-backoff on transport errors (mirrors channel.py). On each
     reconnect we re-run the stale reaper before claiming, since a transport blip
     could have left a delivered row half-handled.
+
+    `relay_healthy` (AC#3, None when the approval hook is disabled) gates gated-task
+    claiming on the approval relay being confirmed up — see `_run_approval_relay_supervised`
+    and `_wait_for_relay_healthy_or_reconnect`.
     """
     from fastmcp import Client
 
@@ -1259,6 +1414,14 @@ async def _bridge(cfg: LauncherConfig) -> None:
                             owner_confirmed, reconnect_needed, owner_wait_abandoned
                         )
                         continue
+                    if relay_healthy is not None and not relay_healthy.is_set():
+                        # AC#3: never claim/spawn a gated task while the approval relay isn't
+                        # confirmed listening — an unreachable relay makes the worker hook fall
+                        # back to "ask", which does NOT override-deny a tool already covered by
+                        # --allowedTools, so a call in this window would run completely ungated.
+                        sem.release()
+                        await _wait_for_relay_healthy_or_reconnect(relay_healthy, reconnect_needed)
+                        continue
                     try:
                         res = await _wait_for_instruction_or_reconnect(c, cfg, reconnect_needed)
                     except Exception:
@@ -1287,6 +1450,22 @@ async def _bridge(cfg: LauncherConfig) -> None:
                             box,
                             mid,
                             json.dumps({"ok": False, "error": "launcher_identity_uncertain"}),
+                        )
+                        sem.release()
+                        continue
+                    if relay_healthy is not None and not relay_healthy.is_set():
+                        # AC#3 residual (mirrors the owner-token check above):
+                        # wait_for_instruction already claims the message server-side before
+                        # returning, so a relay crash discovered WHILE this poll was in flight
+                        # can still surface a real message here even though the relay is no
+                        # longer healthy. We cannot un-claim it, but we can bounce it rather
+                        # than spawn it ungated.
+                        mid = str(msg.get("id", ""))
+                        _log(f"claimed {mid} but the approval relay is unhealthy; bouncing")
+                        await _send_reply(
+                            box,
+                            mid,
+                            json.dumps({"ok": False, "error": "launcher_relay_unavailable"}),
                         )
                         sem.release()
                         continue
@@ -1584,9 +1763,14 @@ async def _handle_relay_conn(
 
 
 async def _approval_relay_server(
-    cfg: LauncherConfig, stop: "asyncio.Event", sem: "asyncio.Semaphore"
+    cfg: LauncherConfig, stop: "asyncio.Event", sem: "asyncio.Semaphore", ready: "asyncio.Event"
 ) -> None:
-    """Listen on the launcher-owned unix socket and relay worker-hook approvals until stop."""
+    """Listen on the launcher-owned unix socket and relay worker-hook approvals until stop.
+
+    Sets `ready` once the socket is confirmed bound and accepting connections (AC#3), so a
+    supervisor (see `_run_approval_relay_supervised`) can gate gated-task claiming on actual
+    listening state rather than on this coroutine having merely been scheduled.
+    """
     sock_path = cfg.approval_socket_path
     Path(sock_path).parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -1601,6 +1785,7 @@ async def _approval_relay_server(
     except OSError:
         pass
     _log(f"approval relay listening on {sock_path}")
+    ready.set()
     try:
         await stop.wait()
     finally:
@@ -1613,6 +1798,58 @@ async def _approval_relay_server(
             os.unlink(sock_path)
         except FileNotFoundError:
             pass
+
+
+async def _run_approval_relay_supervised(
+    cfg: LauncherConfig,
+    stop: "asyncio.Event",
+    relay_sem: "asyncio.Semaphore",
+    relay_healthy: "asyncio.Event",
+) -> None:
+    """Keep the approval relay server running until `stop`, restarting it with backoff if it
+    exits or crashes early (AC#3).
+
+    `relay_healthy` mirrors the server's actual up/down state -- SET only once THIS run's
+    socket is confirmed bound+listening, CLEARED the instant it stops being so -- so
+    `_bridge` can gate gated-task claiming on it instead of assuming a background task that
+    was merely STARTED is actually listening and staying up.
+
+    Unlike the ECA-71 owner-token gate (`_wait_for_owner_confirmed_or_reconnect`), there is
+    deliberately no "give up waiting" escape valve for a persistently-failing relay: that
+    gate's fallback exists because pre-ECA-71 behavior was to proceed with no gate at all
+    (a rare-duplicate-instance backstop), whereas AC#3's entire purpose is the operator's
+    explicit request to gate every tool call -- so a relay that can never come up must keep
+    blocking gated-task claiming forever, not fail open.
+    """
+    backoff = _RELAY_RESTART_BACKOFF_S
+    while not stop.is_set():
+        ready = asyncio.Event()
+        server = asyncio.create_task(_approval_relay_server(cfg, stop, relay_sem, ready))
+        ready_wait = asyncio.ensure_future(ready.wait())
+        try:
+            await asyncio.wait({ready_wait, server}, return_when=asyncio.FIRST_COMPLETED)
+            if ready.is_set():
+                relay_healthy.set()
+                backoff = _RELAY_RESTART_BACKOFF_S
+            await server  # already done => returns/raises now; else blocks until stop/crash
+        except asyncio.CancelledError:
+            raise  # propagate OUR OWN cancellation (e.g. _serve shutting down) untouched
+        except Exception as e:
+            _log(f"approval relay error: {e}")
+        finally:
+            relay_healthy.clear()
+            for fut in (ready_wait, server):
+                if not fut.done():
+                    fut.cancel()
+                    try:
+                        await fut
+                    except (asyncio.CancelledError, Exception):
+                        pass
+        if stop.is_set():
+            return
+        _log(f"approval relay not running; retrying in {backoff:.0f}s")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, _RELAY_RESTART_BACKOFF_MAX_S)
 
 
 # ----------------------------------------------------------------- serve / main
@@ -1693,13 +1930,19 @@ async def _serve(cfg: LauncherConfig) -> None:
 
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
-    bridge_task = asyncio.create_task(_bridge(cfg))
     # Approval relay: the launcher (holding the bearer) serves the worker-hook socket so the
-    # worker never receives a mesh credential it could use to self-approve.
+    # worker never receives a mesh credential it could use to self-approve. relay_healthy
+    # (AC#3) is created BEFORE the bridge so it always reflects the relay's real state; the
+    # bridge gates gated-task claiming on it (never on task-creation order alone).
     relay_task: asyncio.Task | None = None
+    relay_healthy: asyncio.Event | None = None
     if cfg.approval_hook_enabled:
+        relay_healthy = asyncio.Event()
         relay_sem = asyncio.Semaphore(cfg.max_concurrent)
-        relay_task = asyncio.create_task(_approval_relay_server(cfg, stop, relay_sem))
+        relay_task = asyncio.create_task(
+            _run_approval_relay_supervised(cfg, stop, relay_sem, relay_healthy)
+        )
+    bridge_task = asyncio.create_task(_bridge(cfg, relay_healthy))
 
     def _request_stop() -> None:
         stop.set()

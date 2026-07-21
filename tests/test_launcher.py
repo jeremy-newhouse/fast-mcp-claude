@@ -676,7 +676,9 @@ async def test_relay_socket_roundtrip_hook_to_launcher(monkeypatch):
 
 
 async def _approval_relay_server_with_sem(cfg, stop):
-    await L._approval_relay_server(cfg, stop, asyncio.Semaphore(cfg.max_concurrent))
+    await L._approval_relay_server(
+        cfg, stop, asyncio.Semaphore(cfg.max_concurrent), asyncio.Event()
+    )
 
 
 # ================================================================ scrubbed env
@@ -843,6 +845,165 @@ async def test_spawn_timeout_kills_group(tmp_path):
     assert run.timed_out is True
     assert run.exit_code is not None  # process reaped (killed)
     assert live == set()  # cleaned up
+
+
+# ============================================================ FMC-16: bounded output (AC#1)
+
+
+async def test_read_capped_keeps_tail_not_head():
+    """_read_capped must retain the TAIL of an oversized stream, not the head — matching
+    downstream stderr_tail slicing (run.stderr[-STDERR_TAIL_BYTES:]) and _truncate_middle's
+    own tail-preserving truncation of the parsed result."""
+
+    class _FakeStream:
+        def __init__(self, chunks):
+            self._chunks = list(chunks)
+
+        async def read(self, n):
+            return self._chunks.pop(0) if self._chunks else b""
+
+    chunks = [f"L{i:04d}".encode() for i in range(50)]  # 50 * 5 = 250 bytes total
+    data = await L._read_capped(_FakeStream(chunks), cap=25)
+    assert len(data) == 25
+    assert data == b"".join(chunks)[-25:]
+    assert b"L0000" not in data
+    assert b"L0049" in data
+
+
+async def test_read_capped_returns_everything_under_cap():
+    class _FakeStream:
+        def __init__(self, chunks):
+            self._chunks = list(chunks)
+
+        async def read(self, n):
+            return self._chunks.pop(0) if self._chunks else b""
+
+    data = await L._read_capped(_FakeStream([b"hello ", b"world"]), cap=1000)
+    assert data == b"hello world"
+
+
+async def test_run_claude_bounds_stdout_stderr_below_cap(tmp_path):
+    """AC#1 regression: RunResult.stdout/stderr must be bounded to
+    MAX_SUBPROCESS_OUTPUT_BYTES even though the subprocess emits far more — proving output
+    is capped AS PRODUCED, not merely truncated after a full in-memory accumulation. Pre-fix,
+    RunResult carried the subprocess's ENTIRE unbounded proc.communicate() buffer (only the
+    later reply-shaping step truncated it); this asserts the bound at the RunResult layer
+    itself, before any reply-shaping ever runs."""
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    body = (
+        "import sys\n"
+        "for i in range(200):\n"
+        "    sys.stdout.write('L%04d-' % i + 'x' * 60 + chr(10))\n"
+        "    sys.stderr.write('E%04d-' % i + 'x' * 60 + chr(10))\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.flush()\n"
+    )
+    claude = _write_fake_claude(bin_dir, body)  # ~13.4KB total per stream
+    cfg = _cfg(cwd_allowlist=[cwd.resolve()], claude_bin=claude)
+    import fast_mcp_claude.launcher as mod
+
+    old_cap = mod.MAX_SUBPROCESS_OUTPUT_BYTES
+    mod.MAX_SUBPROCESS_OUTPUT_BYTES = 8192  # well below the ~13.4KB emitted per stream
+    try:
+        env = L.TaskEnvelope(
+            task="huge", cwd=str(cwd), allowed_tools=[], model=None, timeout_s=10.0
+        )
+        live: set = set()
+        run = await L._run_claude(env, cfg, live)
+    finally:
+        mod.MAX_SUBPROCESS_OUTPUT_BYTES = old_cap
+    assert run.timed_out is False
+    assert run.exit_code == 0
+    assert len(run.stdout.encode("utf-8")) <= 8192
+    assert len(run.stderr.encode("utf-8")) <= 8192
+    # Tail preserved, head discarded (matches _read_capped's rolling-tail-window design).
+    assert "L0000-" not in run.stdout
+    assert "L0199-" in run.stdout
+    assert "E0000-" not in run.stderr
+    assert "E0199-" in run.stderr
+
+
+# ======================================================== FMC-16: group-wide kill (AC#2)
+
+
+async def test_spawn_timeout_force_kills_lingering_group_member_after_leader_exits(tmp_path):
+    """AC#2 regression: the OLD code's grace-period wait only awaited the group LEADER
+    (lp.proc.wait()) and returned as soon as IT exited, skipping the follow-up SIGKILL
+    entirely. Here the leader dies quickly on SIGTERM (default disposition, no handler)
+    while a forked child in the SAME process group ignores SIGTERM and keeps running — the
+    fix must detect the group still isn't empty and force-kill it within the grace period."""
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "child_pid"
+    body = (
+        "import os, signal, time\n"
+        f"MARKER = {str(marker)!r}\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    with open(MARKER, 'w') as f:\n"
+        "        f.write(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "else:\n"
+        "    time.sleep(30)\n"  # leader also blocks; dies promptly on SIGTERM (default action)
+    )
+    claude = _write_fake_claude(bin_dir, body)
+    cfg = _cfg(cwd_allowlist=[cwd.resolve()], claude_bin=claude)
+    import fast_mcp_claude.launcher as mod
+
+    old_grace, old_poll = mod.KILL_GRACE_S, mod._KILL_POLL_INTERVAL_S
+    # Matches the sibling test_spawn_timeout_kills_group's proven-reliable budget: a fresh
+    # `env python3` interpreter needs real headroom to start up and reach os.fork() before
+    # the timeout fires, or the leader gets SIGTERMed before ever forking the child.
+    mod.KILL_GRACE_S = 0.5
+    mod._KILL_POLL_INTERVAL_S = 0.02
+    try:
+        env = L.TaskEnvelope(
+            task="orphan", cwd=str(cwd), allowed_tools=[], model=None, timeout_s=0.5
+        )
+        live: set = set()
+        run = await L._run_claude(env, cfg, live)
+    finally:
+        mod.KILL_GRACE_S = old_grace
+        mod._KILL_POLL_INTERVAL_S = old_poll
+    assert run.timed_out is True
+    for _ in range(50):
+        if marker.exists():
+            break
+        await asyncio.sleep(0.02)
+    assert marker.exists(), "forked child never started"
+    child_pid = int(marker.read_text())
+    for _ in range(50):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        pytest.fail("SIGTERM-ignoring child in the same process group was never force-killed")
+
+
+def test_group_alive_treats_permission_error_as_not_alive(monkeypatch):
+    """Adversarial-review finding on this branch: os.killpg(pgid, 0) can raise
+    PermissionError (EPERM), not just ProcessLookupError, if the pgid has already been
+    recycled by the OS for an unrelated process during _kill_group's polling window. Our
+    own spawned descendants are always same-uid (we never have permission trouble with our
+    own children), so EPERM here means nothing of OURS remains — _group_alive must treat
+    it the same as ProcessLookupError, not let it propagate uncaught (which would abort
+    _kill_group before its SIGKILL fallback ever runs) or risk signaling a process group we
+    don't actually own."""
+
+    def boom(pgid, sig):
+        raise PermissionError("Operation not permitted")
+
+    monkeypatch.setattr(L.os, "killpg", boom)
+    assert L._group_alive(999999) is False
 
 
 async def test_spawn_missing_binary_replies_spawn_failed(tmp_path):
@@ -1210,6 +1371,81 @@ async def test_bridge_bounces_message_claimed_after_mid_poll_refusal(monkeypatch
     assert len(replies) == 1
     assert replies[0]["message_id"] == "b" * 32
     assert json.loads(replies[0]["response"])["error"] == "launcher_identity_uncertain"
+
+
+# ============================================================ FMC-16: relay-readiness gate (AC#3)
+
+
+async def test_bridge_blocks_then_resumes_claiming_on_relay_health(monkeypatch):
+    """AC#3: the bridge must not call wait_for_instruction (i.e. must not claim/spawn a
+    gated task) while relay_healthy is unset, even though ownership is already confirmed —
+    and must resume claiming once relay_healthy becomes set."""
+    calls: list[str] = []
+
+    class _Client:
+        async def call_tool(self, name, args):
+            calls.append(name)
+            if name == "announce":
+                return FakeClient._Res({"success": True})
+            if name == "list_messages":
+                return FakeClient._Res({"success": True, "messages": []})
+            if name == "wait_for_instruction":
+                return FakeClient._Res({"success": True, "message": None})
+            raise AssertionError(f"unexpected call {name!r}")
+
+    class _Conn:
+        async def __aenter__(self):
+            return _Client()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("fastmcp.Client", lambda *a, **kw: _Conn())
+    cfg = _cfg(identity="mini2_launcher", heartbeat=0.01, poll=0.01, approval_hook_enabled=True)
+    relay_healthy = asyncio.Event()  # never set yet
+    task = asyncio.create_task(L._bridge(cfg, relay_healthy))
+    await asyncio.sleep(0.15)
+    assert "announce" in calls
+    assert "wait_for_instruction" not in calls  # never claims while relay is unhealthy
+    relay_healthy.set()
+    await asyncio.sleep(0.15)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert "wait_for_instruction" in calls  # resumes once relay is confirmed healthy
+
+
+async def test_relay_supervisor_detects_crash_and_restarts(monkeypatch):
+    """AC#3: if the relay task dies after startup, relay_healthy must go False (the pre-fix
+    bug: relay health was never tracked past startup, so a mid-lifetime crash went
+    completely undetected), and the supervisor must restart it with backoff, confirming
+    healthy again once the restarted server signals ready."""
+    attempts = {"n": 0}
+
+    async def fake_relay_server(cfg, stop, sem, ready):
+        attempts["n"] += 1
+        ready.set()
+        if attempts["n"] == 1:
+            await asyncio.sleep(0.05)
+            raise RuntimeError("relay crashed")
+        await stop.wait()
+
+    monkeypatch.setattr(L, "_approval_relay_server", fake_relay_server)
+    monkeypatch.setattr(L, "_RELAY_RESTART_BACKOFF_S", 0.05)
+    stop = asyncio.Event()
+    relay_healthy = asyncio.Event()
+    sem = asyncio.Semaphore(2)
+    cfg = _cfg(approval_hook_enabled=True)
+    task = asyncio.create_task(L._run_approval_relay_supervised(cfg, stop, sem, relay_healthy))
+    await asyncio.wait_for(relay_healthy.wait(), timeout=1.0)
+    async with asyncio.timeout(1.0):
+        while relay_healthy.is_set():
+            await asyncio.sleep(0.01)
+    assert attempts["n"] == 1  # crashed; not yet restarted
+    await asyncio.wait_for(relay_healthy.wait(), timeout=1.0)  # restarted, healthy again
+    assert attempts["n"] == 2
+    stop.set()
+    await asyncio.wait_for(task, timeout=1.0)
 
 
 # ================================================================ FMC-15: reply survives reconnect

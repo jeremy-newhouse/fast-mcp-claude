@@ -170,7 +170,10 @@ async def write_file(
                         field="path",
                     )
                 os.ftruncate(fd, 0)
-                os.write(fd, encoded)
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
         except FileExistsError as e:
             raise PermissionDeniedError(
                 f"file exists and overwrite=false: {resolved}",

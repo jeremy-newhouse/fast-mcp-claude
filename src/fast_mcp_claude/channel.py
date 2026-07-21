@@ -77,6 +77,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Any
@@ -291,6 +292,16 @@ class _Runtime:
     consecutive_nonconsumption: int = 0
     degraded: bool = False
     degraded_status_ts: float | None = None
+    # ECA-83 finding #1/#3: last time this process observed ANY permission-request round trip
+    # (one per tool call), regardless of whether it came from a channel-pushed turn or the
+    # operator's own local turn. Wired via --permission-mode default + the channel's own MCP
+    # experimental capability, NOT the SessionStart/UserPromptSubmit/Stop status-file hook chain
+    # -- so it evidences life on a per-tool-call cadence (closing finding #1's gap, where a long
+    # turn ahead in the queue only bumps the status file once, at its own start) and independent
+    # of whether the status-file hooks are even wired for this host (finding #2/#4).
+    last_activity_ts: float | None = None
+    degraded_activity_ts: float | None = None
+    hookless_warning_logged: bool = False
 
 
 # Populated by _serve before any loop or tool handler runs.
@@ -661,18 +672,36 @@ def _maybe_rearm(cfg: ChannelConfig, rt: "_Runtime") -> None:
     snapshotted at degrade time, the consumer is live again — clear degraded and reset the
     non-consumption count so the next heartbeat re-advertises channel=true and claiming resumes.
     The operator's own local turns bump updated_at regardless of whether a channel push does
-    (spike #2), so this re-arm signal is reliable."""
+    (spike #2), so this re-arm signal is reliable.
+
+    ECA-83 finding #3: on a host whose status-file hooks never fire at all (hookless launch,
+    finding #4's scenario), updated_at never advances and this re-arm path alone can never fire
+    -- a genuinely PERMANENT degrade until process restart. Also re-arming off `last_activity_ts`
+    (any permission-request round trip since degrade time) narrows that: it fires on the
+    operator's very next local tool call, independent of the status-file hook chain. Does not
+    fully close the gap -- an attended session that degrades and then makes zero further tool
+    calls stays degraded, same as before."""
     if not rt.degraded:
         return
     now_ts = _status_updated_at(cfg)
     base = rt.degraded_status_ts
-    if now_ts is not None and (base is None or now_ts > base):
+    status_advanced = now_ts is not None and (base is None or now_ts > base)
+    activity_base = rt.degraded_activity_ts
+    activity_advanced = rt.last_activity_ts is not None and (
+        activity_base is None or rt.last_activity_ts > activity_base
+    )
+    if status_advanced or activity_advanced:
+        reason = (
+            f"status file advanced (updated_at {base} -> {now_ts})"
+            if status_advanced
+            else "permission-request activity observed since degrade"
+        )
         _log(
-            f"re-arming identity={cfg.identity!r}: status file advanced "
-            f"(updated_at {base} -> {now_ts}); consumer live again, resuming claims"
+            f"re-arming identity={cfg.identity!r}: {reason}; consumer live again, resuming claims"
         )
         rt.degraded = False
         rt.degraded_status_ts = None
+        rt.degraded_activity_ts = None
         rt.consecutive_nonconsumption = 0
 
 
@@ -705,14 +734,20 @@ _DEAD = "dead"  # POSITIVE non-consumption evidence -> bounce + count toward deg
 _UNKNOWN = "unknown"  # ambiguous timeout -> do NOT bounce (leave un-finalized; late reply wins)
 
 
-async def _await_consumption(cfg: ChannelConfig, rt: "_Runtime", baseline_ts: float | None) -> str:
+async def _await_consumption(
+    cfg: ChannelConfig,
+    rt: "_Runtime",
+    baseline_ts: float | None,
+    baseline_activity_ts: float | None = None,
+) -> str:
     """Classify how a pushed message ended (ECA-71 Layer C). Returns:
 
       _CONSUMED  — the agent replied (reply_event set).
       _DEAD      — POSITIVE evidence the consumer never processed it: only the fast liveness
-                   signal produces this (status file present + no updated_at advance within
-                   liveness_window_s of the push -> the consumer is not loaded / parked). Safe to
-                   bounce: a genuinely dead consumer won't later produce a real reply to clobber.
+                   signal produces this (status file present + no updated_at advance AND no
+                   permission-request activity within liveness_window_s of the push -> the
+                   consumer is not loaded / parked). Safe to bounce: a genuinely dead consumer
+                   won't later produce a real reply to clobber.
       _UNKNOWN   — the reply budget elapsed but we have NO death evidence (fast signal off, or a
                    live-but-slow turn whose status DID advance). We must NOT bounce here: mesh
                    reply() FINALIZES the message, so a real late reply would be discarded by
@@ -720,7 +755,19 @@ async def _await_consumption(cfg: ChannelConfig, rt: "_Runtime", baseline_ts: fl
                    message un-finalized (pre-ECA-71 behavior) so a late real reply still lands.
 
     The fast path requires a status file — without one there is no liveness signal, so we cannot
-    tell dead from slow and fall back to the ambiguous (never-bounce) path."""
+    tell dead from slow and fall back to the ambiguous (never-bounce) path.
+
+    ECA-83 finding #1: the status file's updated_at only bumps once per turn (on its own
+    UserPromptSubmit/Stop), not once per tool call — so a push queued behind an already-running
+    LONG turn (local or otherwise) sees no status advance within the window even though that
+    turn is provably alive and working, and gets false-bounced as _DEAD, discarding the real
+    reply once it eventually lands (record_reply's CAS drops a reply to an already-finalized
+    message). `rt.last_activity_ts` (stamped on every permission-request round trip, independent
+    of the status-file hook chain) closes that gap: a turn making tool calls generates one of
+    these per call, so `activity_advanced` below sees life long before its Stop hook ever fires.
+    This narrows, not eliminates: a turn with genuinely no further tool-call activity in the
+    window (e.g. one very long single tool call already in flight) still relies on the
+    status-file signal alone, unchanged from before."""
     fast = cfg.liveness_check_enabled and bool(cfg.status_file)
     if not fast:
         try:
@@ -735,11 +782,29 @@ async def _await_consumption(cfg: ChannelConfig, rt: "_Runtime", baseline_ts: fl
     except asyncio.TimeoutError:
         pass
     now_ts = _status_updated_at(cfg)
-    advanced = now_ts is not None and (baseline_ts is None or now_ts > baseline_ts)
-    if not advanced:
+    status_advanced = now_ts is not None and (baseline_ts is None or now_ts > baseline_ts)
+    activity_advanced = rt.last_activity_ts is not None and (
+        baseline_activity_ts is None or rt.last_activity_ts > baseline_activity_ts
+    )
+    if not (status_advanced or activity_advanced):
+        if now_ts is None and cfg.status_file and not rt.hookless_warning_logged:
+            # ECA-83 finding #4: a status_file PATH is configured but has NEVER reported an
+            # updated_at — the SessionStart/UserPromptSubmit/Stop hooks are most likely not
+            # wired for this process (e.g. launched outside start-session.sh), so the fast
+            # signal silently sees every push as dead. One-time, not per-bounce: this is a
+            # standing host misconfiguration, not a new event each time.
+            rt.hookless_warning_logged = True
+            _log(
+                f"WARNING: channel_liveness_check_enabled with status_file={cfg.status_file!r} "
+                "configured, but it has never reported an updated_at. The SessionStart/"
+                "UserPromptSubmit/Stop hooks may not be wired for this process — every push "
+                "will false-bounce as dead until the hooks are installed (see start-session.sh) "
+                "or the file starts reporting. (ECA-83 finding #4)"
+            )
         return _DEAD  # no reply, no sign of life within the window -> dead/parked consumer
-    # Consumer is alive (status advanced) but slow: give it the remaining budget. If it still
-    # doesn't reply it is slow, NOT dead -> ambiguous (don't bounce/clobber a working turn).
+    # Consumer is alive (status or activity advanced) but slow: give it the remaining budget.
+    # If it still doesn't reply it is slow, NOT dead -> ambiguous (don't bounce/clobber a
+    # working turn).
     remaining = max(0.0, cfg.reply_timeout - cfg.liveness_window_s)
     try:
         await asyncio.wait_for(rt.reply_event.wait(), timeout=remaining)
@@ -858,10 +923,13 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                     rt.inflight = msg
                     rt.reply_event = asyncio.Event()
                     baseline_ts = _status_updated_at(cfg)  # snapshot BEFORE the push (Layer C)
+                    baseline_activity_ts = rt.last_activity_ts  # ECA-83 finding #1 companion signal
                     await _push(write_stream, msg)
                     _log(f"pushed message {msg.get('id')} from {msg.get('sender')}; awaiting reply")
                     try:
-                        verdict = await _await_consumption(cfg, rt, baseline_ts)
+                        verdict = await _await_consumption(
+                            cfg, rt, baseline_ts, baseline_activity_ts
+                        )
                     finally:
                         rt.inflight = None
                     # A reply may have raced in right at the boundary — treat that as consumed.
@@ -891,6 +959,7 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                     if rt.consecutive_nonconsumption >= cfg.degrade_after and not rt.degraded:
                         rt.degraded = True
                         rt.degraded_status_ts = _status_updated_at(cfg)
+                        rt.degraded_activity_ts = rt.last_activity_ts
                         _log(
                             f"DEGRADING identity={cfg.identity!r}: "
                             f"{rt.consecutive_nonconsumption} consecutive non-consumptions. "
@@ -1394,6 +1463,13 @@ async def _route_approval(
 
 
 async def _handle_permission(write_stream: Any, cfg: ChannelConfig, params: dict[str, Any]) -> None:
+    # ECA-83 finding #1/#3: every permission-request round trip — whether it belongs to a
+    # channel-pushed turn or the operator's own local turn (the `inflight is None` branch below)
+    # — is positive evidence this process's Claude Code session is alive and working. Stamped
+    # unconditionally, before any early return, since even an auto-allowed call is still activity.
+    assert _RT is not None
+    _RT.last_activity_ts = time.monotonic()
+
     request_id = params.get("request_id") or params.get("requestId") or params.get("id")
     tool_name = str(params.get("tool_name") or "?")
     description = str(params.get("description") or "")
@@ -1405,7 +1481,6 @@ async def _handle_permission(write_stream: Any, cfg: ChannelConfig, params: dict
         await _send_permission(write_stream, request_id, "allow")
         return
 
-    assert _RT is not None
     inflight = _RT.inflight
     if inflight is None:
         # No channel turn in flight => this is the operator's OWN local work. Stay silent;

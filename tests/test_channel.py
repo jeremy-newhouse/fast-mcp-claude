@@ -1179,6 +1179,195 @@ def test_await_consumption_fast_signal_inert_without_status_file():
     assert asyncio.run(run()) == channel_mod._UNKNOWN
 
 
+# ----------------------------------- ECA-83 finding #1: permission-activity liveness companion
+
+
+def test_await_consumption_activity_advance_saves_queued_behind_long_turn(tmp_path):
+    # A push queued behind an already-running long turn: the status file only bumped once at
+    # that turn's OWN start (never again mid-turn) so status_advanced is False here — but the
+    # turn's own tool calls stamp rt.last_activity_ts, which alone must be enough to avoid a
+    # false _DEAD bounce of the queued push (it falls through to the ambiguous/never-bounce
+    # path instead, same as a status-file advance would).
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({"updated_at": 100.0}))  # frozen for the whole window
+    cfg = _cfg(
+        enabled=True,
+        liveness_check_enabled=True,
+        liveness_window_s=0.05,
+        reply_timeout=0.1,
+        status_file=str(sf),
+    )
+    rt = channel_mod._Runtime(cfg=cfg)
+    rt.last_activity_ts = 200.0  # a tool-call permission round trip landed after baseline
+
+    async def run():
+        return await asyncio.wait_for(
+            channel_mod._await_consumption(
+                cfg, rt, baseline_ts=100.0, baseline_activity_ts=100.0
+            ),
+            timeout=5.0,
+        )
+
+    assert asyncio.run(run()) == channel_mod._UNKNOWN  # alive-but-slow, NOT dead -> no bounce
+
+
+def test_await_consumption_dead_when_neither_status_nor_activity_advance(tmp_path):
+    # Sanity converse of the above: with NEITHER signal advancing, the fast path still bounces
+    # (unchanged _DEAD behavior) — the activity signal only ever ADDS life evidence, never
+    # removes the existing status-file one.
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({"updated_at": 100.0}))
+    cfg = _cfg(
+        enabled=True, liveness_check_enabled=True, liveness_window_s=0.05, reply_timeout=50.0,
+        status_file=str(sf),
+    )
+    rt = channel_mod._Runtime(cfg=cfg)
+    rt.last_activity_ts = 100.0  # no advance past baseline_activity_ts
+
+    async def run():
+        return await asyncio.wait_for(
+            channel_mod._await_consumption(
+                cfg, rt, baseline_ts=100.0, baseline_activity_ts=100.0
+            ),
+            timeout=5.0,
+        )
+
+    assert asyncio.run(run()) == channel_mod._DEAD
+
+
+# --------------------------- ECA-83 finding #4: hookless-host diagnostic on first false-bounce
+
+
+def test_await_consumption_dead_logs_hookless_warning_once(tmp_path, monkeypatch):
+    # status_file is CONFIGURED but has never been written (no SessionStart ever ran there,
+    # e.g. launched outside start-session.sh) — the first _DEAD verdict logs a distinguishing
+    # WARNING naming the likely cause, and only once (a standing misconfiguration, not a
+    # per-bounce event).
+    sf = tmp_path / "status.json"  # deliberately never created
+    cfg = _cfg(
+        enabled=True, liveness_check_enabled=True, liveness_window_s=0.02, reply_timeout=0.02,
+        status_file=str(sf),
+    )
+    rt = channel_mod._Runtime(cfg=cfg)
+    logs = []
+    monkeypatch.setattr(channel_mod, "_log", lambda msg: logs.append(msg))
+
+    async def run():
+        v1 = await channel_mod._await_consumption(cfg, rt, baseline_ts=None)
+        v2 = await channel_mod._await_consumption(cfg, rt, baseline_ts=None)
+        return v1, v2
+
+    v1, v2 = asyncio.run(run())
+    assert v1 == channel_mod._DEAD and v2 == channel_mod._DEAD
+    assert rt.hookless_warning_logged is True
+    warnings = [m for m in logs if "ECA-83 finding #4" in m]
+    assert len(warnings) == 1  # logged once across both bounces, not per-bounce
+
+
+def test_await_consumption_dead_no_hookless_warning_when_status_file_exists(tmp_path, monkeypatch):
+    # Converse: a status file that DOES exist and has reported a value (just non-advancing) is a
+    # genuinely dead/parked consumer, not a hookless-host misconfiguration — no warning.
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({"updated_at": 100.0}))
+    cfg = _cfg(
+        enabled=True, liveness_check_enabled=True, liveness_window_s=0.02, reply_timeout=0.02,
+        status_file=str(sf),
+    )
+    rt = channel_mod._Runtime(cfg=cfg)
+    logs = []
+    monkeypatch.setattr(channel_mod, "_log", lambda msg: logs.append(msg))
+
+    assert asyncio.run(
+        channel_mod._await_consumption(cfg, rt, baseline_ts=100.0)
+    ) == channel_mod._DEAD
+    assert rt.hookless_warning_logged is False
+    assert not [m for m in logs if "ECA-83 finding #4" in m]
+
+
+# ------------------------------------- ECA-83 finding #3: activity-driven re-arm (_maybe_rearm)
+
+
+def test_maybe_rearm_noop_when_not_degraded():
+    cfg = _cfg(enabled=True)
+    rt = channel_mod._Runtime(cfg=cfg)
+    channel_mod._maybe_rearm(cfg, rt)  # must not raise / must not touch anything
+    assert rt.degraded is False
+
+
+def test_maybe_rearm_via_status_advance(tmp_path):
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({"updated_at": 200.0}))
+    cfg = _cfg(enabled=True, status_file=str(sf))
+    rt = channel_mod._Runtime(cfg=cfg)
+    rt.degraded = True
+    rt.degraded_status_ts = 100.0
+    rt.consecutive_nonconsumption = 3
+
+    channel_mod._maybe_rearm(cfg, rt)
+
+    assert rt.degraded is False
+    assert rt.consecutive_nonconsumption == 0
+    assert rt.degraded_status_ts is None
+
+
+def test_maybe_rearm_via_activity_when_status_never_advances(tmp_path):
+    # ECA-83 finding #3: on a hookless host the status file is frozen forever post-degrade
+    # (no SessionStart/UserPromptSubmit/Stop hook ever bumps it) — the old code could NEVER
+    # re-arm here. Permission-request activity alone must still re-arm it.
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({"updated_at": 100.0}))  # frozen; never advances
+    cfg = _cfg(enabled=True, status_file=str(sf))
+    rt = channel_mod._Runtime(cfg=cfg)
+    rt.degraded = True
+    rt.degraded_status_ts = 100.0
+    rt.degraded_activity_ts = 100.0
+    rt.consecutive_nonconsumption = 3
+    rt.last_activity_ts = 150.0  # a tool call happened after degrade
+
+    channel_mod._maybe_rearm(cfg, rt)
+
+    assert rt.degraded is False
+    assert rt.consecutive_nonconsumption == 0
+    assert rt.degraded_activity_ts is None
+
+
+def test_maybe_rearm_stays_degraded_when_neither_signal_advances(tmp_path):
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({"updated_at": 100.0}))
+    cfg = _cfg(enabled=True, status_file=str(sf))
+    rt = channel_mod._Runtime(cfg=cfg)
+    rt.degraded = True
+    rt.degraded_status_ts = 100.0
+    rt.degraded_activity_ts = 100.0
+    rt.consecutive_nonconsumption = 3
+    rt.last_activity_ts = 100.0  # no advance
+
+    channel_mod._maybe_rearm(cfg, rt)
+
+    assert rt.degraded is True
+    assert rt.consecutive_nonconsumption == 3
+
+
+# ---------------------------- ECA-83: _handle_permission stamps activity for ANY tool call
+
+
+def test_handle_permission_stamps_activity_for_local_turn(relay):
+    # The operator's OWN local turn (no channel message in flight) must still count as activity
+    # — this is the exact signal finding #1's fix depends on.
+    relay["set_inflight"](None)
+    assert channel_mod._RT.last_activity_ts is None
+    anyio.run(channel_mod._handle_permission, None, _cfg(), _perm_params("Bash"))
+    assert channel_mod._RT.last_activity_ts is not None
+
+
+def test_handle_permission_stamps_activity_for_our_tools_shortcut(relay):
+    relay["set_inflight"](None)
+    assert channel_mod._RT.last_activity_ts is None
+    params = _perm_params(channel_mod.OUR_REPLY_TOOL)
+    anyio.run(channel_mod._handle_permission, None, _cfg(), params)
+    assert channel_mod._RT.last_activity_ts is not None
+
+
 # ------------------------------------------------- ECA-61: presence-loop reconnect after a dead
 # connection (a mesh-server restart). The bug: announce() failures were swallowed inside the
 # INNER loop forever, so the outer reconnect handler (_reconnect_sleep, which rebuilds the

@@ -4,12 +4,18 @@ import pytest
 
 from fast_mcp_claude.errors import PermissionDeniedError, ValidationError
 from fast_mcp_claude.utils.validation import (
+    MAX_METADATA_BYTES,
+    MAX_TOOL_INPUT_BYTES,
+    MAX_TOOL_NAME_BYTES,
     validate_channel,
     validate_message_id,
+    validate_metadata,
     validate_peer_name,
     validate_prompt,
     validate_session_id,
     validate_timeout,
+    validate_tool_input,
+    validate_tool_name,
     validate_workspace_path,
 )
 
@@ -117,3 +123,59 @@ class TestWorkspacePathSandbox:
         roots = [tmp_path.resolve()]
         with pytest.raises(ValidationError):
             validate_workspace_path(str(tmp_path / "nope"), workspace_roots=roots, must_exist=True)
+
+    def test_out_of_sandbox_rejection_does_not_leak_existence(self, tmp_path):
+        """FMC-4: an out-of-sandbox path must raise the SAME error (PermissionDeniedError)
+        whether or not it exists on disk -- otherwise an authenticated peer can probe for
+        the existence of arbitrary absolute paths by reading the exception type/message."""
+        root = tmp_path / "root"
+        root.mkdir()
+        roots = [root.resolve()]
+        outside_existing = tmp_path / "exists.txt"
+        outside_existing.write_text("secret")
+        outside_missing = tmp_path / "does-not-exist.txt"
+
+        with pytest.raises(PermissionDeniedError):
+            validate_workspace_path(str(outside_existing), workspace_roots=roots, must_exist=True)
+        with pytest.raises(PermissionDeniedError):
+            validate_workspace_path(str(outside_missing), workspace_roots=roots, must_exist=True)
+
+
+class TestStructuredFieldSizeCaps:
+    def test_validate_metadata_allows_none(self):
+        assert validate_metadata(None) is None
+
+    def test_validate_metadata_allows_small_dict(self):
+        assert validate_metadata({"branch": "main"}) == {"branch": "main"}
+
+    def test_validate_metadata_rejects_non_dict(self):
+        with pytest.raises(ValidationError):
+            validate_metadata("not a dict")
+
+    def test_validate_metadata_rejects_oversized(self):
+        oversized = {"blob": "x" * (MAX_METADATA_BYTES + 1)}
+        with pytest.raises(ValidationError):
+            validate_metadata(oversized)
+
+    def test_validate_tool_name_valid(self):
+        assert validate_tool_name("Bash") == "Bash"
+
+    def test_validate_tool_name_rejects_empty(self):
+        with pytest.raises(ValidationError):
+            validate_tool_name("")
+
+    def test_validate_tool_name_rejects_oversized(self):
+        with pytest.raises(ValidationError):
+            validate_tool_name("x" * (MAX_TOOL_NAME_BYTES + 1))
+
+    def test_validate_tool_input_allows_small_dict(self):
+        assert validate_tool_input({"command": "ls"}) == {"command": "ls"}
+
+    def test_validate_tool_input_rejects_oversized(self):
+        oversized = {"content": "x" * (MAX_TOOL_INPUT_BYTES + 1)}
+        with pytest.raises(ValidationError):
+            validate_tool_input(oversized)
+
+    def test_validate_tool_input_rejects_non_dict(self):
+        with pytest.raises(ValidationError):
+            validate_tool_input("not a dict")

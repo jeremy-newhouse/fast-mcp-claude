@@ -23,6 +23,8 @@ from ..utils.validation import (
     validate_approval_id,
     validate_session_id,
     validate_timeout,
+    validate_tool_input,
+    validate_tool_name,
 )
 
 logger = get_logger(__name__)
@@ -42,10 +44,8 @@ async def request_approval(
 ) -> dict[str, Any]:
     try:
         session_id = validate_session_id(session_id) or "default"
-        if not isinstance(tool_name, str) or not tool_name:
-            raise ValidationError("tool_name required", field="tool_name")
-        if not isinstance(tool_input, dict):
-            raise ValidationError("tool_input must be an object", field="tool_input")
+        tool_name = validate_tool_name(tool_name)
+        tool_input = validate_tool_input(tool_input)
 
         approval_id = await store.create_approval(
             session_id=session_id,

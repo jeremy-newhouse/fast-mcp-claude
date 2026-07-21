@@ -30,6 +30,7 @@ from ..logging_config import get_logger
 from ..server import mcp, settings, store
 from ..utils.validation import (
     validate_message_id,
+    validate_metadata,
     validate_session_id,
     validate_timeout,
 )
@@ -62,8 +63,7 @@ async def request_session_op(
     try:
         if not isinstance(op, str) or op not in _VALID_OPS:
             raise ValidationError(f"op must be one of {sorted(_VALID_OPS)}", field="op")
-        if payload is not None and not isinstance(payload, dict):
-            raise ValidationError("payload must be an object", field="payload")
+        payload = validate_metadata(payload, field="payload")
         requester = validate_session_id(requester_session, field="requester_session") or "default"
 
         request_id = await store.create_session_op(requester=requester, op=op, payload=payload)
@@ -119,8 +119,7 @@ async def complete_session_op(
         request_id = validate_message_id(request_id, field="request_id")
         if not isinstance(ok, bool):
             raise ValidationError("ok must be a boolean", field="ok")
-        if result is not None and not isinstance(result, dict):
-            raise ValidationError("result must be an object", field="result")
+        result = validate_metadata(result, field="result")
 
         completed = await store.complete_session_op(request_id, ok, result)
         if not completed:

@@ -3,7 +3,8 @@
 import pytest
 
 from fast_mcp_claude.services.store import Store
-from fast_mcp_claude.tools.presence import who
+from fast_mcp_claude.tools.presence import announce, who
+from fast_mcp_claude.utils.validation import MAX_METADATA_BYTES
 
 
 @pytest.mark.asyncio
@@ -235,3 +236,20 @@ async def test_identity_addressed_message_routing(store: Store):
     await store.enqueue_message(sender="ctrl", prompt="anyone", recipient_session=None)
     got2 = await store.pop_next_for_worker("alice")
     assert got2 is not None and got2["prompt"] == "anyone"
+
+
+@pytest.fixture
+def wired_announce(store: Store, monkeypatch):
+    """announce() reads the `store` name bound in the presence tool module -- point
+    it at this test's isolated store, mirroring the wired_who fixture above."""
+    monkeypatch.setattr("fast_mcp_claude.tools.presence.store", store)
+    return announce
+
+
+@pytest.mark.asyncio
+async def test_announce_rejects_oversized_metadata(wired_announce):
+    """FMC-4: announce's metadata is json.dumps'd straight into SQLite with no prior cap."""
+    oversized = {"blob": "x" * (MAX_METADATA_BYTES + 1)}
+    result = await wired_announce("eca2", metadata=oversized)
+    assert result["success"] is False
+    assert result["error"]["code"] == "VALIDATION_ERROR"

@@ -8,6 +8,8 @@ import asyncio
 import pytest
 
 from fast_mcp_claude.services.store import OUTBOX_DONE, OUTBOX_PENDING, Store
+from fast_mcp_claude.tools.session_relay import complete_session_op, request_session_op
+from fast_mcp_claude.utils.validation import MAX_METADATA_BYTES
 
 
 @pytest.mark.asyncio
@@ -113,3 +115,33 @@ async def test_cleanup_spares_fresh_rows(store: Store):
     await store._cleanup_once(cutoff=1000.0)  # cutoff far in the past
     pending = await store.list_pending_session_ops()
     assert [p["id"] for p in pending] == [rid]  # still pending, untouched
+
+
+@pytest.fixture
+def wired_session_relay_tools(store: Store, monkeypatch):
+    """request_session_op()/complete_session_op() read the `store` name bound in the
+    session_relay tool module -- point it at this test's isolated store."""
+    monkeypatch.setattr("fast_mcp_claude.tools.session_relay.store", store)
+    return request_session_op, complete_session_op
+
+
+@pytest.mark.asyncio
+async def test_request_session_op_rejects_oversized_payload(wired_session_relay_tools):
+    """FMC-4: request_session_op's payload is json.dumps'd straight into SQLite with no
+    prior cap."""
+    request_session_op_fn, _ = wired_session_relay_tools
+    oversized = {"text": "x" * (MAX_METADATA_BYTES + 1)}
+    result = await request_session_op_fn(op="send", payload=oversized)
+    assert result["success"] is False
+    assert result["error"]["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_complete_session_op_rejects_oversized_result(wired_session_relay_tools):
+    """FMC-4: complete_session_op's result is json.dumps'd straight into SQLite with no
+    prior cap -- rejected before the (nonexistent) request_id is even looked up."""
+    _, complete_session_op_fn = wired_session_relay_tools
+    oversized = {"sessions": "x" * (MAX_METADATA_BYTES + 1)}
+    result = await complete_session_op_fn(request_id="a" * 32, ok=True, result=oversized)
+    assert result["success"] is False
+    assert result["error"]["code"] == "VALIDATION_ERROR"

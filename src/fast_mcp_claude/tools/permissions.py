@@ -74,7 +74,7 @@ async def await_decision(
     approval_id: Annotated[str, Field(description="ID returned by request_approval")],
     timeout: Annotated[
         float | None,
-        Field(description="Max seconds to block (capped by poll_max_wait_s)"),
+        Field(description="Max seconds to block (capped at 600s)"),
     ] = None,
 ) -> dict[str, Any]:
     try:
@@ -104,9 +104,15 @@ async def pending_approvals(
     limit: Annotated[int, Field(description="Max rows (1-200)")] = 50,
 ) -> dict[str, Any]:
     try:
-        limit = max(1, min(int(limit), 200))
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as e:
+            raise ValidationError("limit must be an integer", field="limit") from e
+        limit = max(1, min(limit, 200))
         rows = await store.list_pending_approvals(limit=limit)
         return {"success": True, "approvals": rows, "count": len(rows)}
+    except ValidationError as e:
+        return format_error_response(e)
     except Exception as e:
         return format_error_response(e)
 
@@ -120,32 +126,17 @@ async def pending_approvals(
 async def wait_for_pending_approval(
     timeout: Annotated[
         float | None,
-        Field(description="Max seconds to block (capped by poll_max_wait_s)"),
+        Field(description="Max seconds to block (capped at 300s)"),
     ] = None,
 ) -> dict[str, Any]:
     try:
         wait_s = validate_timeout(timeout, default=settings.poll_max_wait_s, cap=300.0)
-        # Reuse the approval-queue key: anything new wakes us.
-        from ..services.store import Notifier  # noqa: F401  (re-import for clarity)
-
-        # Use the store's internal notifier by waiting on the well-known key.
-        # We don't have direct access, so we use list_pending_approvals + wait via
-        # the existing notify points: request_approval notifies approvals:any.
-        result = await store._notifier.wait_for(  # type: ignore[attr-defined]
-            "approvals:any",
-            lambda: _approvals_or_none(),
-            wait_s,
-        )
-        return {"success": True, "approvals": result or []}
+        result = await store.wait_for_pending_approvals(wait_s)
+        return {"success": True, "approvals": result}
     except ValidationError as e:
         return format_error_response(e)
     except Exception as e:
         return format_error_response(e)
-
-
-async def _approvals_or_none() -> list[dict[str, Any]] | None:
-    rows = await store.list_pending_approvals(limit=50)
-    return rows if rows else None
 
 
 @mcp.tool(

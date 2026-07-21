@@ -129,7 +129,9 @@ class Notifier:
     """Per-key asyncio.Event registry for waking long-poll waiters.
 
     On notify(): set the existing event (waking any current waiters) and
-    replace it with a fresh one so subsequent waits block again.
+    replace it with a fresh one so subsequent waits block again. notify_prefix()
+    fans that out across every key sharing a prefix; forget() evicts a resolved
+    key once no waiter is parked on it, so _events doesn't grow without bound.
     """
 
     def __init__(self) -> None:

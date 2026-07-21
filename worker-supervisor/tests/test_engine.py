@@ -150,6 +150,27 @@ async def test_second_failure_is_terminal_with_capsule(make_engine, registry, re
     assert epoch["seq"] == 1 and epoch["ended_at"] is None  # keep-on-failure
 
 
+async def test_turn_mcp_diagnostics_emitted_on_failure_ladder_too(
+    make_engine, registry, repo, events
+):
+    """ECA-101 AC1 (adversarial-review follow-up): the FAILURE ladder (_fail_turn)
+    must surface MCP diagnostics too, not just a successful turn — a granted
+    server that never finishes connecting is exactly the kind of failure an
+    operator most wants this evidence for, and the pre-existing failure capsule
+    (Amendment A6) carries no MCP-specific context at all."""
+    engine, _ = make_engine([RuntimeError("boom 1"), RuntimeError("boom 2"), [r("sX")]])
+    await engine.spawn(
+        "w1", str(repo), WorkerPolicy(mcp_servers={"context7": {"type": "stdio"}})
+    )
+    tid = await engine.prompt("w1", "doomed")
+    turn = await terminal_turn(registry, tid)
+    assert turn["state"] == "error"
+
+    diag = [e for e in events.read("w1") if e["event"] == "turn_mcp_diagnostics"]
+    assert len(diag) == 1
+    assert diag[0]["granted"] == ["context7"]
+
+
 async def test_resume_failure_rolls_epoch_and_enqueues_restore(make_engine, registry, repo):
     """G7: ProcessError on a resumed chain -> epoch ends, restore turn grounds the next."""
     engine, calls = make_engine(

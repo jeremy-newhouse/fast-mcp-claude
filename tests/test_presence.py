@@ -220,6 +220,25 @@ async def test_who_redacts_nested_token(store: Store, wired_who):
 
 
 @pytest.mark.asyncio
+async def test_who_rejects_non_numeric_stale_seconds(wired_who):
+    """FMC-6 AC#1: a malformed stale_seconds must surface as VALIDATION_ERROR with a
+    field, not the bare `except Exception` catch-all's generic UNKNOWN_ERROR (a stray
+    `stale_seconds <= 0` comparison on a non-numeric value used to raise a bare TypeError)."""
+    result = await wired_who(stale_seconds="not-a-number")
+    assert result["success"] is False
+    assert result["error"]["code"] == "VALIDATION_ERROR"
+    assert result["error"]["field"] == "stale_seconds"
+
+
+@pytest.mark.asyncio
+async def test_who_accepts_normal_stale_seconds(store: Store, wired_who):
+    await store.announce("alice", summary="testing")
+    result = await wired_who(stale_seconds=100.0)
+    assert result["success"] is True
+    assert len(result["peers"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_identity_addressed_message_routing(store: Store):
     """A message addressed to 'bob' lands in bob's mailbox, not alice's; an
     unaddressed (broadcast) message reaches anyone. This is the N-way contract

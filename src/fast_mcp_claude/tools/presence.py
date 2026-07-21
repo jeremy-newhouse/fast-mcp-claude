@@ -129,6 +129,13 @@ async def who(
     ] = None,
 ) -> dict[str, Any]:
     try:
+        if stale_seconds is not None:
+            try:
+                stale_seconds = float(stale_seconds)
+            except (TypeError, ValueError) as e:
+                raise ValidationError(
+                    "stale_seconds must be a number", field="stale_seconds"
+                ) from e
         if stale_seconds is None:
             stale_seconds = float(settings.poll_heartbeat_s * 3)
         elif stale_seconds <= 0:
@@ -143,5 +150,7 @@ async def who(
             "peers": sanitized_peers,
             "count": len(sanitized_peers),
         }
+    except ValidationError as e:
+        return format_error_response(e)
     except Exception as e:
         return format_error_response(e)

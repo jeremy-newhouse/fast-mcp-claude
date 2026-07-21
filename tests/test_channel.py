@@ -1115,6 +1115,95 @@ def test_inbox_degrades_and_stops_claiming_after_k_nonconsumptions(monkeypatch, 
     assert len([1 for n, _ in client.calls if n == "wait_for_instruction"]) == 1
 
 
+# -------------------------------- FMC-9 Bug 2: remote-context grace window
+#
+# _handle_send_teams used to treat `rt.inflight is None` as sufficient proof the local operator
+# is directly driving the session (operator_direct trust). Two windows make that false: an
+# unanswered FYI push (deliberately pushed WITHOUT holding the in-flight slot) that the agent may
+# still be acting on, and the moment right after an ambiguous/unknown consumption verdict clears
+# `inflight` even though the original turn may still genuinely be executing. These tests cover
+# both the wiring (_inbox_loop marking/clearing the grace window) and the trust decision itself
+# (_handle_send_teams consulting it).
+
+
+def test_inbox_fyi_marks_remote_context_active(monkeypatch):
+    cfg = _cfg(enabled=True, identity="peer.repo.a", reply_timeout=60.0)
+    fyi = {
+        "id": "m-fyi",
+        "sender": "evolv-coder-agent",
+        "prompt": "[Session message] heads-up",
+        "recipient_session": "peer.repo.a",
+        "metadata": {"from_session": "peer.repo.b", "expects_reply": False},
+    }
+    _client, _stream, rt = _run_inbox(monkeypatch, cfg, [fyi])
+    assert rt.remote_turn_started_ts is not None
+    assert channel_mod._remote_context_active(rt) is True
+
+
+def test_inbox_unknown_verdict_marks_remote_context_active(monkeypatch):
+    # Fast liveness signal OFF (default) + reply_timeout elapses -> _UNKNOWN (ambiguous, the
+    # original turn may still be executing) -> the grace window must open, not stay closed.
+    cfg = _cfg(enabled=True, identity="peer.repo.a", reply_timeout=0.05)
+    msg = {
+        "id": "m-task",
+        "sender": "evolv-coder-agent",
+        "prompt": "do work",
+        "recipient_session": "peer.repo.a",
+        "metadata": None,
+    }
+    _client, _stream, rt = _run_inbox(monkeypatch, cfg, [msg])
+    assert rt.remote_turn_started_ts is not None
+    assert channel_mod._remote_context_active(rt) is True
+
+
+def test_inbox_dead_verdict_clears_remote_context(monkeypatch, tmp_path):
+    # A _DEAD verdict (positive non-consumption evidence) means the turn is confirmed NOT
+    # running -- unlike _UNKNOWN, this must NOT open the grace window.
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({"updated_at": 100.0}))  # never advances -> dead consumer
+    cfg = _cfg(
+        enabled=True,
+        identity="peer.repo.a",
+        reply_timeout=0.05,
+        heartbeat=0.01,
+        liveness_check_enabled=True,
+        liveness_window_s=0.02,
+        status_file=str(sf),
+    )
+    msg = {"id": "m1", "sender": "brain", "prompt": "do", "recipient_session": "peer.repo.a"}
+    _client, _stream, rt = _run_inbox(monkeypatch, cfg, [msg])
+    assert rt.remote_turn_started_ts is None
+    assert channel_mod._remote_context_active(rt) is False
+
+
+def test_handle_send_teams_denies_trust_during_remote_context(send_teams_rig):
+    # No task in flight, BUT a remote-originated turn may still be executing (grace window open)
+    # -> neither trusted origin applies; the hub must fail safe and refuse (pre-fix: this got
+    # operator_direct=True purely because rt.inflight was None).
+    send_teams_rig["set_inflight"](None)
+    channel_mod._mark_remote_context(channel_mod._RT)
+    out = anyio.run(channel_mod._call_tool, "send_teams", {"text": "x", "target": "Eng"})
+    _, _, meta = send_teams_rig["calls"][0]
+    assert "operator_direct" not in meta
+    assert "triggering_admin" not in meta
+    assert "NOT posted" in out[0].text
+
+
+def test_handle_send_teams_recovers_operator_direct_after_grace_window(send_teams_rig):
+    # Once the grace window has genuinely elapsed, a no-in-flight send_teams call is trusted
+    # again -- this is a bounded safety margin, not a permanent lockout. Backdate the mark
+    # directly (real time arithmetic) rather than monkeypatching time.monotonic globally, which
+    # would also break asyncio's own internals mid-run.
+    send_teams_rig["set_inflight"](None)
+    channel_mod._RT.remote_turn_started_ts = (
+        channel_mod.time.monotonic() - channel_mod._REMOTE_CONTEXT_GRACE_S - 1.0
+    )
+    out = anyio.run(channel_mod._call_tool, "send_teams", {"text": "x", "target": "Eng"})
+    _, _, meta = send_teams_rig["calls"][0]
+    assert meta.get("operator_direct") is True
+    assert "posted to Teams" in out[0].text
+
+
 # -------------------------------- ECA-71 Layer C: fast liveness signal (_await_consumption)
 
 

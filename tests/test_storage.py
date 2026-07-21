@@ -269,6 +269,90 @@ async def test_notifier_forget_does_not_evict_an_active_waiter():
 
 
 @pytest.mark.asyncio
+async def test_zero_timeout_wait_for_does_not_leak_notifier_event():
+    """Regression (FMC-12 AC#3): wait_for's timeout<=0 short-circuit must never
+    register a persistent Event -- pre-fix, _get(key) ran unconditionally before the
+    timeout check, so every zero-timeout call against a fresh key (e.g. an attacker
+    probing a fabricated inbox:/pubsub: key) permanently grew _events even though the
+    caller never actually waits on it."""
+    notifier = Notifier()
+
+    async def always_empty():
+        return None
+
+    for i in range(50):
+        result = await notifier.wait_for(f"probe:{i}", always_empty, timeout=0)
+        assert result is None
+
+    assert len(notifier._events) == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_for_instruction_zero_timeout_does_not_leak_notifier_events(store: Store):
+    """Regression (FMC-12 AC#3), exercised through the real production path: an
+    authenticated caller repeatedly invoking wait_for_instruction (wait_for_next_
+    for_worker) with fresh, syntactically-valid but nonexistent recipient_session
+    values and timeout=0 must not grow the Notifier's event map -- recipient_session
+    is validated only for SESSION_RE format, never for corresponding to a live
+    identity, so this is the exact adversarial pattern the task describes."""
+    before = len(store._notifier._events)
+    for i in range(50):
+        result = await store.wait_for_next_for_worker(f"fabricated-session-{i}", timeout=0)
+        assert result is None
+    assert len(store._notifier._events) == before
+
+
+@pytest.mark.asyncio
+async def test_subscribe_zero_timeout_does_not_leak_notifier_events(store: Store):
+    """Regression (FMC-12 AC#3): same adversarial pattern via subscribe/wait_for_pubsub
+    with fresh, nonexistent channel names -- validate_channel is format-only too."""
+    before = len(store._notifier._events)
+    for i in range(50):
+        msgs = await store.wait_for_pubsub(f"fabricated-channel-{i}", after_id=0, timeout=0)
+        assert msgs == []
+    assert len(store._notifier._events) == before
+
+
+@pytest.mark.asyncio
+async def test_notifier_events_bounded_by_max_events_cap():
+    """Regression (FMC-12 AC#3): even when a caller uses a nonzero timeout (so an
+    Event genuinely gets registered), Notifier._events must stay bounded rather than
+    growing forever as an unbounded number of distinct fabricated keys accumulate --
+    the least-recently-used, un-waited keys are evicted once over capacity."""
+    notifier = Notifier(max_events=5)
+    for i in range(20):
+        notifier._get(f"inbox:fake-{i}")
+    assert len(notifier._events) <= 5
+    # The most-recently-created keys must be the ones that survived (LRU eviction).
+    assert "inbox:fake-19" in notifier._events
+    assert "inbox:fake-0" not in notifier._events
+
+
+@pytest.mark.asyncio
+async def test_notifier_eviction_never_evicts_an_active_waiter():
+    """Safety property for the FMC-12 AC#3 capacity eviction: it must respect the
+    same active-waiter guard forget() already honors -- a key a real, live session is
+    currently long-polling on must never be evicted just because many fabricated keys
+    pushed the map over capacity."""
+    notifier = Notifier(max_events=3)
+
+    async def always_empty():
+        return None
+
+    waiter_task = asyncio.create_task(notifier.wait_for("keep", always_empty, timeout=1.0))
+    await asyncio.sleep(0.05)  # let the waiter register and start waiting
+    assert "keep" in notifier._events
+
+    for i in range(20):
+        notifier._get(f"filler:{i}")
+
+    assert "keep" in notifier._events  # never evicted despite being over capacity
+
+    result = await waiter_task
+    assert result is None  # times out normally afterward
+
+
+@pytest.mark.asyncio
 async def test_cleanup_evicts_resolved_message_notifier_key(store: Store):
     """Regression (FMC-5 AC#2): Notifier._events must not grow without bound as
     messages are resolved and pruned over a long-running process."""

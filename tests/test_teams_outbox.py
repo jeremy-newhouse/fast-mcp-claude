@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from fast_mcp_claude.services.store import OUTBOX_DONE, OUTBOX_PENDING, Store
+from fast_mcp_claude.services.store import OUTBOX_CLAIMED, OUTBOX_DONE, Store
 from fast_mcp_claude.tools.teams_outbox import request_teams_send
 from fast_mcp_claude.utils.validation import MAX_METADATA_BYTES
 
@@ -20,7 +20,9 @@ async def test_round_trip(store: Store):
 
     pending = await store.list_pending_teams_sends()
     assert [p["id"] for p in pending] == [rid]
-    assert pending[0]["status"] == OUTBOX_PENDING
+    # list_pending_teams_sends atomically claims the row (FMC-12 AC#1): it is no
+    # longer bare "pending" once a drain call has observed it.
+    assert pending[0]["status"] == OUTBOX_CLAIMED
     assert pending[0]["text"] == "deploy green"
     assert pending[0]["target"] == "Engineering"
     assert pending[0]["metadata"]["triggering_admin"] is True
@@ -72,6 +74,23 @@ async def test_default_target_none(store: Store):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_drain_claims_row_exactly_once(store: Store):
+    """Regression (FMC-12 AC#1): two concurrent hub-side drain calls racing for the
+    same pending row must not both observe it as claimable — pre-fix, list_pending_
+    teams_sends was a bare SELECT with no claim step, so both concurrent callers
+    would see (and both act on, e.g. post to Teams twice for) the same row. Combined
+    across both calls, the row must surface exactly once."""
+    rid = await store.create_teams_send(requester="r", text="hi")
+
+    results = await asyncio.gather(
+        store.list_pending_teams_sends(),
+        store.list_pending_teams_sends(),
+    )
+    claimed_ids = [p["id"] for lst in results for p in lst]
+    assert claimed_ids == [rid]  # not [], and not [rid, rid]
+
+
+@pytest.mark.asyncio
 async def test_cleanup_removes_stale_pending(store: Store):
     # A stale PENDING row is expired (pending -> done) and pruned in the same sweep, so it
     # never dangles in the pending set. A broken expire UPDATE would leave it pending; a broken
@@ -81,6 +100,18 @@ async def test_cleanup_removes_stale_pending(store: Store):
     await store._cleanup_once(cutoff=2000.0)
     assert await store.get_teams_send(rid) is None
     assert await store.list_pending_teams_sends() == []
+
+
+@pytest.mark.asyncio
+async def test_cleanup_removes_stale_claimed(store: Store):
+    """Regression (FMC-12): a row claimed by a drain call that then crashed before
+    completing must not dangle in the claimed state forever -- cleanup's stale-expiry
+    sweep must catch CLAIMED rows too, not just PENDING ones."""
+    rid = await store.create_teams_send(requester="r", text="hi")
+    await store.list_pending_teams_sends()  # claims it; hub then "crashes" (never completes)
+    await store.db.execute("UPDATE teams_outbox SET created_at=? WHERE id=?", (1000.0, rid))
+    await store._cleanup_once(cutoff=2000.0)
+    assert await store.get_teams_send(rid) is None
 
 
 @pytest.mark.asyncio

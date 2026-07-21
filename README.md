@@ -223,6 +223,7 @@ All tools return `{"success": bool, ...}` or `{"success": false, "error": {"mess
 ## Security
 
 - **Always set `MCP_API_KEY`** for any non-localhost deployment. The server logs a `WARNING` on startup if it's unset.
+- **`MCP_ADMIN_API_KEY` is a distinct, optional second bearer** for a designated trusted hub/admin origin (e.g. the eCA brain). `MCP_API_KEY` alone is shared by every mesh peer, so it cannot prove a caller is the trusted hub rather than any other peer — `send_prompt` only lets a caller's `metadata.triggering_admin` claim become `true` (which `channel.py`'s permission relay auto-allows on) when the request authenticated with this key. Unset by default, meaning nobody is ever admin-trusted.
 - **WORKSPACE_ROOTS is an allowlist**: `read_file`/`write_file` refuse paths outside it, including via symlink escapes.
 - **No outbound HTTP from user input**: tools never make network calls to URLs supplied by callers (in v1 there's no outbound HTTP at all).
 - **Hook fail-safe**: any error in the permission relay (server down, timeout, parse error) → `permissionDecision: "ask"` → Claude Code's local prompt takes over.

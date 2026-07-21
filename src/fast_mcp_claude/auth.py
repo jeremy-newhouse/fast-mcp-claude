@@ -65,18 +65,28 @@ class AuthRateLimiter:
 
 
 class ApiKeyVerifier(TokenVerifier):
-    """Verifies bearer tokens against a configured API key (timing-safe)."""
+    """Verifies bearer tokens against a configured API key (timing-safe).
 
-    def __init__(self, api_key: str):
+    `admin_api_key`, when set, is a SECOND, distinct credential (FMC-9): every peer in a mesh
+    shares the same `api_key`, so matching it alone proves only "some peer with the shared
+    secret", not "a designated trusted hub/admin origin". A caller authenticated with
+    `admin_api_key` instead gets `claims={"admin": True}` on its AccessToken -- the single
+    source of truth tools/messaging.py::send_prompt consults before honoring a caller's claim
+    to set metadata.triggering_admin.
+    """
+
+    def __init__(self, api_key: str, admin_api_key: str | None = None):
         super().__init__()
         self.api_key = api_key
+        self.admin_api_key = admin_api_key or None
         self._rate_limiter = AuthRateLimiter()
 
     async def verify_token(self, token: str) -> AccessToken | None:
         # Compare first so a correct credential always succeeds, even during an
         # active lockout - the limiter has no per-connection identity to scope
         # itself to the attacker, so it must never gate the legitimate peer.
-        if hmac.compare_digest(token.encode("utf-8"), self.api_key.encode("utf-8")):
+        token_bytes = token.encode("utf-8")
+        if hmac.compare_digest(token_bytes, self.api_key.encode("utf-8")):
             await self._rate_limiter.record_success()
             return AccessToken(
                 token=token,
@@ -84,6 +94,18 @@ class ApiKeyVerifier(TokenVerifier):
                 scopes=[],
                 expires_at=None,
                 claims={},
+            )
+
+        if self.admin_api_key and hmac.compare_digest(
+            token_bytes, self.admin_api_key.encode("utf-8")
+        ):
+            await self._rate_limiter.record_success()
+            return AccessToken(
+                token=token,
+                client_id="admin-api-key-client",
+                scopes=[],
+                expires_at=None,
+                claims={"admin": True},
             )
 
         if not await self._rate_limiter.check_rate_limit():

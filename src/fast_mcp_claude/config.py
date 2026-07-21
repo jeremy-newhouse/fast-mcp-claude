@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     # MCP endpoint authentication (bearer token clients must send to us)
     mcp_api_key: str | None = None
     mcp_auth_enabled: bool = True
+    # Optional SECOND bearer, distinct from mcp_api_key, for a designated trusted hub/admin
+    # origin (FMC-9). Every peer in a mesh shares the same mcp_api_key, so a caller authenticated
+    # with it alone cannot be trusted with admin-level actions (e.g. channel.py auto-allowing a
+    # pushed tool call via metadata.triggering_admin) -- ANY bearer-holding peer could forge that
+    # claim. Unset (default) means no caller is ever admin-trusted, closing that hole by default;
+    # provision this to a genuinely trusted hub process's .env to opt back into the admin
+    # fast-path. See auth.py::ApiKeyVerifier and tools/messaging.py::send_prompt.
+    mcp_admin_api_key: str | None = None
 
     # Peer registry — JSON list of PeerConfig
     peers: list[PeerConfig] = Field(default_factory=list)

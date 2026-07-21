@@ -302,6 +302,12 @@ class _Runtime:
     last_activity_ts: float | None = None
     degraded_activity_ts: float | None = None
     hookless_warning_logged: bool = False
+    # FMC-9 Bug 2: set (to time.monotonic()) whenever a remote-originated turn may still be
+    # executing even though `inflight` is None -- an unanswered FYI push, or the window right
+    # after an ambiguous/unknown consumption verdict cleared `inflight`. Consulted by
+    # _handle_send_teams so "no in-flight message" is no longer treated as proof the local
+    # operator is directly driving the session. See _mark_remote_context/_remote_context_active.
+    remote_turn_started_ts: float | None = None
 
 
 # Populated by _serve before any loop or tool handler runs.
@@ -733,6 +739,27 @@ _CONSUMED = "consumed"  # the agent called reply() -> reply_event set (happy pat
 _DEAD = "dead"  # POSITIVE non-consumption evidence -> bounce + count toward degrade
 _UNKNOWN = "unknown"  # ambiguous timeout -> do NOT bounce (leave un-finalized; late reply wins)
 
+# FMC-9 Bug 2: how long after an FYI push (or an ambiguous/unknown consumption verdict) a
+# still-no-in-flight-message state is treated as "a remote-originated turn might still be
+# executing" rather than "the operator is idle and just typed this directly". Deliberately a
+# fixed internal constant, not an operator-tunable setting -- it's a narrow safety margin, not a
+# knob anyone needs to reach for.
+_REMOTE_CONTEXT_GRACE_S = 60.0
+
+
+def _mark_remote_context(rt: "_Runtime") -> None:
+    """Start (or refresh) the remote-context grace window (`_Runtime.remote_turn_started_ts`)."""
+    rt.remote_turn_started_ts = time.monotonic()
+
+
+def _clear_remote_context(rt: "_Runtime") -> None:
+    rt.remote_turn_started_ts = None
+
+
+def _remote_context_active(rt: "_Runtime") -> bool:
+    ts = rt.remote_turn_started_ts
+    return ts is not None and (time.monotonic() - ts) < _REMOTE_CONTEXT_GRACE_S
+
 
 async def _await_consumption(
     cfg: ChannelConfig,
@@ -907,10 +934,14 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                         # late-reply push-back). Push WITHOUT holding the one-in-flight slot —
                         # an unanswered FYI would otherwise wedge this mailbox for
                         # reply_timeout (30 min default) — and auto-finalize the mesh message
-                        # so it doesn't sit 'delivered' until the 7-day TTL. Permission
-                        # requests raised by the FYI's turn see NO in-flight message: the
-                        # exact state a post-reply-timeout turn already produces today
-                        # (local terminal dialog / operator_direct send_teams stamping).
+                        # so it doesn't sit 'delivered' until the 7-day TTL. Permission requests
+                        # raised by the FYI's turn see NO in-flight message, same as the
+                        # operator's own local work (left to the local terminal dialog). FMC-9
+                        # Bug 2: send_teams must NOT treat this no-in-flight window as
+                        # operator_direct-trusted, since the agent may still be acting on the
+                        # FYI's (remote-originated) content — mark the remote-context grace
+                        # window so _handle_send_teams stamps neither trust flag until it lapses.
+                        _mark_remote_context(rt)
                         await _push(write_stream, msg)
                         _log(
                             f"pushed FYI {msg.get('id')} from {msg.get('sender')} "
@@ -940,7 +971,21 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                     finally:
                         rt.inflight = None
                     # A reply may have raced in right at the boundary — treat that as consumed.
-                    if verdict == _CONSUMED or rt.reply_event.is_set():
+                    consumed = verdict == _CONSUMED or rt.reply_event.is_set()
+                    if verdict == _UNKNOWN and not consumed:
+                        # FMC-9 Bug 2: the reply budget elapsed with no death evidence, so the
+                        # original turn may STILL genuinely be executing (that's exactly why we
+                        # don't bounce it below) — `inflight` just got cleared above, but a
+                        # send_teams call landing right now could still be part of that
+                        # remote-originated turn. Keep the remote-context grace window open
+                        # rather than letting _handle_send_teams treat this as operator-idle.
+                        _mark_remote_context(rt)
+                    else:
+                        # CONSUMED (normal completion) or DEAD (confirmed not running) — the
+                        # turn is genuinely over; a subsequent send_teams call is unambiguously
+                        # a fresh local-operator action.
+                        _clear_remote_context(rt)
+                    if consumed:
                         rt.consecutive_nonconsumption = 0
                         continue
                     if verdict == _UNKNOWN:
@@ -1197,15 +1242,23 @@ async def _handle_send_teams(
     target = str(target).strip() if target else None
     via_fleet_channel = bool(arguments.get("via_fleet_channel")) and not target
     # Stamp the hub-trusted context. Two trusted origins:
-    #   * NO in-flight task -> the OPERATOR is driving this session directly (their own action on
-    #     their own machine), trusted exactly as the channel already treats the operator's local
-    #     turns (see _handle_permission's inflight-None branch). Stamp operator_direct.
+    #   * NO in-flight task AND no remote-originated turn might still be executing (FMC-9 Bug 2 —
+    #     see _remote_context_active) -> the OPERATOR is driving this session directly (their own
+    #     action on their own machine), trusted exactly as the channel already treats the
+    #     operator's local turns (see _handle_permission's inflight-None branch). Stamp
+    #     operator_direct.
     #   * an in-flight task -> only an admin-triggered task ADDRESSED to this identity carries
     #     triggering_admin (mirrors the permission relay's auto-allow gate). A non-admin pushed
     #     task carries neither flag, so the hub refuses it — fail safe.
+    #   * NO in-flight task BUT a remote-originated turn might still be executing (an unanswered
+    #     FYI being acted on, or the grace window right after an ambiguous consumption verdict) ->
+    #     neither trusted origin applies; stamp neither flag so the hub fails safe and refuses.
     inflight = _RT.inflight if isinstance(_RT.inflight, dict) else None
     if inflight is None:
-        metadata: dict[str, Any] = {"operator_direct": True}
+        if _remote_context_active(_RT):
+            metadata: dict[str, Any] = {}
+        else:
+            metadata = {"operator_direct": True}
     else:
         in_meta = inflight.get("metadata") if isinstance(inflight.get("metadata"), dict) else {}
         addressed = inflight.get("recipient_session") == cfg.identity

@@ -82,6 +82,50 @@ async def messaging_server(monkeypatch, settings_factory):
         await test_store.close()
 
 
+@pytest.fixture
+async def unauth_messaging_server(monkeypatch, settings_factory):
+    """Same as `messaging_server` but with auth disabled entirely (auth=None) -- confirms
+    _caller_is_admin() degrades safely (no AuthenticatedUser in scope -> get_access_token()
+    returns None) rather than raising or defaulting to admin-trusted."""
+    settings = settings_factory(mcp_auth_enabled=False, mcp_api_key=None)
+    test_store = Store(settings)
+    await test_store.initialize()
+    monkeypatch.setattr(messaging_mod, "store", test_store)
+    monkeypatch.setattr(messaging_mod, "settings", settings)
+
+    test_mcp = FastMCP(name="send-prompt-admin-trust-unauth-test", auth=None)
+    for fn in (messaging_mod.send_prompt, messaging_mod.wait_for_instruction):
+        test_mcp.tool(fn)
+
+    sock, port = _bind_ephemeral_socket()
+    url = f"http://127.0.0.1:{port}/mcp"
+    server_task = asyncio.create_task(
+        test_mcp.run_http_async(
+            host="127.0.0.1", sockets=[sock], show_banner=False, log_level="error"
+        )
+    )
+    try:
+        last_exc: Exception | None = None
+        for _ in range(100):
+            try:
+                async with Client(url) as c:
+                    await c.call_tool("wait_for_instruction", {"timeout": 0})
+                break
+            except Exception as e:
+                last_exc = e
+                await asyncio.sleep(0.02)
+        else:
+            raise RuntimeError(f"test server never became ready: {last_exc}")
+
+        yield url
+    finally:
+        server_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await server_task
+        sock.close()
+        await test_store.close()
+
+
 def _perm_params(tool_name: str, request_id: str = "req-1") -> dict:
     return {
         "request_id": request_id,
@@ -184,3 +228,24 @@ async def test_send_prompt_without_triggering_admin_key_untouched(messaging_serv
     stored = res.data["message"]
     assert "triggering_admin" not in stored["metadata"]
     assert stored["metadata"]["foo"] == "bar"
+
+
+async def test_unauthenticated_server_cannot_set_triggering_admin(unauth_messaging_server):
+    """With auth disabled entirely (no bearer at all -- MCP_AUTH_ENABLED=false), there is no
+    authenticated identity to trust, so get_access_token() must resolve to None and
+    _caller_is_admin() must be False -- triggering_admin still clamps to False, never defaults
+    to trusted just because auth is off."""
+    async with Client(unauth_messaging_server) as sender:
+        await sender.call_tool(
+            "send_prompt",
+            {
+                "prompt": "do the thing",
+                "recipient_session": IDENTITY,
+                "metadata": {"triggering_admin": True},
+            },
+        )
+    async with Client(unauth_messaging_server) as claimer:
+        res = await claimer.call_tool(
+            "wait_for_instruction", {"recipient_session": IDENTITY, "timeout": 5}
+        )
+    assert res.data["message"]["metadata"]["triggering_admin"] is False

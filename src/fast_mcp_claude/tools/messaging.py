@@ -84,7 +84,10 @@ async def send_prompt(
         # truth -- only ever allowed to STAY true, never forced true -- so a downstream consumer
         # (e.g. channel.py's permission relay) can trust the stored value without re-deriving it.
         if metadata is not None and "triggering_admin" in metadata:
-            metadata["triggering_admin"] = bool(metadata["triggering_admin"]) and _caller_is_admin()
+            # `is True` (not a bool() coercion) mirrors channel.py's own strict check -- only
+            # the JSON literal `true` counts, not any other truthy value.
+            claimed_admin = metadata["triggering_admin"] is True
+            metadata["triggering_admin"] = claimed_admin and _caller_is_admin()
         sender_name = (sender or "unknown").strip()[:64] or "unknown"
 
         message_id = await store.enqueue_message(

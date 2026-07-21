@@ -743,7 +743,13 @@ _UNKNOWN = "unknown"  # ambiguous timeout -> do NOT bounce (leave un-finalized; 
 # still-no-in-flight-message state is treated as "a remote-originated turn might still be
 # executing" rather than "the operator is idle and just typed this directly". Deliberately a
 # fixed internal constant, not an operator-tunable setting -- it's a narrow safety margin, not a
-# knob anyone needs to reach for.
+# knob anyone needs to reach for. A blind timer alone would be bypassable by any turn that simply
+# takes longer than this to reach its send_teams call (ordinary agentic latency, not an edge
+# case) -- so _remote_context_active also extends the window using the SAME hook-status-file
+# liveness signal _await_consumption's Layer C fast path already trusts to distinguish "still
+# working" from "done" (see below). Only the fallback for a deployment with NO status file
+# configured is a bare fixed-timer heuristic, same documented limitation as the liveness fast
+# path being "inert" without one.
 _REMOTE_CONTEXT_GRACE_S = 60.0
 
 
@@ -758,7 +764,19 @@ def _clear_remote_context(rt: "_Runtime") -> None:
 
 def _remote_context_active(rt: "_Runtime") -> bool:
     ts = rt.remote_turn_started_ts
-    return ts is not None and (time.monotonic() - ts) < _REMOTE_CONTEXT_GRACE_S
+    if ts is None:
+        return False
+    cfg = rt.cfg
+    if cfg.status_file:
+        # The consumer has shown real activity (UserPromptSubmit/Stop bumping updated_at) within
+        # the grace window as recently as right now -- the turn plausibly hasn't finished, no
+        # matter how long ago the FYI/ambiguous-verdict window originally opened. Without this, a
+        # turn that simply takes longer than _REMOTE_CONTEXT_GRACE_S to call send_teams would
+        # regain operator_direct trust mid-turn.
+        updated = _status_updated_at(cfg)
+        if updated is not None and (time.time() - updated) < _REMOTE_CONTEXT_GRACE_S:
+            return True
+    return (time.monotonic() - ts) < _REMOTE_CONTEXT_GRACE_S
 
 
 async def _await_consumption(
@@ -968,8 +986,15 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                         verdict = await _await_consumption(
                             cfg, rt, baseline_ts, baseline_activity_ts
                         )
-                    finally:
+                    except BaseException:
                         rt.inflight = None
+                        # FMC-9 defense-in-depth: an unexpected error here means we can't prove
+                        # the pushed turn actually finished — fail safe by keeping the
+                        # remote-context window open rather than silently falling back to
+                        # operator_direct trust on the next send_teams call.
+                        _mark_remote_context(rt)
+                        raise
+                    rt.inflight = None
                     # A reply may have raced in right at the boundary — treat that as consumed.
                     consumed = verdict == _CONSUMED or rt.reply_event.is_set()
                     if verdict == _UNKNOWN and not consumed:

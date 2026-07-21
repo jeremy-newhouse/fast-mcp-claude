@@ -1204,6 +1204,42 @@ def test_handle_send_teams_recovers_operator_direct_after_grace_window(send_team
     assert "posted to Teams" in out[0].text
 
 
+def test_handle_send_teams_status_file_activity_extends_grace_window(send_teams_rig, tmp_path):
+    # A blind timer alone would let trust return to operator_direct once the grace period
+    # elapses since the mark, even if the agent is still actively working on the remote-
+    # originated turn (ordinary agentic latency, not an edge case). The status file's
+    # updated_at (bumped by the real CC hooks on UserPromptSubmit/Stop) is a stronger,
+    # activity-based signal that must extend the window instead of letting it lapse.
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({"updated_at": channel_mod.time.time()}))  # recent activity
+    cfg = _cfg(enabled=True, status_file=str(sf))
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    # Marked long enough ago that the plain monotonic timer alone would already have expired.
+    channel_mod._RT.remote_turn_started_ts = (
+        channel_mod.time.monotonic() - channel_mod._REMOTE_CONTEXT_GRACE_S - 1.0
+    )
+    out = anyio.run(channel_mod._call_tool, "send_teams", {"text": "x", "target": "Eng"})
+    _, _, meta = send_teams_rig["calls"][0]
+    assert "operator_direct" not in meta
+    assert "NOT posted" in out[0].text
+
+
+def test_handle_send_teams_stale_status_file_does_not_extend_grace_window(send_teams_rig, tmp_path):
+    # A status file whose activity is ALSO stale must not artificially hold the window open --
+    # only genuinely recent hook activity extends it.
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({"updated_at": 100.0}))  # ancient, unrelated to "now"
+    cfg = _cfg(enabled=True, status_file=str(sf))
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    channel_mod._RT.remote_turn_started_ts = (
+        channel_mod.time.monotonic() - channel_mod._REMOTE_CONTEXT_GRACE_S - 1.0
+    )
+    out = anyio.run(channel_mod._call_tool, "send_teams", {"text": "x", "target": "Eng"})
+    _, _, meta = send_teams_rig["calls"][0]
+    assert meta.get("operator_direct") is True
+    assert "posted to Teams" in out[0].text
+
+
 # -------------------------------- ECA-71 Layer C: fast liveness signal (_await_consumption)
 
 

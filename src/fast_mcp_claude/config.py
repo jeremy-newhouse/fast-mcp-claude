@@ -213,6 +213,16 @@ class Settings(BaseSettings):
     peer_request_timeout: float = 30.0
 
     @property
+    def mcp_auth_effective(self) -> bool:
+        """Whether requests will actually be authenticated at runtime.
+
+        Single source of truth for server.py's fail-closed startup check and
+        __main__.py's startup log, so the two can't drift into reporting
+        different answers for the same config (e.g. an empty-string API key).
+        """
+        return bool(self.mcp_api_key) and self.mcp_auth_enabled
+
+    @property
     def db_full_path(self) -> Path:
         """Resolve and create parent dir of the sqlite store path."""
         path = Path(os.path.expanduser(self.db_path))

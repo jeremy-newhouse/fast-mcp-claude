@@ -93,7 +93,7 @@ async def request_teams_send(
 async def wait_for_pending_teams_send(
     timeout: Annotated[
         float | None,
-        Field(description="Max seconds to block (capped by poll_max_wait_s)"),
+        Field(description="Max seconds to block (capped at 300s)"),
     ] = None,
 ) -> dict[str, Any]:
     try:
@@ -155,7 +155,7 @@ async def await_teams_send(
     request_id: Annotated[str, Field(description="ID from request_teams_send")],
     timeout: Annotated[
         float | None,
-        Field(description="Max seconds to block (capped by poll_max_wait_s)"),
+        Field(description="Max seconds to block (capped at 300s)"),
     ] = None,
 ) -> dict[str, Any]:
     try:

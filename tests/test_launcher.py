@@ -988,8 +988,11 @@ async def test_heartbeat_trips_reconnect_after_consecutive_failures():
     client = _AnnounceRaises(RuntimeError("Session terminated"))
     ev = asyncio.Event()
     owner_confirmed = asyncio.Event()
+    owner_wait_abandoned = asyncio.Event()
     await asyncio.wait_for(
-        L._heartbeat_loop(client, _cfg(heartbeat=0.0), L._Counter(), ev, owner_confirmed),
+        L._heartbeat_loop(
+            client, _cfg(heartbeat=0.0), L._Counter(), ev, owner_confirmed, owner_wait_abandoned
+        ),
         timeout=2.0,
     )
     assert ev.is_set()  # signalled the bridge to rebuild
@@ -998,15 +1001,22 @@ async def test_heartbeat_trips_reconnect_after_consecutive_failures():
 
 async def test_heartbeat_auth_failure_never_trips_reconnect():
     """A bad bearer won't be fixed by reconnecting (and could re-arm the 60s lockout), so an
-    auth error must keep retrying without ever signalling a rebuild."""
+    auth error must keep retrying without ever signalling a rebuild — but it MUST eventually
+    give up waiting on owner confirmation (FMC-15 adversarial-review finding: this used to
+    deadlock the bridge's owner-token gate forever on a persistently bad bearer)."""
     client = _AnnounceRaises(RuntimeError("401 Unauthorized"))
     ev = asyncio.Event()
     owner_confirmed = asyncio.Event()
+    owner_wait_abandoned = asyncio.Event()
     task = asyncio.create_task(
-        L._heartbeat_loop(client, _cfg(heartbeat=0.0), L._Counter(), ev, owner_confirmed)
+        L._heartbeat_loop(
+            client, _cfg(heartbeat=0.0), L._Counter(), ev, owner_confirmed, owner_wait_abandoned
+        )
     )
     await asyncio.sleep(0.05)  # let it fail many times
     assert not ev.is_set()
+    assert not owner_confirmed.is_set()
+    assert owner_wait_abandoned.is_set()  # gives up waiting rather than deadlocking forever
     assert not task.done()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1029,8 +1039,12 @@ async def test_heartbeat_transient_blip_does_not_accumulate():
 
     ev = asyncio.Event()
     owner_confirmed = asyncio.Event()
+    owner_wait_abandoned = asyncio.Event()
     task = asyncio.create_task(
-        L._heartbeat_loop(_FlakyOnce(), _cfg(heartbeat=0.0), L._Counter(), ev, owner_confirmed)
+        L._heartbeat_loop(
+            _FlakyOnce(), _cfg(heartbeat=0.0), L._Counter(), ev, owner_confirmed,
+            owner_wait_abandoned,
+        )
     )
     await asyncio.sleep(0.05)
     assert not ev.is_set()
@@ -1107,6 +1121,95 @@ async def test_owner_token_refused_never_reaps_or_claims(monkeypatch):
     assert "announce" in calls_before_cancel
     assert "list_messages" not in calls_before_cancel
     assert "wait_for_instruction" not in calls_before_cancel
+
+
+async def test_owner_wait_abandoned_lets_bridge_proceed_on_persistent_auth_failure(monkeypatch):
+    """Adversarial-review finding on FMC-15's first pass: a persistently bad bearer (every
+    announce raises a 401-shaped exception) never yields a well-formed IDENTITY_LIVE_ELSEWHERE
+    refusal, so blocking the owner-token gate on owner_confirmed alone would deadlock _bridge
+    FOREVER — a pure regression versus pre-fix behavior, which at least reached the poll loop
+    and let its own reconnect-with-backoff handling take over. The gate must give up waiting
+    instead."""
+    calls: list[str] = []
+
+    class _AuthBrokenClient:
+        async def call_tool(self, name, args):
+            calls.append(name)
+            raise RuntimeError("401 Unauthorized")
+
+    class _Conn:
+        async def __aenter__(self):
+            return _AuthBrokenClient()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("fastmcp.Client", lambda *a, **kw: _Conn())
+    cfg = _cfg(identity="mini2_launcher", heartbeat=0.01, poll=0.01)
+    task = asyncio.create_task(L._bridge(cfg))
+    await asyncio.sleep(0.3)
+    calls_before_cancel = list(calls)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls_before_cancel.count("announce") >= L._AUTH_FAILS_BEFORE_GIVING_UP
+    # Must have gotten PAST the gate to attempt real work instead of permanently blocking.
+    assert "list_messages" in calls_before_cancel or "wait_for_instruction" in calls_before_cancel
+
+
+async def test_bridge_bounces_message_claimed_after_mid_poll_refusal(monkeypatch):
+    """Adversarial-review finding on FMC-15's first pass: wait_for_instruction already claims a
+    message server-side before returning, so an IDENTITY_LIVE_ELSEWHERE refusal discovered WHILE
+    a poll is in flight can still surface a real message even though ownership is no longer
+    confirmed. The bridge must bounce it (fail-fast reply) instead of silently running it."""
+    announce_calls = 0
+    replies: list[dict] = []
+
+    class _TogglingClient:
+        def __init__(self):
+            self.refused = asyncio.Event()
+
+        async def call_tool(self, name, args):
+            nonlocal announce_calls
+            if name == "announce":
+                announce_calls += 1
+                if announce_calls == 1:
+                    return FakeClient._Res({"success": True})
+                self.refused.set()
+                return FakeClient._Res(
+                    {"success": False, "error": {"code": "IDENTITY_LIVE_ELSEWHERE"}}
+                )
+            if name == "wait_for_instruction":
+                await self.refused.wait()  # don't surface the message until refused
+                return FakeClient._Res(
+                    {"success": True, "message": {"id": "b" * 32, "sender": "x"}}
+                )
+            if name == "reply":
+                replies.append(dict(args))
+                return FakeClient._Res({"success": True})
+            if name == "list_messages":
+                return FakeClient._Res({"success": True, "messages": []})
+            raise AssertionError(f"unexpected call {name!r}")
+
+    client = _TogglingClient()
+
+    class _Conn:
+        async def __aenter__(self):
+            return client
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("fastmcp.Client", lambda *a, **kw: _Conn())
+    cfg = _cfg(identity="mini2_launcher", heartbeat=0.02, poll=5.0)
+    task = asyncio.create_task(L._bridge(cfg))
+    await asyncio.sleep(0.3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(replies) == 1
+    assert replies[0]["message_id"] == "b" * 32
+    assert json.loads(replies[0]["response"])["error"] == "launcher_identity_uncertain"
 
 
 # ================================================================ FMC-15: reply survives reconnect

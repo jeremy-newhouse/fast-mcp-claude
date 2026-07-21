@@ -3,9 +3,11 @@ id: FMC-14
 title: >-
   Fix hook.py: authenticated permission-relay client passes an unsupported
   headers kwarg, silently disabling controller approval
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@claude'
 created_date: '2026-07-21 14:44'
+updated_date: '2026-07-21 17:27'
 labels:
   - security
   - hook
@@ -42,7 +44,29 @@ Fix direction (for context, not a mandate): construct the Client using whatever 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 When MCP_API_KEY is configured, the hook's authenticated relay path successfully constructs a client against the installed fastmcp version without raising a TypeError, and successfully calls request_approval and await_decision against a running local server
-- [ ] #2 An authenticated deployment (MCP_API_KEY set) can complete a full controller-approval round trip end to end: a worker's tool call reaches the local server's request_approval, a simulated controller decision via approve_tool is observed by await_decision, and the hook emits the corresponding allow or deny permissionDecision instead of falling back to ask
-- [ ] #3 A regression test exercises the authenticated relay path (Client construction plus at least one call_tool round trip) against the actual installed fastmcp version so a future incompatible client-construction change fails CI instead of silently degrading to the ask fallback
+- [x] #1 When MCP_API_KEY is configured, the hook's authenticated relay path successfully constructs a client against the installed fastmcp version without raising a TypeError, and successfully calls request_approval and await_decision against a running local server
+- [x] #2 An authenticated deployment (MCP_API_KEY set) can complete a full controller-approval round trip end to end: a worker's tool call reaches the local server's request_approval, a simulated controller decision via approve_tool is observed by await_decision, and the hook emits the corresponding allow or deny permissionDecision instead of falling back to ask
+- [x] #3 A regression test exercises the authenticated relay path (Client construction plus at least one call_tool round trip) against the actual installed fastmcp version so a future incompatible client-construction change fails CI instead of silently degrading to the ask fallback
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Verify installed fastmcp 3.4.4 Client constructor API directly (not memory/docs) -- confirmed via inspect.signature: Client has no headers param, but has auth: httpx.Auth | Literal['oauth'] | str | None, and StreamableHttpTransport._set_auth wraps a plain str in BearerAuth automatically.
+2. Fix hook.py _relay() to construct Client(url, auth=api_key or None) instead of passing an unsupported headers kwarg.
+3. Add tests/test_hook.py: a relay_server fixture that serves the REAL request_approval/await_decision/pending_approvals/approve_tool tool functions (rebound to an isolated Store via monkeypatch, not the process singleton) over a real ephemeral HTTP port guarded by the real ApiKeyVerifier, then two full round-trip tests (allow, deny) driving hook._relay() as the worker side and a second authenticated Client as the controller side calling approve_tool, plus a wrong-api-key rejection test.
+4. Confirm regression coverage: git stash hook.py's fix and confirm the round-trip tests fail with the exact TypeError described in the bug (Client.__init__() got an unexpected keyword argument 'headers'), then restore the fix.
+5. Run full test suite + ruff check/format.
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Verified installed fastmcp 3.4.4 Client.__init__ signature directly (inspect.signature) and StreamableHttpTransport._set_auth source: no headers kwarg exists; auth accepts httpx.Auth | Literal['oauth'] | str | None, and a plain str is auto-wrapped in BearerAuth (Authorization: Bearer <token>). Fixed hook.py's _relay() to use Client(url, auth=api_key or None). Added tests/test_hook.py with a relay_server fixture serving the real permissions.py tool functions (request_approval/await_decision/pending_approvals/approve_tool) rebound to an isolated Store via monkeypatch onto a fresh FastMCP instance guarded by the real ApiKeyVerifier, over a real ephemeral TCP port -- so the test exercises genuine installed-fastmcp Client/server/auth code, not stubs. 3 new tests: allow round trip, deny round trip, wrong-api-key rejection.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Fixed hook.py's _relay(): replaced Client(url, headers={...}) -- an unsupported kwarg that raised TypeError on every authenticated call, per inspect.signature(Client.__init__) against the actual installed fastmcp 3.4.4 -- with Client(url, auth=api_key or None), the constructor's real bearer-token mechanism (a plain str auth value is auto-wrapped in BearerAuth by StreamableHttpTransport._set_auth). Added tests/test_hook.py (3 tests) that serve the real request_approval/await_decision/pending_approvals/approve_tool tools over a real HTTP port guarded by the real ApiKeyVerifier, driving hook._relay() as the worker side and a second authenticated Client as the controller: full allow round trip, full deny round trip, and wrong-api-key rejection. Confirmed via git stash that both round-trip tests fail against the pre-fix code with the exact predicted TypeError (Client.__init__() got an unexpected keyword argument 'headers'), and pass after the fix. Full suite: 301 passed (up from 298); ruff check clean; ruff format --check flags the same 9 pre-existing-drift files already documented in FMC-4/6/8's session notes, none touched by this branch. All 3 ACs verified with objective evidence.
+<!-- SECTION:FINAL_SUMMARY:END -->

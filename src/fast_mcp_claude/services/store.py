@@ -528,6 +528,16 @@ class Store:
         await cur.close()
         return [_row_to_approval(r) for r in rows]
 
+    async def wait_for_pending_approvals(
+        self, timeout: float, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        async def check() -> list[dict[str, Any]] | None:
+            rows = await self.list_pending_approvals(limit)
+            return rows if rows else None
+
+        result = await self._notifier.wait_for(self._approval_queue_key(), check, timeout)
+        return result or []
+
     # -------------------------------------------------------------- teams outbox
     # ADR-0013: a peer live session asks the hub to post to Teams. Mirrors approvals
     # (create -> controller drains pending -> controller completes -> requester awaits

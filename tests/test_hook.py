@@ -75,6 +75,8 @@ async def relay_server(monkeypatch, settings_factory):
         server_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await server_task
+        # Hard-cancelling uvicorn skips its normal socket cleanup.
+        sock.close()
         await test_store.close()
 
 

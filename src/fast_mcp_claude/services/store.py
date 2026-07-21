@@ -134,6 +134,9 @@ class Notifier:
 
     def __init__(self) -> None:
         self._events: dict[str, asyncio.Event] = {}
+        # Active wait_for() calls currently parked per key, so forget() can
+        # refuse to evict a key out from under a live waiter (FMC-5 AC#2).
+        self._waiters: dict[str, int] = {}
 
     def _get(self, key: str) -> asyncio.Event:
         ev = self._events.get(key)
@@ -148,13 +151,36 @@ class Notifier:
             ev.set()
             self._events[key] = asyncio.Event()
 
+    def notify_prefix(self, prefix: str) -> None:
+        """Notify every key currently registered under `prefix`.
+
+        Used for broadcast enqueues, where every identity-scoped `inbox:<session>`
+        waiter can claim the row (not just a wildcard `inbox:*` listener) and so
+        must all wake, not only the one key an addressed enqueue would notify.
+        """
+        for key in list(self._events):
+            if key.startswith(prefix):
+                self.notify(key)
+
+    def forget(self, key: str) -> None:
+        """Drop a resolved key's event so Notifier._events doesn't grow without
+        bound over a long-running process (FMC-5 AC#2). Refuses to evict a key
+        that still has an active waiter parked on it.
+        """
+        if self._waiters.get(key, 0) > 0:
+            return
+        self._events.pop(key, None)
+        self._waiters.pop(key, None)
+
     async def wait_for(
         self,
         key: str,
         check: Callable[[], Awaitable[T | None]],
         timeout: float,
     ) -> T | None:
-        """Long-poll pattern: check DB now; if empty, wait on the event then re-check.
+        """Long-poll pattern: check DB now; if empty, wait on the event then re-check,
+        continuing to wait out the remaining timeout budget on a lost race (check()
+        still returns None after a wakeup) instead of returning early (FMC-5 AC#3).
 
         Returns the first non-None result from `check()`, or None on timeout.
         """
@@ -169,12 +195,28 @@ class Notifier:
         if timeout <= 0:
             return None
 
+        deadline = time.monotonic() + timeout
+        self._waiters[key] = self._waiters.get(key, 0) + 1
         try:
-            await asyncio.wait_for(ev.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                try:
+                    await asyncio.wait_for(ev.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return None
 
-        return await check()
+                result = await check()
+                if result is not None:
+                    return result
+                # Lost the race (another caller's check() already consumed the
+                # result) or a prefix-wake with nothing for this key; notify()
+                # already swapped in a fresh Event, so re-fetch it and keep
+                # waiting out whatever budget remains.
+                ev = self._get(key)
+        finally:
+            self._waiters[key] = self._waiters.get(key, 0) - 1
 
 
 class Store:
@@ -250,9 +292,14 @@ class Store:
         )
         await self.db.commit()
         # Wake any wait_for_instruction blocked on this recipient (or wildcard).
-        self._notifier.notify(self._inbox_key(recipient_session))
         if recipient_session is not None:
+            self._notifier.notify(self._inbox_key(recipient_session))
             self._notifier.notify(self._inbox_key(None))
+        else:
+            # Genuine broadcast: pop_next_for_worker returns NULL-recipient rows
+            # to ANY identity-scoped caller, so every identity-scoped waiter must
+            # wake too, not just a wildcard `inbox:*` listener (FMC-5 AC#1).
+            self._notifier.notify_prefix("inbox:")
         return message_id
 
     async def pop_next_for_worker(self, recipient_session: str | None) -> dict[str, Any] | None:
@@ -882,20 +929,51 @@ class Store:
 
     # ------------------------------------------------------------------- cleanup
 
-    async def _cleanup_once(self, cutoff: float) -> None:
+    async def _cleanup_once(self, cutoff: float, delete_grace: float = 0.0) -> None:
         """One sweep: expire stale in-flight rows (so waiters unblock) and prune resolved
-        rows older than `cutoff`. Extracted from the periodic loop so it is directly testable."""
+        rows older than `cutoff`. Extracted from the periodic loop so it is directly testable.
+
+        `delete_grace` delays deletion of newly-expired messages by that many extra
+        seconds, so a row marked expired this sweep survives at least one more sweep
+        before being pruned — otherwise the very same pass that marks a row expired
+        also deletes it, and a wait_for_completion() caller never observes
+        status="expired" (FMC-5 AC#4). Applies to the messages table only:
+        teams_outbox/session_relay intentionally keep mark-and-delete in the same
+        pass (see test_teams_outbox.py/test_session_relay.py's
+        test_cleanup_removes_stale_pending) — their own request timeouts are far
+        shorter than the store TTL, so nothing is realistically still waiting by
+        the time cleanup reaches them.
+
+        Also evicts the Notifier's per-id event keys for every row this sweep
+        deletes (outbox:/approval:/teams_outbox:/session_relay:), so
+        Notifier._events does not grow without bound (FMC-5 AC#2). `inbox:<session>`
+        keys are never evicted here — they're reused per identity, not per
+        message, so they stay bounded on their own.
+        """
         async with self._db_lock:
             # Mark old queued/delivered as expired so wait_for_completion unblocks
             await self.db.execute(
                 "UPDATE messages SET status=? WHERE status IN (?, ?) AND created_at<?",
                 (STATUS_EXPIRED, STATUS_QUEUED, STATUS_DELIVERED, cutoff),
             )
-            # Delete fully-resolved old rows
+            # Delete fully-resolved old rows (expired rows get the extra grace above).
+            messages_delete_cutoff = cutoff - delete_grace
+            cur = await self.db.execute(
+                "SELECT id FROM messages WHERE status IN (?, ?, ?) AND created_at<?",
+                (STATUS_REPLIED, STATUS_CANCELLED, STATUS_EXPIRED, messages_delete_cutoff),
+            )
+            deleted_message_ids = [row["id"] for row in await cur.fetchall()]
+            await cur.close()
             await self.db.execute(
                 "DELETE FROM messages WHERE status IN (?, ?, ?) AND created_at<?",
-                (STATUS_REPLIED, STATUS_CANCELLED, STATUS_EXPIRED, cutoff),
+                (STATUS_REPLIED, STATUS_CANCELLED, STATUS_EXPIRED, messages_delete_cutoff),
             )
+            cur = await self.db.execute(
+                "SELECT id FROM approvals WHERE decision IS NOT NULL AND created_at<?",
+                (cutoff,),
+            )
+            deleted_approval_ids = [row["id"] for row in await cur.fetchall()]
+            await cur.close()
             await self.db.execute(
                 "DELETE FROM approvals WHERE decision IS NOT NULL AND created_at<?",
                 (cutoff,),
@@ -908,6 +986,12 @@ class Store:
                 "WHERE status=? AND created_at<?",
                 (OUTBOX_DONE, "expired: no hub pickup in time", OUTBOX_PENDING, cutoff),
             )
+            cur = await self.db.execute(
+                "SELECT id FROM teams_outbox WHERE status=? AND created_at<?",
+                (OUTBOX_DONE, cutoff),
+            )
+            deleted_teams_ids = [row["id"] for row in await cur.fetchall()]
+            await cur.close()
             await self.db.execute(
                 "DELETE FROM teams_outbox WHERE status=? AND created_at<?",
                 (OUTBOX_DONE, cutoff),
@@ -923,6 +1007,12 @@ class Store:
                     cutoff,
                 ),
             )
+            cur = await self.db.execute(
+                "SELECT id FROM session_relay WHERE status=? AND created_at<?",
+                (OUTBOX_DONE, cutoff),
+            )
+            deleted_relay_ids = [row["id"] for row in await cur.fetchall()]
+            await cur.close()
             await self.db.execute(
                 "DELETE FROM session_relay WHERE status=? AND created_at<?",
                 (OUTBOX_DONE, cutoff),
@@ -939,13 +1029,23 @@ class Store:
             )
             await self.db.commit()
 
+        for mid in deleted_message_ids:
+            self._notifier.forget(self._outbox_key(mid))
+        for aid in deleted_approval_ids:
+            self._notifier.forget(self._approval_key(aid))
+        for tid in deleted_teams_ids:
+            self._notifier.forget(self._teams_outbox_key(tid))
+        for sid in deleted_relay_ids:
+            self._notifier.forget(self._session_relay_key(sid))
+
     async def _periodic_cleanup(self) -> None:
         """Background task — expires old queued messages and prunes ancient rows."""
         ttl = self.settings.store_ttl_seconds
+        interval = min(3600, ttl // 4 or 60)
         while True:
             try:
-                await asyncio.sleep(min(3600, ttl // 4 or 60))
-                await self._cleanup_once(time.time() - ttl)
+                await asyncio.sleep(interval)
+                await self._cleanup_once(time.time() - ttl, delete_grace=interval)
             except asyncio.CancelledError:
                 raise
             except Exception:

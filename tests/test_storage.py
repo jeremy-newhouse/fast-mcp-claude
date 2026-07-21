@@ -8,7 +8,9 @@ from fast_mcp_claude.services.store import (
     DECISION_ALLOW,
     DECISION_DENY,
     STATUS_DELIVERED,
+    STATUS_EXPIRED,
     STATUS_REPLIED,
+    Notifier,
     Store,
 )
 
@@ -135,6 +137,32 @@ async def test_broadcast_message_visible_to_any_worker(store: Store):
 
 
 @pytest.mark.asyncio
+async def test_broadcast_wakes_identity_scoped_waiter(store: Store):
+    """Regression (FMC-5 AC#1): a worker long-polling on its own identity key must
+    wake immediately when a broadcast (recipient_session=None) message arrives,
+    not just after the full poll timeout — pop_next_for_worker("foo") does return
+    NULL-recipient rows, but the old enqueue_message only notified the wildcard
+    inbox:* key, never inbox:foo."""
+
+    async def waiter():
+        return await store.wait_for_next_for_worker(recipient_session="foo", timeout=5.0)
+
+    async def producer():
+        await asyncio.sleep(0.05)
+        return await store.enqueue_message(
+            sender="bob", prompt="broadcast ping", recipient_session=None
+        )
+
+    waiter_task = asyncio.create_task(waiter())
+    producer_task = asyncio.create_task(producer())
+
+    result, msg_id = await asyncio.gather(waiter_task, producer_task)
+    assert result is not None
+    assert result["id"] == msg_id
+    assert result["prompt"] == "broadcast ping"
+
+
+@pytest.mark.asyncio
 async def test_approval_round_trip(store: Store):
     approval_id = await store.create_approval(
         session_id="default", tool_name="Bash", tool_input={"command": "ls"}
@@ -171,3 +199,125 @@ async def test_list_messages_filters_by_recipient_session(store: Store):
     assert [m["prompt"] for m in only_a] == ["for A"]
     # unfiltered still returns the whole queue (backward compatible)
     assert len(await store.list_messages(status="queued")) == 3
+
+
+# ------------------------------------------------------------- Notifier (FMC-5)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_continues_after_lost_race():
+    """Regression (FMC-5 AC#3): if check() returns None on wakeup (lost a race to
+    another waiter), wait_for must keep waiting out the remaining timeout budget
+    instead of returning early."""
+    notifier = Notifier()
+    calls: list[int] = []
+
+    async def check():
+        calls.append(1)
+        if len(calls) < 3:
+            return None
+        return "done"
+
+    task = asyncio.create_task(notifier.wait_for("k", check, timeout=2.0))
+    await asyncio.sleep(0.02)
+    notifier.notify("k")  # first wake: check() still returns None (lost race)
+    await asyncio.sleep(0.02)
+    notifier.notify("k")  # second wake: check() finally succeeds
+
+    result = await task
+    assert result == "done"
+    assert len(calls) == 3  # initial check + 2 post-wakeup re-checks
+
+
+@pytest.mark.asyncio
+async def test_wait_for_genuine_timeout_still_returns_none():
+    """A wait that never gets notified must still return None at (approximately)
+    the requested timeout, not early and not hang forever."""
+    notifier = Notifier()
+
+    async def always_empty():
+        return None
+
+    start = asyncio.get_event_loop().time()
+    result = await notifier.wait_for("k", always_empty, timeout=0.1)
+    elapsed = asyncio.get_event_loop().time() - start
+    assert result is None
+    assert elapsed >= 0.1
+
+
+@pytest.mark.asyncio
+async def test_notifier_forget_does_not_evict_an_active_waiter():
+    """Safety property for FMC-5 AC#2's eviction: forget() must not pull the
+    Event out from under a waiter currently parked on that key."""
+    notifier = Notifier()
+
+    async def always_empty():
+        return None
+
+    waiter_task = asyncio.create_task(notifier.wait_for("k", always_empty, timeout=1.0))
+    await asyncio.sleep(0.05)  # let the waiter register and start waiting
+    assert "k" in notifier._events
+
+    notifier.forget("k")
+    assert "k" in notifier._events  # still parked; must not be evicted
+
+    result = await waiter_task
+    assert result is None  # times out normally afterward
+
+    notifier.forget("k")
+    assert "k" not in notifier._events  # now safe to evict
+
+
+@pytest.mark.asyncio
+async def test_cleanup_evicts_resolved_message_notifier_key(store: Store):
+    """Regression (FMC-5 AC#2): Notifier._events must not grow without bound as
+    messages are resolved and pruned over a long-running process."""
+    msg_id = await store.enqueue_message(sender="a", prompt="hi")
+    await store.pop_next_for_worker(recipient_session=None)
+
+    async def waiter():
+        return await store.wait_for_reply(msg_id, timeout=5.0)
+
+    async def replier():
+        await asyncio.sleep(0.05)
+        return await store.record_reply(msg_id, "done")
+
+    await asyncio.gather(waiter(), replier())
+    key = store._outbox_key(msg_id)
+    assert key in store._notifier._events  # lingers after being waited on
+
+    await store.db.execute("UPDATE messages SET created_at=? WHERE id=?", (1000.0, msg_id))
+    await store._cleanup_once(cutoff=2000.0)
+
+    assert await store.get_message(msg_id) is None  # pruned
+    assert key not in store._notifier._events  # and its notifier key evicted
+
+
+@pytest.mark.asyncio
+async def test_expired_message_survives_one_cleanup_cycle_before_deletion(store: Store):
+    """Regression (FMC-5 AC#4): a row marked expired this sweep must be observable
+    (status="expired") for at least one more sweep before it is pruned — the old
+    code deleted it in the very same pass that marked it, so wait_for_completion()
+    callers only ever saw NotFoundError, never status="expired"."""
+    msg_id = await store.enqueue_message(sender="a", prompt="orphaned")
+    await store.db.execute("UPDATE messages SET created_at=? WHERE id=?", (1800.0, msg_id))
+
+    # Sweep 1: crosses the expire threshold, but the grace period keeps it alive.
+    await store._cleanup_once(cutoff=2000.0, delete_grace=500.0)
+    msg = await store.get_message(msg_id)
+    assert msg is not None
+    assert msg["status"] == STATUS_EXPIRED
+
+    # Sweep 2: now old enough (relative to the advanced delete cutoff) to prune.
+    await store._cleanup_once(cutoff=2500.0, delete_grace=500.0)
+    assert await store.get_message(msg_id) is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_without_grace_keeps_legacy_same_pass_delete(store: Store):
+    """Default delete_grace=0.0 preserves the pre-fix same-pass mark+delete
+    behavior for direct callers that don't pass a grace period."""
+    msg_id = await store.enqueue_message(sender="a", prompt="orphaned")
+    await store.db.execute("UPDATE messages SET created_at=? WHERE id=?", (1000.0, msg_id))
+    await store._cleanup_once(cutoff=2000.0)
+    assert await store.get_message(msg_id) is None

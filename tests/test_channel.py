@@ -1856,9 +1856,28 @@ def test_reply_tool_after_bounce_gets_distinguishable_warning(reply_rig, monkeyp
 
     monkeypatch.setattr(channel_mod, "_mesh_reply", failing_mesh_reply)
     reply_rig["set_inflight"](None)  # already cleared by the bounce, same as real _inbox_loop
-    channel_mod._RT.bounced_message_id = "m1"
+    channel_mod._RT.bounced_message_ids.append("m1")
     out = anyio.run(
         channel_mod._call_tool, "reply", {"message_id": "m1", "response": "late answer"}
+    )
+    assert "already finalized by a non-consumption bounce" in out[0].text
+
+
+def test_reply_tool_after_bounce_distinguishes_earlier_bounce_too(reply_rig, monkeypatch):
+    # Adversarial-review finding on this branch: a single-scalar bounced-id tracker only
+    # remembered the MOST RECENT bounce -- degrade_after allows several consecutive bounces
+    # before the session disarms, so a late reply for an EARLIER bounce could arrive after a
+    # LATER bounce overwrote a scalar tracker and wrongly fall back to the generic warning.
+    # Bounded history (a deque, not a scalar) fixes this.
+    async def failing_mesh_reply(cfg, message_id, response):
+        return False
+
+    monkeypatch.setattr(channel_mod, "_mesh_reply", failing_mesh_reply)
+    reply_rig["set_inflight"](None)
+    channel_mod._RT.bounced_message_ids.append("m1")  # bounced first
+    channel_mod._RT.bounced_message_ids.append("m2")  # bounced second (most recent)
+    out = anyio.run(
+        channel_mod._call_tool, "reply", {"message_id": "m1", "response": "late answer for m1"}
     )
     assert "already finalized by a non-consumption bounce" in out[0].text
 
@@ -1871,7 +1890,6 @@ def test_reply_tool_unknown_id_keeps_generic_warning(reply_rig, monkeypatch):
 
     monkeypatch.setattr(channel_mod, "_mesh_reply", failing_mesh_reply)
     reply_rig["set_inflight"](None)
-    channel_mod._RT.bounced_message_id = None
     out = anyio.run(channel_mod._call_tool, "reply", {"message_id": "typod-id", "response": "x"})
     assert "unknown/already-finalized" in out[0].text
     assert "non-consumption bounce" not in out[0].text

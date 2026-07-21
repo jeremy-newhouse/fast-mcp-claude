@@ -5,6 +5,8 @@ import asyncio
 import pytest
 
 from fast_mcp_claude.services.store import OUTBOX_DONE, OUTBOX_PENDING, Store
+from fast_mcp_claude.tools.teams_outbox import request_teams_send
+from fast_mcp_claude.utils.validation import MAX_METADATA_BYTES
 
 
 @pytest.mark.asyncio
@@ -96,3 +98,21 @@ async def test_cleanup_spares_fresh_rows(store: Store):
     await store._cleanup_once(cutoff=1000.0)  # cutoff far in the past
     pending = await store.list_pending_teams_sends()
     assert [p["id"] for p in pending] == [rid]  # still pending, untouched
+
+
+@pytest.fixture
+def wired_request_teams_send(store: Store, monkeypatch):
+    """request_teams_send() reads the `store` name bound in the teams_outbox tool
+    module -- point it at this test's isolated store."""
+    monkeypatch.setattr("fast_mcp_claude.tools.teams_outbox.store", store)
+    return request_teams_send
+
+
+@pytest.mark.asyncio
+async def test_request_teams_send_rejects_oversized_metadata(wired_request_teams_send):
+    """FMC-4: request_teams_send's metadata is json.dumps'd straight into SQLite with
+    no prior cap."""
+    oversized = {"blob": "x" * (MAX_METADATA_BYTES + 1)}
+    result = await wired_request_teams_send(text="hi", metadata=oversized)
+    assert result["success"] is False
+    assert result["error"]["code"] == "VALIDATION_ERROR"

@@ -20,7 +20,7 @@ from pydantic import Field
 from ..errors import ValidationError, format_error_response
 from ..logging_config import SENSITIVE_LOG_FIELDS_EXACT, SENSITIVE_LOG_SUFFIXES, get_logger
 from ..server import mcp, settings, store
-from ..utils.validation import validate_identity
+from ..utils.validation import validate_identity, validate_metadata
 
 logger = get_logger(__name__)
 
@@ -71,8 +71,7 @@ async def announce(
             if not isinstance(summary, str):
                 raise ValidationError("summary must be a string", field="summary")
             summary = summary.strip()[:280] or None
-        if metadata is not None and not isinstance(metadata, dict):
-            raise ValidationError("metadata must be an object", field="metadata")
+        metadata = validate_metadata(metadata)
 
         result = await store.announce(identity, summary=summary, metadata=metadata)
         # Owner-token identity guard (ECA-71 / ADR-0029): the store refuses a second live

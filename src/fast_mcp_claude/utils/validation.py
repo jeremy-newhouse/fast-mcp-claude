@@ -5,6 +5,7 @@ write and pub/sub broadcast, so every tool that takes untrusted input must
 funnel through these validators.
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -23,6 +24,13 @@ MAX_RESPONSE_BYTES = 4_000_000  # 4 MB
 MAX_FILE_BYTES = 10_000_000  # 10 MB
 MAX_FILE_LIST_ENTRIES = 1000
 MAX_PUBSUB_PAYLOAD_BYTES = 256_000  # 256 KB
+# Structured side-channel fields (metadata/payload/result bags attached to a
+# message rather than being the message itself) — same precedent as pubsub.
+MAX_METADATA_BYTES = 256_000  # 256 KB
+# tool_input can legitimately carry prompt-scale content (e.g. a large file
+# write relayed through the permission hook), so it gets the prompt cap.
+MAX_TOOL_INPUT_BYTES = 1_000_000  # 1 MB
+MAX_TOOL_NAME_BYTES = 256
 
 
 def validate_session_id(value: str | None, *, field: str = "session_id") -> str | None:
@@ -157,32 +165,63 @@ def validate_workspace_path(
     # Resolve to canonical form (follows symlinks where they exist).
     resolved = candidate.resolve(strict=False)
 
-    if must_exist and not resolved.exists():
-        raise ValidationError(f"{field} does not exist: {resolved}", field=field)
-
-    # Check it sits under at least one allowed root (also resolved).
+    # Check containment BEFORE touching the filesystem for existence, so a
+    # rejected out-of-sandbox path never leaks (via error type or message)
+    # whether it actually exists.
     for root in workspace_roots:
         try:
             resolved.relative_to(root)
-            return resolved
+            break
         except ValueError:
             continue
+    else:
+        raise PermissionDeniedError(
+            f"{field} {resolved} is outside WORKSPACE_ROOTS",
+            details={"allowed_roots": [str(r) for r in workspace_roots]},
+        )
 
-    raise PermissionDeniedError(
-        f"{field} {resolved} is outside WORKSPACE_ROOTS",
-        details={"allowed_roots": [str(r) for r in workspace_roots]},
-    )
+    if must_exist and not resolved.exists():
+        raise ValidationError(f"{field} does not exist: {resolved}", field=field)
+
+    return resolved
+
+
+def validate_json_object_size(value: dict, *, max_bytes: int, field: str) -> dict:
+    """Reject a structured (dict) field once its JSON encoding exceeds max_bytes.
+
+    Shared by every tool that json.dumps's a caller-supplied dict straight into
+    SQLite (metadata/payload/result/tool_input bags) — without this, such a
+    field bypasses every other documented body-size cap.
+    """
+    if not isinstance(value, dict):
+        raise ValidationError(f"{field} must be a JSON object", field=field)
+    encoded = json.dumps(value).encode("utf-8")
+    if len(encoded) > max_bytes:
+        raise ValidationError(
+            f"{field} exceeds {max_bytes} bytes",
+            field=field,
+        )
+    return value
 
 
 def validate_pubsub_payload(payload: dict, *, field: str = "payload") -> dict:
-    if not isinstance(payload, dict):
-        raise ValidationError(f"{field} must be a JSON object", field=field)
-    import json
+    return validate_json_object_size(payload, max_bytes=MAX_PUBSUB_PAYLOAD_BYTES, field=field)
 
-    encoded = json.dumps(payload).encode("utf-8")
-    if len(encoded) > MAX_PUBSUB_PAYLOAD_BYTES:
-        raise ValidationError(
-            f"{field} exceeds {MAX_PUBSUB_PAYLOAD_BYTES} bytes",
-            field=field,
-        )
-    return payload
+
+def validate_metadata(value: dict | None, *, field: str = "metadata") -> dict | None:
+    """Validate an optional structured metadata/payload/result field."""
+    if value is None:
+        return None
+    return validate_json_object_size(value, max_bytes=MAX_METADATA_BYTES, field=field)
+
+
+def validate_tool_name(value: str, *, field: str = "tool_name") -> str:
+    if not isinstance(value, str) or not value:
+        raise ValidationError(f"{field} is required", field=field)
+    if len(value.encode("utf-8")) > MAX_TOOL_NAME_BYTES:
+        raise ValidationError(f"{field} exceeds {MAX_TOOL_NAME_BYTES} bytes", field=field)
+    return value
+
+
+def validate_tool_input(value: dict, *, field: str = "tool_input") -> dict:
+    return validate_json_object_size(value, max_bytes=MAX_TOOL_INPUT_BYTES, field=field)

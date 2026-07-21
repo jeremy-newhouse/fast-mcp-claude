@@ -24,6 +24,7 @@ from ..logging_config import get_logger
 from ..server import mcp, settings, store
 from ..utils.validation import (
     validate_message_id,
+    validate_metadata,
     validate_response,
     validate_session_id,
     validate_timeout,
@@ -65,8 +66,7 @@ async def request_teams_send(
             if not isinstance(target, str):
                 raise ValidationError("target must be a string", field="target")
             target = target.strip()[:_MAX_TARGET] or None
-        if metadata is not None and not isinstance(metadata, dict):
-            raise ValidationError("metadata must be an object", field="metadata")
+        metadata = validate_metadata(metadata)
         requester = validate_session_id(requester_session, field="requester_session") or "default"
 
         request_id = await store.create_teams_send(

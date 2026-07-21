@@ -18,6 +18,7 @@ from ..logging_config import get_logger
 from ..server import mcp, settings, store
 from ..utils.validation import (
     validate_message_id,
+    validate_metadata,
     validate_prompt,
     validate_response,
     validate_session_id,
@@ -64,6 +65,7 @@ async def send_prompt(
     try:
         prompt = validate_prompt(prompt)
         recipient_session = validate_session_id(recipient_session, field="recipient_session")
+        metadata = validate_metadata(metadata)
         sender_name = (sender or "unknown").strip()[:64] or "unknown"
 
         message_id = await store.enqueue_message(

@@ -38,6 +38,7 @@ def _cfg(tmp_path: Path, sock_path: Path) -> Config:
         mesh_api_key=None,
         machine="testhost",
         announce_interval_s=60,
+        mcp_startup_grace_s=0.0,
         socket_override=sock_path,
     )
 

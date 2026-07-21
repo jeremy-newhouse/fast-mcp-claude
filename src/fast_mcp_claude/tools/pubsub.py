@@ -72,7 +72,7 @@ async def subscribe(
     ] = 0,
     timeout: Annotated[
         float | None,
-        Field(description="Max seconds to block (capped by poll_max_wait_s)"),
+        Field(description="Max seconds to block (capped at 300s)"),
     ] = None,
 ) -> dict[str, Any]:
     try:

@@ -100,7 +100,7 @@ async def wait_for_completion(
     message_id: Annotated[str, Field(description="ID returned from send_prompt")],
     timeout: Annotated[
         float | None,
-        Field(description="Max seconds to wait (capped by server's poll_max_wait_s)"),
+        Field(description="Max seconds to wait (capped at 300s)"),
     ] = None,
 ) -> dict[str, Any]:
     try:
@@ -258,7 +258,7 @@ async def wait_for_instruction(
     ] = None,
     timeout: Annotated[
         float | None,
-        Field(description="Max seconds to block; capped by server's poll_max_wait_s"),
+        Field(description="Max seconds to block; capped at 300s"),
     ] = None,
 ) -> dict[str, Any]:
     try:

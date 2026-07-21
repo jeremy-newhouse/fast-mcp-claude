@@ -738,7 +738,7 @@ async def _await_consumption(
     cfg: ChannelConfig,
     rt: "_Runtime",
     baseline_ts: float | None,
-    baseline_activity_ts: float | None = None,
+    baseline_activity_ts: float | None,
 ) -> str:
     """Classify how a pushed message ended (ECA-71 Layer C). Returns:
 
@@ -765,9 +765,16 @@ async def _await_consumption(
     message). `rt.last_activity_ts` (stamped on every permission-request round trip, independent
     of the status-file hook chain) closes that gap: a turn making tool calls generates one of
     these per call, so `activity_advanced` below sees life long before its Stop hook ever fires.
-    This narrows, not eliminates: a turn with genuinely no further tool-call activity in the
-    window (e.g. one very long single tool call already in flight) still relies on the
-    status-file signal alone, unchanged from before."""
+    This narrows, not eliminates: it depends on Claude Code actually EMITTING a permission
+    request for at least one of the turn's tool calls within the window. Two known residuals
+    where it can't help, both falling back to the status-file signal alone (unchanged from
+    before): (a) one very long single tool call already in flight with no further calls in the
+    window, and (b) a turn making many calls, but all already covered by a standing
+    settings.json/"don't ask again" allow rule, so CC resolves them internally and never emits
+    the notification at all — this is arguably the MORE common shape for a long turn (repeated
+    calls to an already-approved tool/command) than (a), and is not fixed here; a genuinely
+    complete fix would need CC to surface a signal for internally-auto-resolved tool calls too,
+    which this experimental capability does not provide today."""
     fast = cfg.liveness_check_enabled and bool(cfg.status_file)
     if not fast:
         try:

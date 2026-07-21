@@ -1124,7 +1124,9 @@ def test_await_consumption_consumed_when_replied():
 
     async def run():
         rt.reply_event.set()
-        return await channel_mod._await_consumption(cfg, rt, baseline_ts=None)
+        return await channel_mod._await_consumption(
+            cfg, rt, baseline_ts=None, baseline_activity_ts=None
+        )
 
     assert asyncio.run(run()) == channel_mod._CONSUMED
 
@@ -1144,7 +1146,10 @@ def test_await_consumption_dead_when_fast_signal_sees_no_life(tmp_path):
 
     async def run():
         return await asyncio.wait_for(
-            channel_mod._await_consumption(cfg, rt, baseline_ts=100.0), timeout=5.0
+            channel_mod._await_consumption(
+                cfg, rt, baseline_ts=100.0, baseline_activity_ts=None
+            ),
+            timeout=5.0,
         )
 
     assert asyncio.run(run()) == channel_mod._DEAD
@@ -1158,7 +1163,9 @@ def test_await_consumption_unknown_never_bounces_slow_turn():
     rt = channel_mod._Runtime(cfg=cfg)
 
     async def run():
-        return await channel_mod._await_consumption(cfg, rt, baseline_ts=None)
+        return await channel_mod._await_consumption(
+            cfg, rt, baseline_ts=None, baseline_activity_ts=None
+        )
 
     assert asyncio.run(run()) == channel_mod._UNKNOWN
 
@@ -1174,7 +1181,9 @@ def test_await_consumption_fast_signal_inert_without_status_file():
     rt = channel_mod._Runtime(cfg=cfg)
 
     async def run():
-        return await channel_mod._await_consumption(cfg, rt, baseline_ts=None)
+        return await channel_mod._await_consumption(
+            cfg, rt, baseline_ts=None, baseline_activity_ts=None
+        )
 
     assert asyncio.run(run()) == channel_mod._UNKNOWN
 
@@ -1253,8 +1262,12 @@ def test_await_consumption_dead_logs_hookless_warning_once(tmp_path, monkeypatch
     monkeypatch.setattr(channel_mod, "_log", lambda msg: logs.append(msg))
 
     async def run():
-        v1 = await channel_mod._await_consumption(cfg, rt, baseline_ts=None)
-        v2 = await channel_mod._await_consumption(cfg, rt, baseline_ts=None)
+        v1 = await channel_mod._await_consumption(
+            cfg, rt, baseline_ts=None, baseline_activity_ts=None
+        )
+        v2 = await channel_mod._await_consumption(
+            cfg, rt, baseline_ts=None, baseline_activity_ts=None
+        )
         return v1, v2
 
     v1, v2 = asyncio.run(run())
@@ -1278,7 +1291,7 @@ def test_await_consumption_dead_no_hookless_warning_when_status_file_exists(tmp_
     monkeypatch.setattr(channel_mod, "_log", lambda msg: logs.append(msg))
 
     assert asyncio.run(
-        channel_mod._await_consumption(cfg, rt, baseline_ts=100.0)
+        channel_mod._await_consumption(cfg, rt, baseline_ts=100.0, baseline_activity_ts=None)
     ) == channel_mod._DEAD
     assert rt.hookless_warning_logged is False
     assert not [m for m in logs if "ECA-83 finding #4" in m]

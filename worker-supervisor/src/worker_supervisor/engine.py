@@ -534,6 +534,7 @@ class Engine:
                 await self._finish_failure_capsule(
                     name, turn_id, "timeout", options_snapshot, list(stderr_tail), [resume_from]
                 )
+                self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
                 await self._reg.set_worker_status(name, "idle", active=True)
                 return
             except ProcessError as e:
@@ -551,6 +552,7 @@ class Engine:
                         name, turn_id, "resume_failed", options_snapshot,
                         list(stderr_tail), [resume_from],
                     )
+                    self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
                     await self._reg.roll_epoch(name, "resume_failed")
                     await self._reg.enqueue_turn(
                         name, restore_prompt(worker["repo"]), kind="restore"
@@ -563,7 +565,7 @@ class Engine:
                     continue
                 await self._fail_turn(
                     name, turn_id, outcome, f"ProcessError: {e}", options_snapshot,
-                    stderr_tail, resume_from,
+                    stderr_tail, resume_from, policy,
                 )
                 return
             except asyncio.CancelledError:
@@ -574,7 +576,7 @@ class Engine:
                     continue
                 await self._fail_turn(
                     name, turn_id, outcome, f"{type(e).__name__}: {e}", options_snapshot,
-                    stderr_tail, resume_from,
+                    stderr_tail, resume_from, policy,
                 )
                 return
 
@@ -600,13 +602,14 @@ class Engine:
                 name, turn_id, "question_timeout", options_snapshot,
                 list(stderr_tail), [resume_from, outcome.session_id],
             )
+            self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
             await self._reg.set_worker_status(name, "idle", active=True)
             return
 
         if not outcome.saw_result:
             await self._fail_turn(
                 name, turn_id, outcome, "stream ended without a ResultMessage",
-                options_snapshot, stderr_tail, resume_from,
+                options_snapshot, stderr_tail, resume_from, policy,
             )
             return
 
@@ -630,17 +633,7 @@ class Engine:
             duration_ms=outcome.duration_ms, num_turns=outcome.num_turns,
             context_pct=context_pressure_pct(outcome.usage),
         )
-        if policy.mcp_servers:
-            # ECA-101 AC1: previously only a FAILED turn's stderr/mcp state ever
-            # reached a capsule (_finish_failure_capsule) — a turn that "succeeds"
-            # while silently dropping a granted MCP server left zero evidence.
-            # Always surfacing this (any terminal state) closes that gap.
-            self._events.emit(
-                name, "turn_mcp_diagnostics", turn_id=turn_id,
-                granted=sorted(policy.mcp_servers.keys()),
-                mcp_init=outcome.mcp_init,
-                stderr_tail=list(stderr_tail),
-            )
+        self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
         if outcome.session_id:
             watchdog = asyncio.create_task(
                 self._verify_transcript_persisted(
@@ -711,6 +704,7 @@ class Engine:
         options_snapshot: dict[str, Any],
         stderr_tail: deque[str],
         resume_from: str | None,
+        policy: WorkerPolicy,
     ) -> None:
         """Terminal error after the retry: record, capsule, keep the epoch
         (keep-on-failure, Amendment A6) — the orchestrator decides what's next."""
@@ -728,7 +722,31 @@ class Engine:
             name, turn_id, "error", options_snapshot, list(stderr_tail),
             [resume_from, outcome.session_id],
         )
+        self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
         await self._reg.set_worker_status(name, "idle", active=True)
+
+    def _emit_mcp_diagnostics(
+        self,
+        name: str,
+        turn_id: int,
+        policy: WorkerPolicy,
+        mcp_init: list[dict[str, Any]] | None,
+        stderr_tail: deque[str] | list[str],
+    ) -> None:
+        """ECA-101 AC1: surface a granted-MCP lane's connect evidence on EVERY
+        terminal state, not just a successful one — a failed turn already gets a
+        capsule (Amendment A6), but that capsule carries no MCP-specific context,
+        and a genuinely unreachable/never-connecting server is exactly the kind of
+        failure an operator debugging "is this MCP server actually up" most wants
+        surfaced alongside the turn's outcome."""
+        if not policy.mcp_servers:
+            return
+        self._events.emit(
+            name, "turn_mcp_diagnostics", turn_id=turn_id,
+            granted=sorted(policy.mcp_servers.keys()),
+            mcp_init=mcp_init,
+            stderr_tail=list(stderr_tail),
+        )
 
     async def _finish_failure_capsule(
         self,

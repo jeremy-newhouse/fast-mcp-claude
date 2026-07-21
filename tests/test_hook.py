@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import socket
 
+import httpx
 import pytest
 from fastmcp import Client, FastMCP
 
@@ -134,8 +135,12 @@ async def test_relay_authenticated_deny_round_trip(relay_server):
 
 
 async def test_relay_rejects_wrong_api_key(relay_server):
-    """Guards the auth boundary itself: a wrong bearer must fail the relay, not
-    silently succeed unauthenticated."""
+    """Guards the auth boundary itself: a wrong bearer must fail the relay with
+    the server's 401, not silently succeed unauthenticated. Asserting the specific
+    status (rather than a bare Exception) matters here -- the pre-fix headers=
+    bug also raised an Exception (a TypeError from Client construction), which
+    would make a loose assertion pass for the wrong reason."""
     url = relay_server
-    with pytest.raises(Exception):
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
         await H._relay(url, "totally-wrong-key", "s", "Bash", {}, 2.0)
+    assert exc_info.value.response.status_code == 401

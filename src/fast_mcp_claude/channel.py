@@ -79,6 +79,7 @@ import os
 import sys
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -313,11 +314,14 @@ class _Runtime:
     # _handle_send_teams so "no in-flight message" is no longer treated as proof the local
     # operator is directly driving the session. See _mark_remote_context/_remote_context_active.
     remote_turn_started_ts: float | None = None
-    # FMC-13 AC#3: message_id of the most recent message the inbox loop gave up on and bounced
-    # (see the _DEAD verdict handling in _inbox_loop). Lets _handle_reply tell "your reply
-    # arrived after the sidecar already told the controller you weren't live" apart from an
-    # ordinary unknown/invalid message_id -- both used to produce the same generic warning.
-    bounced_message_id: str | None = None
+    # FMC-13 AC#3: message_ids the inbox loop has recently given up on and bounced (see the
+    # _DEAD verdict handling in _inbox_loop). Bounded history, not a single scalar -- degrade_after
+    # allows several consecutive bounces before the session disarms, so a late reply for an
+    # EARLIER bounce could otherwise arrive after a LATER bounce overwrote a single-slot tracker
+    # and wrongly fall back to the generic warning. Lets _handle_reply tell "your reply arrived
+    # after the sidecar already told the controller you weren't live" apart from an ordinary
+    # unknown/invalid message_id for any recently-bounced message, not just the newest one.
+    bounced_message_ids: deque[str] = field(default_factory=lambda: deque(maxlen=64))
 
 
 # Populated by _serve before any loop or tool handler runs.
@@ -1073,8 +1077,9 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                     )
                     # FMC-13 AC#3: record BEFORE the mesh call so a reply that races in during
                     # this await (however unlikely on a single-threaded loop) still sees it.
-                    rt.bounced_message_id = str(msg.get("id", ""))
-                    await _mesh_reply(cfg, rt.bounced_message_id, _NON_CONSUMPTION_BOUNCE)
+                    bounced_id = str(msg.get("id", ""))
+                    rt.bounced_message_ids.append(bounced_id)
+                    await _mesh_reply(cfg, bounced_id, _NON_CONSUMPTION_BOUNCE)
                     rt.consecutive_nonconsumption += 1
                     if rt.consecutive_nonconsumption >= cfg.degrade_after and not rt.degraded:
                         rt.degraded = True
@@ -1293,7 +1298,7 @@ async def _handle_reply(cfg: ChannelConfig, arguments: dict[str, Any]) -> list[t
     if ok:
         _log(f"replied to controller for message {message_id}")
         return [types.TextContent(type="text", text="delivered to controller")]
-    if message_id and message_id == _RT.bounced_message_id:
+    if message_id and message_id in _RT.bounced_message_ids:
         # FMC-13 AC#3: this message was already finalized by a non-consumption bounce (the
         # inbox loop gave up waiting and told the controller this session wasn't live) before
         # this reply arrived. record_reply's CAS correctly refuses the double-write; give the

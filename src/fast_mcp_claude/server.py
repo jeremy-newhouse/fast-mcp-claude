@@ -36,7 +36,7 @@ def build_auth_provider(settings: Settings) -> ApiKeyVerifier | None:
             "Set MCP_API_KEY, or explicitly set MCP_AUTH_ENABLED=false for "
             "local-only use."
         )
-    return ApiKeyVerifier(api_key=settings.mcp_api_key)
+    return ApiKeyVerifier(api_key=settings.mcp_api_key, admin_api_key=settings.mcp_admin_api_key)
 
 
 settings = get_settings()

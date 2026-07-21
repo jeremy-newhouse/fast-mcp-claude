@@ -10,6 +10,7 @@ Two roles use these tools:
 
 from typing import Annotated, Any
 
+from fastmcp.server.dependencies import get_access_token
 from pydantic import Field
 
 from .. import __version__
@@ -26,6 +27,18 @@ from ..utils.validation import (
 )
 
 logger = get_logger(__name__)
+
+
+def _caller_is_admin() -> bool:
+    """Whether the CURRENT request authenticated with the distinct admin credential
+    (auth.py::ApiKeyVerifier's admin_api_key), not merely the mesh-wide shared api_key.
+
+    FMC-9: every peer in a mesh shares the same mcp_api_key, so bearer authentication alone
+    cannot prove a caller is a designated trusted hub/admin origin. This is the ONLY source of
+    truth send_prompt consults before letting metadata.triggering_admin become True.
+    """
+    token = get_access_token()
+    return bool(token and token.claims.get("admin"))
 
 
 # ============================================================ CONTROLLER tools
@@ -66,6 +79,12 @@ async def send_prompt(
         prompt = validate_prompt(prompt)
         recipient_session = validate_session_id(recipient_session, field="recipient_session")
         metadata = validate_metadata(metadata)
+        # FMC-9 Bug 1: metadata is caller-supplied and every mesh peer shares one bearer, so a
+        # claimed triggering_admin=true is not proof of admin origin. Clamp it to the verified
+        # truth -- only ever allowed to STAY true, never forced true -- so a downstream consumer
+        # (e.g. channel.py's permission relay) can trust the stored value without re-deriving it.
+        if metadata is not None and "triggering_admin" in metadata:
+            metadata["triggering_admin"] = bool(metadata["triggering_admin"]) and _caller_is_admin()
         sender_name = (sender or "unknown").strip()[:64] or "unknown"
 
         message_id = await store.enqueue_message(

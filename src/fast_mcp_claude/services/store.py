@@ -226,16 +226,19 @@ class Notifier:
             return await check()
 
         # Capture the event reference BEFORE checking DB so we don't miss a
-        # notification that arrives between check and wait.
+        # notification that arrives between check and wait. Bump the waiter
+        # refcount in this same synchronous stretch (no `await` in between) so
+        # the capacity eviction in _get()/_evict_if_over_capacity can never drop
+        # this key out from under us during the `await check()` below — a gap
+        # that existed when the refcount bump came after the first check().
         ev = self._get(key)
-
-        result = await check()
-        if result is not None:
-            return result
-
-        deadline = time.monotonic() + timeout
         self._waiters[key] = self._waiters.get(key, 0) + 1
         try:
+            result = await check()
+            if result is not None:
+                return result
+
+            deadline = time.monotonic() + timeout
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:

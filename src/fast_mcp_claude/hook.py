@@ -150,11 +150,7 @@ async def _relay(
     # the hook path, not the rest of the package.
     from fastmcp import Client
 
-    client_kwargs: dict[str, Any] = {}
-    if api_key:
-        client_kwargs["headers"] = {"Authorization": f"Bearer {api_key}"}
-
-    async with Client(url, **client_kwargs) as c:
+    async with Client(url, auth=api_key or None) as c:
         req = await c.call_tool(
             "request_approval",
             {

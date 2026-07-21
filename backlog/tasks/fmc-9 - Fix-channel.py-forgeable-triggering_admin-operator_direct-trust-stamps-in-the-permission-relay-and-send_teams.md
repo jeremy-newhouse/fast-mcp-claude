@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-07-21 14:44'
-updated_date: '2026-07-21 19:18'
+updated_date: '2026-07-21 19:35'
 labels:
   - security
   - channel
@@ -176,6 +176,33 @@ formatting drift beyond the pre-existing drift already on dev in channel.py/test
 range against my actual edits.
 Docs updated: .env.example (MCP_ADMIN_API_KEY), README.md Security section, CLAUDE.md
 Channel push flow + Security model sections.
+
+Adversarial subagent review (this campaign's established practice for security/concurrency
+fixes -- FMC-11/FMC-12/FMC-9 now all confirm a real hit) reviewed the full branch diff and
+found one CRITICAL gap plus 3 minor items:
+- CRITICAL: the original Bug 2 fix used a blind 60s wall-clock timer disconnected from
+  actual agent activity -- any FYI-triggered or ambiguous-verdict turn that legitimately
+  took longer than 60s to reach its send_teams call would regain operator_direct trust
+  mid-turn, reopening the exact bypass Bug 2 existed to close. Fixed by extending
+  _remote_context_active to also stay active whenever the hook status file's updated_at
+  (the SAME liveness signal _await_consumption's Layer C fast path already trusts) shows
+  activity within the grace window of NOW -- so a still-working agent keeps the window
+  open regardless of total elapsed time; only a deployment with no status file configured
+  falls back to the bare fixed-timer heuristic (same documented limitation as the existing
+  liveness fast path being "inert" without one).
+- Minor: _await_consumption's exception path (currently unreachable, but latent) could skip
+  the remote-context mark/clear bookkeeping -- restructured to fail safe (mark active) on
+  any unexpected exception before re-raising.
+- Minor: the triggering_admin clamp used bool() coercion instead of an `is True` check,
+  inconsistent with channel.py's own strict check -- tightened to match.
+- Minor: no test exercised send_prompt against a server with auth fully disabled
+  (MCP_AUTH_ENABLED=false) to confirm _caller_is_admin() degrades safely rather than
+  defaulting to trusted -- added test_unauthenticated_server_cannot_set_triggering_admin.
+Added 3 more tests (344 total, up from 341): the new
+test_handle_send_teams_status_file_activity_extends_grace_window independently confirmed
+via git stash to fail against the pre-review-fix code (reproducing the exact CRITICAL
+finding) and pass against the fix. Full suite: `uv run pytest` 344 passed; `uv run ruff
+check src/ tests/` clean; format-diff re-confirmed zero new drift.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
@@ -187,14 +214,17 @@ on a match) and made send_prompt (tools/messaging.py) clamp a caller's
 metadata.triggering_admin claim to that server-verified truth instead of trusting it
 verbatim -- closing the forgeable-admin-stamp auto-allow path while leaving channel.py's
 existing trust-the-stored-metadata logic and the no-in-flight local-dialog fallback
-unchanged. Bug 2: added a bounded remote-context grace window in channel.py
-(_mark_remote_context/_clear_remote_context/_remote_context_active) so send_teams no
+unchanged. Bug 2: added a remote-context grace window in channel.py so send_teams no
 longer treats "no in-flight message" as proof of operator-direct trust while an
 unanswered FYI may still be getting acted on, or immediately after an ambiguous
-consumption verdict clears in-flight state. Verified with 14 new tests (341 total, up
-from 327), each independently confirmed via git stash to fail against the pre-fix code
-and pass against the fix; full suite and ruff check clean; my changes introduce no new
-formatting drift beyond dev's pre-existing drift in the touched files. Updated
-.env.example, README.md, and CLAUDE.md to document MCP_ADMIN_API_KEY and the new
-server-verified trust model. All 3 ACs checked with objective evidence.
+consumption verdict clears in-flight state -- the window extends using the same
+hook-status-file liveness signal already trusted by _await_consumption's Layer C fast
+path, so it doesn't lapse mid-turn for a still-working agent (an adversarial subagent
+review caught this exact gap in an earlier iteration that used a blind fixed timer, and
+verified the fix). Verified with 17 new tests (344 total, up from 327), each
+independently confirmed via git stash to fail against the pre-fix code and pass against
+the fix; full suite and ruff check clean; no new formatting drift beyond dev's
+pre-existing drift in the touched files. Updated .env.example, README.md, and CLAUDE.md
+to document MCP_ADMIN_API_KEY and the new server-verified trust model. All 3 ACs checked
+with objective evidence.
 <!-- SECTION:FINAL_SUMMARY:END -->

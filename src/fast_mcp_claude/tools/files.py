@@ -12,6 +12,7 @@ from pydantic import Field
 from ..errors import PermissionDeniedError, ValidationError, format_error_response
 from ..logging_config import get_logger
 from ..server import mcp, settings
+from ..utils.secure_fs import is_regular_file, secure_open_read, secure_open_write, secure_scandir
 from ..utils.validation import (
     MAX_FILE_BYTES,
     MAX_FILE_LIST_ENTRIES,
@@ -38,27 +39,34 @@ async def list_files(
             raise ValidationError(f"path is not a directory: {resolved}", field="path")
 
         entries: list[dict[str, Any]] = []
-        with os.scandir(resolved) as it:
-            for de in it:
-                if not include_hidden and de.name.startswith("."):
-                    continue
-                try:
-                    stat = de.stat(follow_symlinks=False)
-                    entries.append(
-                        {
-                            "name": de.name,
-                            "path": str(resolved / de.name),
-                            "type": "dir"
-                            if de.is_dir(follow_symlinks=False)
-                            else ("symlink" if de.is_symlink() else "file"),
-                            "size": stat.st_size if de.is_file(follow_symlinks=False) else None,
-                            "modified": stat.st_mtime,
-                        }
-                    )
-                except OSError:
-                    continue
-                if len(entries) >= MAX_FILE_LIST_ENTRIES:
-                    break
+        try:
+            with secure_scandir(resolved, roots) as it:
+                for de in it:
+                    if not include_hidden and de.name.startswith("."):
+                        continue
+                    try:
+                        stat = de.stat(follow_symlinks=False)
+                        entries.append(
+                            {
+                                "name": de.name,
+                                "path": str(resolved / de.name),
+                                "type": "dir"
+                                if de.is_dir(follow_symlinks=False)
+                                else ("symlink" if de.is_symlink() else "file"),
+                                "size": stat.st_size if de.is_file(follow_symlinks=False) else None,
+                                "modified": stat.st_mtime,
+                            }
+                        )
+                    except OSError:
+                        continue
+                    if len(entries) >= MAX_FILE_LIST_ENTRIES:
+                        break
+        except OSError as e:
+            # A path component was swapped (e.g. for a symlink pointing outside
+            # WORKSPACE_ROOTS) between validation and this real scan -- fail closed.
+            raise PermissionDeniedError(
+                f"path changed after validation, refusing to list: {resolved}"
+            ) from e
 
         return {"success": True, "path": str(resolved), "entries": entries, "count": len(entries)}
     except (ValidationError, PermissionDeniedError) as e:
@@ -81,18 +89,37 @@ async def read_file(
         if not resolved.is_file():
             raise ValidationError(f"path is not a regular file: {resolved}", field="path")
 
-        size = resolved.stat().st_size
-        if size > MAX_FILE_BYTES:
-            raise ValidationError(
-                f"file too large ({size} > {MAX_FILE_BYTES})",
-                field="path",
-            )
+        try:
+            with secure_open_read(resolved, roots) as fd:
+                if not is_regular_file(fd):
+                    raise ValidationError(f"path is not a regular file: {resolved}", field="path")
+                size = os.fstat(fd).st_size
+                if size > MAX_FILE_BYTES:
+                    raise ValidationError(
+                        f"file too large ({size} > {MAX_FILE_BYTES})",
+                        field="path",
+                    )
+                chunks: list[bytes] = []
+                remaining = size
+                while remaining > 0:
+                    chunk = os.read(fd, remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                raw = b"".join(chunks)
+        except OSError as e:
+            # A path component was swapped (e.g. for a symlink pointing outside
+            # WORKSPACE_ROOTS) between validation and this real read -- fail closed.
+            raise PermissionDeniedError(
+                f"path changed after validation, refusing to read: {resolved}"
+            ) from e
 
         try:
-            content = resolved.read_text(encoding="utf-8")
+            content = raw.decode("utf-8")
             encoding = "utf-8"
         except UnicodeDecodeError:
-            content = resolved.read_bytes().decode("utf-8", errors="replace")
+            content = raw.decode("utf-8", errors="replace")
             encoding = "utf-8-replace"
 
         return {
@@ -135,18 +162,30 @@ async def write_file(
         roots = settings.workspace_roots_resolved
         resolved = validate_workspace_path(path, workspace_roots=roots, must_exist=False)
 
-        if resolved.exists() and not overwrite:
+        try:
+            with secure_open_write(resolved, roots, overwrite=overwrite) as fd:
+                if not is_regular_file(fd):
+                    raise ValidationError(
+                        f"path exists and is not a regular file: {resolved}",
+                        field="path",
+                    )
+                os.ftruncate(fd, 0)
+                os.write(fd, encoded)
+        except FileExistsError as e:
             raise PermissionDeniedError(
                 f"file exists and overwrite=false: {resolved}",
-            )
-        if resolved.exists() and not resolved.is_file():
+            ) from e
+        except IsADirectoryError as e:
             raise ValidationError(
                 f"path exists and is not a regular file: {resolved}",
                 field="path",
-            )
-
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_bytes(encoded)
+            ) from e
+        except OSError as e:
+            # A path component was swapped (e.g. for a symlink pointing outside
+            # WORKSPACE_ROOTS) between validation and this real write -- fail closed.
+            raise PermissionDeniedError(
+                f"path changed after validation, refusing to write: {resolved}"
+            ) from e
 
         return {"success": True, "path": str(resolved), "bytes_written": len(encoded)}
     except (ValidationError, PermissionDeniedError) as e:

@@ -3,9 +3,11 @@ id: FMC-12
 title: >-
   Fix store.py hub-drain races: double-claimed teams/session-relay sends and
   unbounded Notifier growth via adversarial identities/channels
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@jeremy'
 created_date: '2026-07-21 14:44'
+updated_date: '2026-07-21 18:44'
 labels:
   - reliability
   - store
@@ -41,8 +43,99 @@ This is a gap in FMC-5's fix, not a duplicate of anything FMC-5 already resolved
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Two concurrent hub-side drain calls (wait_for_pending_teams_sends or list_pending_teams_sends) can no longer both observe the same pending teams_outbox row as claimable; the read that surfaces a pending row to a caller atomically marks it as claimed (e.g. transitions its status away from pending) so a second concurrent drainer sees it as already taken and does not re-perform the Teams-post side effect for that row.
-- [ ] #2 Two concurrent hub-side drain calls (wait_for_pending_session_ops or list_pending_session_ops) can no longer both observe the same pending session_relay row as claimable; the read that surfaces a pending row to a caller atomically marks it as claimed so a second concurrent drainer does not re-perform (re-route/re-execute) the session-relay operation for that row.
-- [ ] #3 An authenticated caller repeatedly invoking wait_for_instruction with fresh, syntactically-valid but nonexistent recipient_session values (or subscribe with fresh, syntactically-valid but nonexistent channel values), each with a zero or near-zero timeout, does not cause the Notifier's in-memory event map to grow without bound over the life of the server process -- entries for identities/channels with no corresponding live presence row or real backing data are eventually evicted or otherwise bounded.
-- [ ] #4 Both fixes (the atomic-claim fix for teams_outbox/session_relay draining, and the Notifier growth bound for adversarial inbox:/pubsub: keys) are covered by new automated tests that fail against the pre-fix code and pass against the fix, and the full existing test suite continues to pass alongside them.
+- [x] #1 Two concurrent hub-side drain calls (wait_for_pending_teams_sends or list_pending_teams_sends) can no longer both observe the same pending teams_outbox row as claimable; the read that surfaces a pending row to a caller atomically marks it as claimed (e.g. transitions its status away from pending) so a second concurrent drainer sees it as already taken and does not re-perform the Teams-post side effect for that row.
+- [x] #2 Two concurrent hub-side drain calls (wait_for_pending_session_ops or list_pending_session_ops) can no longer both observe the same pending session_relay row as claimable; the read that surfaces a pending row to a caller atomically marks it as claimed so a second concurrent drainer does not re-perform (re-route/re-execute) the session-relay operation for that row.
+- [x] #3 An authenticated caller repeatedly invoking wait_for_instruction with fresh, syntactically-valid but nonexistent recipient_session values (or subscribe with fresh, syntactically-valid but nonexistent channel values), each with a zero or near-zero timeout, does not cause the Notifier's in-memory event map to grow without bound over the life of the server process -- entries for identities/channels with no corresponding live presence row or real backing data are eventually evicted or otherwise bounded.
+- [x] #4 Both fixes (the atomic-claim fix for teams_outbox/session_relay draining, and the Notifier growth bound for adversarial inbox:/pubsub: keys) are covered by new automated tests that fail against the pre-fix code and pass against the fix, and the full existing test suite continues to pass alongside them.
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Add OUTBOX_CLAIMED status constant (pending -> claimed -> done) to services/store.py.
+2. Sub-bug 1: make list_pending_teams_sends/list_pending_session_ops atomically
+   claim (SELECT+UPDATE under _db_lock, mirroring pop_next_for_worker) instead of
+   a bare SELECT, so two concurrent hub drain calls can never both see the same
+   pending row. Widen complete_teams_send/complete_session_op's completion guard
+   from status=pending to status IN (pending, claimed). Extend _cleanup_once's
+   stale-expiry sweep to also catch CLAIMED rows (a drain that claimed then
+   crashed before completing must not dangle forever).
+3. Sub-bug 2: Notifier.wait_for skips creating/registering an Event entirely when
+   timeout<=0 (the cheap, unlimited-rate adversarial-key vector); Notifier._events
+   becomes an LRU-ordered OrderedDict capped at max_events (default 10_000),
+   evicting least-recently-used keys with zero active waiters once over capacity
+   (never evicting a key someone is actively parked on, same guard as forget()).
+4. Add regression tests for both sub-bugs in tests/test_teams_outbox.py,
+   tests/test_session_relay.py, and tests/test_storage.py; update the two existing
+   round-trip tests whose bare-pending assertion is now claimed-on-read.
+5. Verify via git stash (store.py only) that every new/changed test fails against
+   the pre-fix code and passes after; run the full suite + ruff.
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Verified all 4 ACs with objective evidence, each confirmed via git stash (store.py
+only) to fail against pre-fix code and pass post-fix:
+
+AC#1/#2 (atomic drain claims): test_concurrent_drain_claims_row_exactly_once
+(test_teams_outbox.py) and test_concurrent_drain_claims_op_exactly_once
+(test_session_relay.py) run two concurrent list_pending_*() calls via
+asyncio.gather against a single pending row and assert the row surfaces exactly
+once combined. Also independently reproduced the raw race with a standalone
+script against pre-fix store.py: both concurrent calls returned the SAME row id
+(['f6f57e73...', 'f6f57e73...']), confirming the exact double-claim described in
+the task. Post-fix: exactly one call claims it (pending -> claimed under
+_db_lock, mirroring pop_next_for_worker); complete_teams_send/complete_session_op
+widened to accept status IN (pending, claimed) so direct-completion callers
+(existing tests) still work. Also added test_cleanup_removes_stale_claimed for
+both queues: a row claimed then never completed (simulated hub crash) is now
+caught by _cleanup_once's stale-expiry sweep instead of dangling forever.
+
+AC#3 (Notifier growth): 5 new tests in test_storage.py. wait_for() now
+short-circuits before ever calling _get() when timeout<=0, so the cheap
+unlimited-rate zero-timeout attack (via wait_for_instruction/subscribe with a
+fabricated recipient_session/channel) leaks nothing --
+test_zero_timeout_wait_for_does_not_leak_notifier_event,
+test_wait_for_instruction_zero_timeout_does_not_leak_notifier_events, and
+test_subscribe_zero_timeout_does_not_leak_notifier_events exercise this at the
+Notifier, Store, and real-tool-path (wait_for_next_for_worker/wait_for_pubsub)
+levels respectively. For the general case (nonzero-timeout bursts), _events is
+now an LRU-ordered OrderedDict capped at max_events (default 10_000): once over
+capacity, least-recently-used keys with zero active waiters are evicted --
+test_notifier_events_bounded_by_max_events_cap confirms the cap holds, and
+test_notifier_eviction_never_evicts_an_active_waiter confirms a real in-flight
+waiter's key is never evicted regardless of capacity pressure (same invariant
+FMC-5's forget() already established).
+
+AC#4 (test coverage + full suite): full suite 326 passed (up from 315, +11 new
+tests: 2 concurrency, 2 stale-claimed cleanup, 5 Notifier growth-bound, 2
+existing round-trip assertions updated from bare-pending to claimed-on-read).
+uv run ruff check src/ tests/ clean. ruff format flags the same pre-existing
+drift class already documented in FMC-4/6/8/14/11 (confirmed store.py's drift
+predates this branch via git show dev:... | ruff format --check); none of my
+touched files (store.py aside, which was already drifting) are newly flagged.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Fixed both store.py bugs from the codex review. (1) list_pending_teams_sends/
+list_pending_session_ops now atomically claim (pending -> claimed, under
+_db_lock) instead of a bare SELECT, mirroring pop_next_for_worker's
+select+update pattern -- two concurrent hub drain calls can no longer both
+observe (and both act on) the same row. complete_teams_send/complete_session_op
+widened to accept status IN (pending, claimed); _cleanup_once's stale-expiry
+sweep now also catches CLAIMED rows so a crashed-mid-drain row doesn't dangle
+forever. (2) Notifier.wait_for skips registering an Event at all when
+timeout<=0, closing the cheap/unlimited-rate fabricated-identity DoS vector;
+Notifier._events is now an LRU-capped OrderedDict (default 10_000) that evicts
+least-recently-used, non-actively-waited keys once over capacity, bounding
+growth generally while never evicting a key a live long-poll is parked on.
+Added 11 tests (326 total, up from 315); every new/changed assertion confirmed
+via git stash to fail against the pre-fix code (including a standalone script
+reproducing the literal double-claim) and pass against the fix. Full suite
+passes; ruff check clean; ruff format's pre-existing drift on store.py (and
+other files) confirmed to predate this branch, per the FMC-4/6/8/14/11
+precedent. All 4 ACs checked.
+<!-- SECTION:FINAL_SUMMARY:END -->

@@ -353,6 +353,34 @@ async def test_notifier_eviction_never_evicts_an_active_waiter():
 
 
 @pytest.mark.asyncio
+async def test_wait_for_key_survives_capacity_eviction_during_its_own_check():
+    """Regression: the active-waiter refcount for `key` must be bumped in the same
+    synchronous stretch as _get(key), before wait_for's first `await check()` --
+    an adversarial review of the FMC-12 fix caught a gap where the refcount bump
+    happened only after that first check(), so a flood of unrelated _get() calls
+    triggered from inside check() (e.g. other concurrent traffic) could evict
+    `key`'s own just-registered Event before this waiter ever got a chance to be
+    counted as active, since a freshly-inserted, never-revisited key is the
+    oldest (front-of-queue, LRU) entry the moment anything else gets inserted
+    after it."""
+    notifier = Notifier(max_events=3)
+
+    async def check_that_floods_other_keys():
+        for i in range(10):
+            notifier._get(f"other:{i}")
+        return None
+
+    task = asyncio.create_task(
+        notifier.wait_for("keep", check_that_floods_other_keys, timeout=0.15)
+    )
+    await asyncio.sleep(0.05)
+    assert "keep" in notifier._events  # must have survived the flood inside check()
+
+    result = await task
+    assert result is None  # check() always returns None -> times out normally
+
+
+@pytest.mark.asyncio
 async def test_cleanup_evicts_resolved_message_notifier_key(store: Store):
     """Regression (FMC-5 AC#2): Notifier._events must not grow without bound as
     messages are resolved and pruned over a long-running process."""

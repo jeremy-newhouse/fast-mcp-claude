@@ -23,6 +23,7 @@ from claude_agent_sdk import (
     HookMatcher,
     ProcessError,
     ResultMessage,
+    SystemMessage,
     ToolUseBlock,
     query,
 )
@@ -113,7 +114,9 @@ def retire_prompt(repo: str) -> str:
     )
 
 
-def _discipline_append(limits: Limits, cycle_context_pct: int) -> str:
+def _discipline_append(
+    limits: Limits, cycle_context_pct: int, mcp_server_names: list[str] | None = None
+) -> str:
     """Per-turn system-prompt appendix: renders live limits so the agent can self-pace.
 
     Encodes the three long-op discipline rules from the ECA-60 dogfood campaign
@@ -122,7 +125,7 @@ def _discipline_append(limits: Limits, cycle_context_pct: int) -> str:
     allowlisted commands were tripping avoidable launcher approval prompts).
     Never hardcode the numeric limits here.
     """
-    return (
+    text = (
         f"TURN DISCIPLINE (enforced by worker-supervisor): "
         f"(1) This turn runs under {limits.wall_clock_s}s wall-clock / "
         f"{limits.max_turns} SDK turns; context auto-cycles at ~{cycle_context_pct}%. "
@@ -138,6 +141,18 @@ def _discipline_append(limits: Limits, cycle_context_pct: int) -> str:
         f"allowlisted prefix trips an avoidable approval prompt even though the underlying "
         f"command is safe."
     )
+    if mcp_server_names:
+        text += (
+            f" (5) MCP SERVERS: this turn was granted {', '.join(mcp_server_names)} in "
+            f"addition to your built-in tools. Each is a fresh connection made at turn "
+            f"start (a brand-new CLI process backs every turn) and is not guaranteed to "
+            f"finish connecting before you start working — ToolSearch or a direct call "
+            f"for one of these servers can come back empty/fail on a first attempt purely "
+            f"from that startup race, not because the server is actually unavailable. If "
+            f"that happens, wait a few seconds and retry once before concluding the server "
+            f"is down."
+        )
+    return text
 
 
 def session_transcript_path(cwd: str, session_id: str) -> Path:
@@ -146,8 +161,20 @@ def session_transcript_path(cwd: str, session_id: str) -> Path:
     return Path.home() / ".claude" / "projects" / sanitized / f"{session_id}.jsonl"
 
 
-async def _prompt_as_stream(prompt: str) -> AsyncIterator[dict[str, Any]]:
-    """can_use_tool requires streaming input (G1) — single-message stream."""
+async def _prompt_as_stream(
+    prompt: str, startup_grace_s: float = 0.0
+) -> AsyncIterator[dict[str, Any]]:
+    """can_use_tool requires streaming input (G1) — single-message stream.
+
+    startup_grace_s (ECA-101): a head start for non-'sdk'-type mcp_servers before
+    the turn's only prompt is delivered. wait_for_result_and_end_input() (the SDK's
+    own pre-first-message gate) only waits on in-process 'sdk' servers — never the
+    stdio/http/https servers a worker policy actually grants — so without this,
+    slower-to-connect remote/npx servers race the model's first action with no
+    guaranteed head start at all.
+    """
+    if startup_grace_s > 0:
+        await asyncio.sleep(startup_grace_s)
     yield {
         "type": "user",
         "session_id": "",
@@ -167,6 +194,7 @@ class TurnOutcome:
     usage: dict[str, Any] | None = None
     tools: list[str] = field(default_factory=list)
     saw_result: bool = False
+    mcp_init: list[dict[str, Any]] | None = None
 
 
 def context_pressure_pct(usage: dict[str, Any] | None) -> int | None:
@@ -444,7 +472,11 @@ class Engine:
                 system_prompt={
                     "type": "preset",
                     "preset": "claude_code",
-                    "append": _discipline_append(limits, self._cfg.cycle_context_pct),
+                    "append": _discipline_append(
+                        limits,
+                        self._cfg.cycle_context_pct,
+                        sorted(policy.mcp_servers.keys()),
+                    ),
                 },
                 env=build_worker_env(
                     self._boot_env,
@@ -483,8 +515,9 @@ class Engine:
             outcome = TurnOutcome()
             try:
                 async with asyncio.timeout(limits.wall_clock_s):
+                    grace = self._cfg.mcp_startup_grace_s if policy.mcp_servers else 0.0
                     async for msg in query(
-                        prompt=_prompt_as_stream(turn["prompt"]), options=options
+                        prompt=_prompt_as_stream(turn["prompt"], grace), options=options
                     ):
                         self._observe(name, turn_id, msg, outcome)
                 break  # stream completed
@@ -597,6 +630,17 @@ class Engine:
             duration_ms=outcome.duration_ms, num_turns=outcome.num_turns,
             context_pct=context_pressure_pct(outcome.usage),
         )
+        if policy.mcp_servers:
+            # ECA-101 AC1: previously only a FAILED turn's stderr/mcp state ever
+            # reached a capsule (_finish_failure_capsule) — a turn that "succeeds"
+            # while silently dropping a granted MCP server left zero evidence.
+            # Always surfacing this (any terminal state) closes that gap.
+            self._events.emit(
+                name, "turn_mcp_diagnostics", turn_id=turn_id,
+                granted=sorted(policy.mcp_servers.keys()),
+                mcp_init=outcome.mcp_init,
+                stderr_tail=list(stderr_tail),
+            )
         if outcome.session_id:
             watchdog = asyncio.create_task(
                 self._verify_transcript_persisted(
@@ -737,6 +781,12 @@ class Engine:
                     self._events.emit(
                         name, "tool_use", turn_id=turn_id, tool=block.name
                     )
+        elif isinstance(msg, SystemMessage) and msg.subtype == "init":
+            # ECA-101 diagnostic: a point-in-time snapshot taken at turn start —
+            # non-'sdk' servers are commonly still "pending" here (the CLI never
+            # waits on them), so this does NOT prove a server never connected,
+            # only what its state was at this instant.
+            outcome.mcp_init = msg.data.get("mcp_servers")
 
     async def _after_turn(self, name: str, turn_id: int) -> None:
         """Lifecycle chaining once a turn reaches a terminal state."""

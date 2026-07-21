@@ -49,6 +49,11 @@ class Config:
     cycle_context_pct: int
     max_concurrent_turns: int
     idle_timeout_s: int
+    # ECA-101: one-shot query()'s wait_for_result_and_end_input() only waits on
+    # 'sdk'-type (in-process) mcp_servers before delivering the turn's prompt —
+    # never the stdio/http/https servers a worker policy actually grants. This
+    # grace gives them a head start connecting before the prompt lands.
+    mcp_startup_grace_s: float
     # mesh presence (Amendment A4); disabled when url or key is unset
     mesh_url: str | None
     mesh_api_key: str | None
@@ -100,6 +105,7 @@ def load_config(env_file: str | Path | None = None) -> Config:
         cycle_context_pct=_i("SUPERVISOR_CYCLE_CONTEXT_PCT", 80),
         max_concurrent_turns=_i("SUPERVISOR_MAX_CONCURRENT_TURNS", 4),
         idle_timeout_s=_i("SUPERVISOR_WORKER_IDLE_TIMEOUT_S", 86400),
+        mcp_startup_grace_s=_f("SUPERVISOR_MCP_STARTUP_GRACE_S", 3.0),
         mesh_url=os.environ.get("MESH_URL") or None,
         mesh_api_key=os.environ.get("MESH_API_KEY") or None,
         machine=machine,

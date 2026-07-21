@@ -5,6 +5,7 @@ auto), and lifecycle records — the code-provable halves of AC-WS-1/4/5/11."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from typing import Any
 
 import pytest
@@ -12,11 +13,13 @@ from claude_agent_sdk import (
     AssistantMessage,
     ProcessError,
     ResultMessage,
+    SystemMessage,
     ToolUseBlock,
 )
 
-from worker_supervisor.engine import Engine
-from worker_supervisor.gate import QuestionBridge
+from worker_supervisor.engine import Engine, _discipline_append
+from worker_supervisor.config import Limits
+from worker_supervisor.gate import QuestionBridge, WorkerPolicy
 from worker_supervisor.registry import TURN_TERMINAL
 
 
@@ -52,6 +55,8 @@ def make_fake_query(script: list[Any], calls: list[Any]):
             raise item
         async for _ in prompt:  # consume the stream like the SDK does
             break
+        if options.stderr is not None:
+            options.stderr("mock cli stderr line")
         for msg in item:
             yield msg
 
@@ -387,3 +392,106 @@ async def test_system_prompt_carries_live_limits(make_engine, registry, repo, cf
     assert "nohup" in append
     assert "Run allowlisted commands" in append
     assert "PLAINLY" in append
+
+    # No MCP grant on this lane (default WorkerPolicy()) -> no MCP clause at all.
+    assert "MCP SERVERS" not in append
+
+
+def test_discipline_append_mcp_retry_hint():
+    """ECA-101 AC3 mitigation: a granted-MCP lane's system prompt must tell the
+    agent that a first ToolSearch/tool-call miss for one of ITS granted servers
+    can be the startup race, not real unavailability, and to retry once."""
+    limits = Limits(wall_clock_s=100, max_turns=10)
+
+    no_mcp = _discipline_append(limits, 80, [])
+    assert "MCP SERVERS" not in no_mcp
+
+    with_mcp = _discipline_append(limits, 80, ["context7", "langfuse"])
+    assert "MCP SERVERS" in with_mcp
+    assert "context7, langfuse" in with_mcp
+    assert "retry once" in with_mcp
+
+
+async def test_turn_mcp_diagnostics_emitted_on_success(make_engine, registry, repo, events):
+    """ECA-101 AC1: previously only a FAILED turn's stderr/mcp state ever reached
+    a capsule (_finish_failure_capsule) — a turn that SUCCEEDS while a granted MCP
+    server never finished connecting left zero evidence anywhere. A 'done' turn on
+    an MCP-granted lane must now surface the init snapshot + raw stderr tail too."""
+    init_msg = SystemMessage(
+        subtype="init", data={"mcp_servers": [{"name": "context7", "status": "pending"}]}
+    )
+    engine, calls = make_engine([[init_msg, r("s1")]])
+    await engine.spawn(
+        "w1", str(repo), WorkerPolicy(mcp_servers={"context7": {"type": "stdio"}})
+    )
+    tid = await engine.prompt("w1", "do the thing")
+    turn = await terminal_turn(registry, tid)
+    assert turn["state"] == "done"
+
+    diag = [e for e in events.read("w1") if e["event"] == "turn_mcp_diagnostics"]
+    assert len(diag) == 1
+    assert diag[0]["granted"] == ["context7"]
+    assert diag[0]["mcp_init"] == [{"name": "context7", "status": "pending"}]
+    assert diag[0]["stderr_tail"] == ["mock cli stderr line"]
+
+    # The lane's own system prompt must carry the retry-hint naming ITS servers.
+    append = calls[0].system_prompt["append"]
+    assert "MCP SERVERS" in append and "context7" in append
+
+
+async def test_turn_mcp_diagnostics_absent_without_mcp_grant(make_engine, registry, repo, events):
+    """A lane with no MCP grant at all gets no diagnostics noise."""
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo))  # default WorkerPolicy(): no mcp_servers
+    tid = await engine.prompt("w1", "do the thing")
+    await terminal_turn(registry, tid)
+    assert not any(e["event"] == "turn_mcp_diagnostics" for e in events.read("w1"))
+
+
+async def test_mcp_startup_grace_delays_prompt_only_when_servers_granted(
+    cfg, registry, events, monkeypatch, repo
+):
+    """ECA-101 AC3: query()'s own pre-first-message wait only ever covers
+    'sdk'-type (in-process) mcp_servers, never the stdio/http/https servers a
+    worker policy actually grants — so without a deliberate grace period, those
+    servers get zero guaranteed head start against the model's first action."""
+    grace_cfg = dataclasses.replace(cfg, mcp_startup_grace_s=0.2)
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        "worker_supervisor.engine.query", make_fake_query([[r("s1")]], calls)
+    )
+    monkeypatch.setattr(Engine, "_transcript_exists", lambda self, cwd, sid: True)
+    bridge = QuestionBridge(registry, events)
+    engine = Engine(grace_cfg, registry, events, bridge)
+    try:
+        await engine.spawn(
+            "w1", str(repo), WorkerPolicy(mcp_servers={"context7": {"type": "stdio"}})
+        )
+        start = asyncio.get_event_loop().time()
+        tid = await engine.prompt("w1", "do the thing")
+        await terminal_turn(registry, tid)
+        assert asyncio.get_event_loop().time() - start >= 0.2
+    finally:
+        await engine.stop()
+
+
+async def test_mcp_startup_grace_skipped_without_mcp_grant(
+    cfg, registry, events, monkeypatch, repo
+):
+    """The grace period must not tax lanes that were never granted any MCP server."""
+    grace_cfg = dataclasses.replace(cfg, mcp_startup_grace_s=0.2)
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        "worker_supervisor.engine.query", make_fake_query([[r("s1")]], calls)
+    )
+    monkeypatch.setattr(Engine, "_transcript_exists", lambda self, cwd, sid: True)
+    bridge = QuestionBridge(registry, events)
+    engine = Engine(grace_cfg, registry, events, bridge)
+    try:
+        await engine.spawn("w1", str(repo))  # no mcp_servers granted
+        start = asyncio.get_event_loop().time()
+        tid = await engine.prompt("w1", "do the thing")
+        await terminal_turn(registry, tid)
+        assert asyncio.get_event_loop().time() - start < 0.2
+    finally:
+        await engine.stop()

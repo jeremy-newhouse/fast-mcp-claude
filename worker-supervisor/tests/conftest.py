@@ -16,6 +16,7 @@ def cfg(tmp_path) -> Config:
         cycle_context_pct=80,
         max_concurrent_turns=2,
         idle_timeout_s=3600,
+        mcp_startup_grace_s=0.0,
         mesh_url=None,
         mesh_api_key=None,
         machine="testhost",

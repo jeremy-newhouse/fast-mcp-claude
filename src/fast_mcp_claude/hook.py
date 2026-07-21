@@ -150,6 +150,8 @@ async def _relay(
     # the hook path, not the rest of the package.
     from fastmcp import Client
 
+    # fastmcp 3.x Client takes the bearer as `auth=<token>` (a bare string is sent as
+    # `Authorization: Bearer <token>`), NOT a `headers=` kwarg.
     async with Client(url, auth=api_key or None) as c:
         req = await c.call_tool(
             "request_approval",

@@ -223,6 +223,11 @@ def _log(msg: str) -> None:
         print(f"[fast-mcp-claude-channel] {msg}", file=sys.stderr, flush=True)
 
 
+# How often the inbox loop re-logs that it's still waiting for this session's own MCP handshake
+# (notifications/initialized) before it will claim anything -- see _inbox_loop's initialized-wait.
+# A module constant (not inline) so tests can shrink it instead of waiting out a real 30s.
+_INITIALIZED_WAIT_LOG_INTERVAL_S = 30.0
+
 # A bad bearer locks the WHOLE mesh endpoint for 60s after 5 attempts, which would also lock out
 # the legitimately-authed hook/launcher on the same server — so on an auth error cool down LONGER
 # than the lockout instead of retry-storming it on the normal 1→30s reconnect backoff (mirrors
@@ -308,6 +313,11 @@ class _Runtime:
     # _handle_send_teams so "no in-flight message" is no longer treated as proof the local
     # operator is directly driving the session. See _mark_remote_context/_remote_context_active.
     remote_turn_started_ts: float | None = None
+    # FMC-13 AC#3: message_id of the most recent message the inbox loop gave up on and bounced
+    # (see the _DEAD verdict handling in _inbox_loop). Lets _handle_reply tell "your reply
+    # arrived after the sidecar already told the controller you weren't live" apart from an
+    # ordinary unknown/invalid message_id -- both used to produce the same generic warning.
+    bounced_message_id: str | None = None
 
 
 # Populated by _serve before any loop or tool handler runs.
@@ -584,6 +594,16 @@ async def _presence_loop(cfg: ChannelConfig) -> None:
                         meta["channel"] = False
                         meta["status"] = "degraded"
                         summary = f"{summary} [DEGRADED: channel consumer not live]"[:280]
+                    elif not rt.initialized.is_set():
+                        # FMC-13 AC#1: don't advertise channel-capable until the tee has observed
+                        # THIS session's own MCP handshake complete (notifications/initialized) --
+                        # the closest verifiable signal this server has that Claude Code is really
+                        # driving this stdio connection. Previously this was purely a function of
+                        # cfg.enabled, so a wired-but-never-actually-connected launch still
+                        # announced channel:true and a controller's send_prompt would land in a
+                        # push nothing was ever going to consume. Mirrors _inbox_loop's own gate
+                        # below (claiming already waited on this signal; presence now agrees).
+                        meta["channel"] = False
                     res = await c.call_tool(
                         "announce",
                         {"identity": cfg.identity, "summary": summary, "metadata": meta},
@@ -896,10 +916,19 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
     rt = _RT
     # Don't push before the session has finished initializing (events into an un-initialized
     # session are dropped). The tee sets this when it sees notifications/initialized.
-    try:
-        await asyncio.wait_for(rt.initialized.wait(), timeout=30.0)
-    except asyncio.TimeoutError:
-        _log("session did not signal initialized within 30s; proceeding anyway")
+    # FMC-13 AC#1: a timeout here must mean "stay disarmed", not "arm anyway" -- previously a
+    # single 30s wait fell through and started claiming even though this session's own MCP
+    # handshake was never observed (e.g. a hung/misconfigured stdio connection). Loop the wait
+    # instead of ever proceeding without the signal; log periodically so a genuinely stuck
+    # session is still visible in the debug log rather than silently inert forever.
+    while not rt.initialized.is_set():
+        try:
+            await asyncio.wait_for(rt.initialized.wait(), timeout=_INITIALIZED_WAIT_LOG_INTERVAL_S)
+        except asyncio.TimeoutError:
+            _log(
+                "still waiting for this session's MCP handshake (notifications/initialized) "
+                "before claiming anything; staying disarmed"
+            )
     # Layer B: wait for the first confirmed announce before claiming anything. A fork whose
     # announce is refused never sets this, so it never claims (blocks here indefinitely).
     if not rt.announce_confirmed.is_set():
@@ -980,9 +1009,20 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                     rt.reply_event = asyncio.Event()
                     baseline_ts = _status_updated_at(cfg)  # snapshot BEFORE the push (Layer C)
                     baseline_activity_ts = rt.last_activity_ts  # ECA-83 finding #1 companion signal
-                    await _push(write_stream, msg)
-                    _log(f"pushed message {msg.get('id')} from {msg.get('sender')}; awaiting reply")
                     try:
+                        # FMC-13 AC#4: _push now lives INSIDE this try -- it previously sat
+                        # outside, so a push failure (e.g. a broken stdio pipe) propagated
+                        # straight past this block without ever clearing `inflight`, leaking the
+                        # claimed-message state indefinitely. While leaked, the permission relay
+                        # (_handle_permission) would evaluate ANY later, unrelated permission
+                        # request -- including the operator's own genuine local work -- against
+                        # this stale message's triggering_admin metadata instead of correctly
+                        # falling through to the local terminal dialog.
+                        await _push(write_stream, msg)
+                        _log(
+                            f"pushed message {msg.get('id')} from {msg.get('sender')}; "
+                            "awaiting reply"
+                        )
                         verdict = await _await_consumption(
                             cfg, rt, baseline_ts, baseline_activity_ts
                         )
@@ -1031,7 +1071,10 @@ async def _inbox_loop(cfg: ChannelConfig, write_stream: Any) -> None:
                         f"NON-CONSUMPTION of {msg.get('id')} (consumer showed no life); "
                         "bouncing to the sender so it is not black-holed"
                     )
-                    await _mesh_reply(cfg, str(msg.get("id", "")), _NON_CONSUMPTION_BOUNCE)
+                    # FMC-13 AC#3: record BEFORE the mesh call so a reply that races in during
+                    # this await (however unlikely on a single-threaded loop) still sees it.
+                    rt.bounced_message_id = str(msg.get("id", ""))
+                    await _mesh_reply(cfg, rt.bounced_message_id, _NON_CONSUMPTION_BOUNCE)
                     rt.consecutive_nonconsumption += 1
                     if rt.consecutive_nonconsumption >= cfg.degrade_after and not rt.degraded:
                         rt.degraded = True
@@ -1241,12 +1284,34 @@ async def _handle_reply(cfg: ChannelConfig, arguments: dict[str, Any]) -> list[t
     response = str(raw if raw is not None else "")
     ok = await _mesh_reply(cfg, message_id, response)
     # Unblock the inbox loop so it claims the next message (only if this reply is for the
-    # in-flight turn; a stale/duplicate reply still relays to the controller but doesn't advance).
-    if _RT.inflight is not None and str(_RT.inflight.get("id")) == message_id:
+    # in-flight turn AND the mesh actually recorded it — FMC-13 AC#2: previously this was
+    # signaled unconditionally on an id match, so a relay that errored or returned an
+    # unsuccessful result still made the inbox loop treat the message as consumed and advance,
+    # even though the controller never actually received the agent's answer).
+    if ok and _RT.inflight is not None and str(_RT.inflight.get("id")) == message_id:
         _RT.reply_event.set()
     if ok:
         _log(f"replied to controller for message {message_id}")
         return [types.TextContent(type="text", text="delivered to controller")]
+    if message_id and message_id == _RT.bounced_message_id:
+        # FMC-13 AC#3: this message was already finalized by a non-consumption bounce (the
+        # inbox loop gave up waiting and told the controller this session wasn't live) before
+        # this reply arrived. record_reply's CAS correctly refuses the double-write; give the
+        # agent a message that says so, distinguishable from an ordinary invalid/unknown id --
+        # its answer genuinely exists but will never reach the controller, which is very
+        # different from "you typo'd the message_id".
+        return [
+            types.TextContent(
+                type="text",
+                text=(
+                    "WARNING: reply NOT recorded — this message was already finalized by a "
+                    "non-consumption bounce (the sidecar gave up waiting for your reply and "
+                    "told the controller this session did not respond) before your reply "
+                    "arrived. The controller already received that bounce and will not see "
+                    "this content."
+                ),
+            )
+        ]
     return [
         types.TextContent(
             type="text",

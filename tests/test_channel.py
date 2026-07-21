@@ -1732,3 +1732,228 @@ def test_graceful_forget_swallows_errors(monkeypatch):
         channel_mod._RT = None
 
     assert len(client.calls) == 1
+
+
+# ==================================================================================
+# FMC-13: channel.py's two-part arming gate + race-prone claimed-message state
+# ==================================================================================
+#
+# AC#1: the arming decision (both presence's channel:true advertisement and the inbox loop's
+# claiming) must incorporate this session's own MCP handshake signal (notifications/initialized,
+# observed by the stdio tee) rather than only cfg.enabled, and a timeout waiting for that signal
+# must leave the sidecar disarmed rather than falling through to arm anyway.
+
+
+class _RecordingAnnounceClient:
+    """Records every announce() call's args; ends the test after `stop_after` calls."""
+
+    def __init__(self, stop_after):
+        self.calls = []
+        self._stop_after = stop_after
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def call_tool(self, name, args):
+        assert name == "announce"
+        self.calls.append(args)
+        if len(self.calls) >= self._stop_after:
+            raise asyncio.CancelledError
+        return _Res({"success": True})
+
+
+def test_presence_does_not_advertise_channel_before_initialized(monkeypatch):
+    # Pre-fix: presence advertised channel:true purely from cfg.enabled, with no regard for
+    # whether this session's own MCP handshake had ever actually been observed -- a
+    # wired-but-never-actually-connected launch still told the brain it was push-capable.
+    cfg = _cfg(enabled=True, heartbeat=0.001)
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    # Deliberately NOT setting rt.initialized.
+    client = _RecordingAnnounceClient(stop_after=2)
+    monkeypatch.setattr(channel_mod, "_make_client", lambda cfg, timeout=None: client)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(asyncio.wait_for(channel_mod._presence_loop(cfg), timeout=5.0))
+    finally:
+        channel_mod._RT = None
+
+    assert len(client.calls) == 2
+    assert all(args["metadata"]["channel"] is False for args in client.calls)
+
+
+def test_presence_advertises_channel_once_initialized(monkeypatch):
+    cfg = _cfg(enabled=True, heartbeat=0.001)
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    channel_mod._RT.initialized.set()
+    client = _RecordingAnnounceClient(stop_after=1)
+    monkeypatch.setattr(channel_mod, "_make_client", lambda cfg, timeout=None: client)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(asyncio.wait_for(channel_mod._presence_loop(cfg), timeout=5.0))
+    finally:
+        channel_mod._RT = None
+
+    assert client.calls[0]["metadata"]["channel"] is True
+
+
+def test_inbox_stays_disarmed_when_never_initialized(monkeypatch):
+    # Pre-fix: a single 30s timeout on the initialized-wait fell through and started claiming
+    # anyway. Post-fix it must never proceed without the signal, no matter how many times the
+    # internal wait re-times-out. Shrink the log-interval constant so the bounded test window
+    # spans SEVERAL such timeouts -- a test bounded well under the real 30s would pass on both
+    # the pre-fix and post-fix code (neither reaches its first timeout that fast), so it
+    # wouldn't actually exercise the fix.
+    monkeypatch.setattr(channel_mod, "_INITIALIZED_WAIT_LOG_INTERVAL_S", 0.02)
+    cfg = _cfg(enabled=True, identity="peer.repo.a")
+    client_builds = []
+
+    def fake_make_client(cfg, timeout=None):
+        client_builds.append(1)
+        return _ScriptedClient([])
+
+    monkeypatch.setattr(channel_mod, "_make_client", fake_make_client)
+    stream = _RecordingStream()
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    # Deliberately NOT setting rt.initialized or rt.announce_confirmed.
+
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(asyncio.wait_for(channel_mod._inbox_loop(cfg, stream), timeout=0.3))
+    finally:
+        channel_mod._RT = None
+
+    assert client_builds == []  # never got past the initialized gate to even connect
+
+
+# AC#2: a reply that fails to relay to the mesh must not make the inbox loop treat the claimed
+# message as consumed.
+
+
+def test_reply_tool_failed_relay_does_not_signal(reply_rig, monkeypatch):
+    async def failing_mesh_reply(cfg, message_id, response):
+        return False
+
+    monkeypatch.setattr(channel_mod, "_mesh_reply", failing_mesh_reply)
+    reply_rig["set_inflight"]("m1")
+    out = anyio.run(channel_mod._call_tool, "reply", {"message_id": "m1", "response": "done"})
+    # THE FIX: pre-fix this was signaled unconditionally on an id match, regardless of `ok`.
+    assert not channel_mod._RT.reply_event.is_set()
+    assert "WARNING" in out[0].text
+
+
+# AC#3: a genuine reply arriving after the inbox loop already bounced this message must be
+# distinguishable from an ordinary invalid/unknown message_id.
+
+
+def test_reply_tool_after_bounce_gets_distinguishable_warning(reply_rig, monkeypatch):
+    async def failing_mesh_reply(cfg, message_id, response):
+        return False  # record_reply's CAS correctly refuses the already-finalized message
+
+    monkeypatch.setattr(channel_mod, "_mesh_reply", failing_mesh_reply)
+    reply_rig["set_inflight"](None)  # already cleared by the bounce, same as real _inbox_loop
+    channel_mod._RT.bounced_message_id = "m1"
+    out = anyio.run(
+        channel_mod._call_tool, "reply", {"message_id": "m1", "response": "late answer"}
+    )
+    assert "already finalized by a non-consumption bounce" in out[0].text
+
+
+def test_reply_tool_unknown_id_keeps_generic_warning(reply_rig, monkeypatch):
+    # An ordinary unknown/invalid id (not a bounced one) keeps the pre-existing generic warning
+    # -- the distinguishing message is reserved for the specific bounce case.
+    async def failing_mesh_reply(cfg, message_id, response):
+        return False
+
+    monkeypatch.setattr(channel_mod, "_mesh_reply", failing_mesh_reply)
+    reply_rig["set_inflight"](None)
+    channel_mod._RT.bounced_message_id = None
+    out = anyio.run(channel_mod._call_tool, "reply", {"message_id": "typod-id", "response": "x"})
+    assert "unknown/already-finalized" in out[0].text
+    assert "non-consumption bounce" not in out[0].text
+
+
+# AC#4: a push failure must reliably clear the claimed-message state, and while stale state
+# would otherwise persist it must never be applied to an unrelated permission request.
+
+
+class _RaisingPushStream:
+    """A write_stream whose send() always raises (simulates a broken stdio pipe on push)."""
+
+    def __init__(self, fail_exc):
+        self._fail_exc = fail_exc
+
+    async def send(self, m):
+        raise self._fail_exc
+
+
+def test_inbox_push_failure_clears_inflight_and_does_not_leak_into_permission_relay(monkeypatch):
+    # Pre-fix: _push sat OUTSIDE the try/finally that clears `inflight`, so a push failure left
+    # the claimed-message slot set indefinitely. While leaked, _handle_permission would evaluate
+    # a later, UNRELATED permission request against the stale message's triggering_admin --
+    # this message is deliberately admin-triggered + addressed, the exact shape that would have
+    # been auto-allowed pre-fix.
+    cfg = _cfg(enabled=True, identity="peer.repo.a")
+    msg = {
+        "id": "m1",
+        "sender": "brain",
+        "prompt": "do",
+        "recipient_session": "peer.repo.a",
+        "metadata": {"triggering_admin": True},
+    }
+    client = _ScriptedClient([msg])
+    monkeypatch.setattr(channel_mod, "_make_client", lambda cfg, timeout=None: client)
+    stream = _RaisingPushStream(ConnectionError("broken pipe"))
+    channel_mod._RT = channel_mod._Runtime(cfg=cfg)
+    channel_mod._RT.initialized.set()
+    channel_mod._RT.announce_confirmed.set()
+
+    reconnects = []
+
+    async def fake_reconnect_sleep(what, exc, backoff):
+        reconnects.append((what, str(exc)))
+        raise asyncio.CancelledError  # end the test right after the push failure is handled
+
+    monkeypatch.setattr(channel_mod, "_reconnect_sleep", fake_reconnect_sleep)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(asyncio.wait_for(channel_mod._inbox_loop(cfg, stream), timeout=5.0))
+    finally:
+        rt = channel_mod._RT
+        channel_mod._RT = None
+
+    assert len(reconnects) == 1 and "broken pipe" in reconnects[0][1]
+    # THE FIX: cleared despite it being the PUSH (not _await_consumption) that failed.
+    assert rt.inflight is None
+
+    channel_mod._RT = rt
+    routed = []
+    sent = []
+
+    async def fake_route(cfg, inflight, tool_name, description, preview):
+        routed.append(inflight)
+        return "deny"
+
+    async def fake_send(write_stream, request_id, behavior):
+        sent.append(behavior)
+
+    monkeypatch.setattr(channel_mod, "_route_approval", fake_route)
+    monkeypatch.setattr(channel_mod, "_send_permission", fake_send)
+    try:
+        anyio.run(
+            channel_mod._handle_permission,
+            None,
+            cfg,
+            {"request_id": "r1", "tool_name": "Bash", "description": "x", "input_preview": "{}"},
+        )
+        # Falls through to the local terminal dialog (no in-flight turn), not the stale message
+        # -- pre-fix this auto-allowed via the stale message's triggering_admin=True + addressed.
+        assert routed == []
+        assert sent == []
+    finally:
+        channel_mod._RT = None

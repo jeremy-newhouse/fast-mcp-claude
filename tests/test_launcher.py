@@ -987,8 +987,10 @@ class _AnnounceRaises:
 async def test_heartbeat_trips_reconnect_after_consecutive_failures():
     client = _AnnounceRaises(RuntimeError("Session terminated"))
     ev = asyncio.Event()
+    owner_confirmed = asyncio.Event()
     await asyncio.wait_for(
-        L._heartbeat_loop(client, _cfg(heartbeat=0.0), L._Counter(), ev), timeout=2.0
+        L._heartbeat_loop(client, _cfg(heartbeat=0.0), L._Counter(), ev, owner_confirmed),
+        timeout=2.0,
     )
     assert ev.is_set()  # signalled the bridge to rebuild
     assert client.announce_calls == L._ANNOUNCE_FAILS_BEFORE_RECONNECT
@@ -999,7 +1001,10 @@ async def test_heartbeat_auth_failure_never_trips_reconnect():
     auth error must keep retrying without ever signalling a rebuild."""
     client = _AnnounceRaises(RuntimeError("401 Unauthorized"))
     ev = asyncio.Event()
-    task = asyncio.create_task(L._heartbeat_loop(client, _cfg(heartbeat=0.0), L._Counter(), ev))
+    owner_confirmed = asyncio.Event()
+    task = asyncio.create_task(
+        L._heartbeat_loop(client, _cfg(heartbeat=0.0), L._Counter(), ev, owner_confirmed)
+    )
     await asyncio.sleep(0.05)  # let it fail many times
     assert not ev.is_set()
     assert not task.done()
@@ -1023,8 +1028,9 @@ async def test_heartbeat_transient_blip_does_not_accumulate():
             return FakeClient._Res({"success": True})
 
     ev = asyncio.Event()
+    owner_confirmed = asyncio.Event()
     task = asyncio.create_task(
-        L._heartbeat_loop(_FlakyOnce(), _cfg(heartbeat=0.0), L._Counter(), ev)
+        L._heartbeat_loop(_FlakyOnce(), _cfg(heartbeat=0.0), L._Counter(), ev, owner_confirmed)
     )
     await asyncio.sleep(0.05)
     assert not ev.is_set()
@@ -1061,6 +1067,144 @@ async def test_wait_for_instruction_returns_result_when_healthy():
     res = await L._wait_for_instruction_or_reconnect(_Returns(), _cfg(poll=1.0), ev)
     assert L._result_data(res)["message"]["id"] == "x" * 32
     assert not ev.is_set()
+
+
+# ================================================================ FMC-15: owner-token gate
+
+
+async def test_owner_token_refused_never_reaps_or_claims(monkeypatch):
+    """AC#1/#2: a rogue second launcher instance whose announce is refused
+    (IDENTITY_LIVE_ELSEWHERE) must never run the stale-claim reaper nor claim new work —
+    only `announce` may be called while ownership is unconfirmed."""
+    calls: list[str] = []
+
+    class _RefusedClient:
+        async def call_tool(self, name, args):
+            calls.append(name)
+            if name == "announce":
+                return FakeClient._Res(
+                    {"success": False, "error": {"code": "IDENTITY_LIVE_ELSEWHERE"}}
+                )
+            raise AssertionError(f"must not call {name!r} while ownership is unconfirmed")
+
+    class _Conn:
+        async def __aenter__(self):
+            return _RefusedClient()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("fastmcp.Client", lambda *a, **kw: _Conn())
+    cfg = _cfg(identity="mini2_launcher", heartbeat=0.01, poll=0.01)
+    task = asyncio.create_task(L._bridge(cfg))
+    await asyncio.sleep(0.2)
+    # Snapshot BEFORE cancelling: `_shutdown`'s own reply sweep also opens a connection
+    # against the same fake and would otherwise contaminate the assertion below.
+    calls_before_cancel = list(calls)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert "announce" in calls_before_cancel
+    assert "list_messages" not in calls_before_cancel
+    assert "wait_for_instruction" not in calls_before_cancel
+
+
+# ================================================================ FMC-15: reply survives reconnect
+
+
+class _SwapsToLiveOnSecondFailure:
+    """A dead connection: every call raises. After the 2nd failed attempt it simulates
+    `_bridge` reconnecting by swapping the box over to a live connection — deterministic,
+    no sleep-based timing race."""
+
+    def __init__(self, box: "L._ClientBox", live) -> None:
+        self._box = box
+        self._live = live
+        self.attempts = 0
+
+    async def call_tool(self, name, args):
+        self.attempts += 1
+        if self.attempts >= 2:
+            self._box.client = self._live
+        raise RuntimeError("connection is closed")
+
+
+class _RepliesOk:
+    def __init__(self) -> None:
+        self.replies: list[dict] = []
+
+    async def call_tool(self, name, args):
+        if name == "reply":
+            self.replies.append(dict(args))
+            return FakeClient._Res({"success": True})
+        raise AssertionError(f"unexpected call {name!r}")
+
+
+async def test_handle_task_reply_survives_reconnect(monkeypatch, tmp_path):
+    """AC#3: a task handler's reply must land on whichever connection is CURRENT at reply
+    time, not the one captured when the task started — so a client reconnect mid-task
+    doesn't strand the reply on a connection that has already closed."""
+    monkeypatch.setattr(L, "_REPLY_RETRY_BACKOFF_S", 0.001)
+
+    box = L._ClientBox()
+    live = _RepliesOk()
+    box.client = _SwapsToLiveOnSecondFailure(box, live)
+
+    cfg = _cfg(cwd_allowlist=[tmp_path.resolve()], tools_ceiling=["Read"])
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+    msg = {"id": "9" * 32, "prompt": json.dumps({"task": "x", "cwd": str(tmp_path)})}
+
+    async def fake_run_claude(env, cfg2, live_set):
+        return L.RunResult(
+            exit_code=0, timed_out=False, duration_s=0.01,
+            stdout=json.dumps({"result": "ok"}), stderr="",
+        )
+
+    monkeypatch.setattr(L, "_run_claude", fake_run_claude)
+    await L._handle_task(box, msg, cfg, sem, set(), L._Counter(), set())
+    assert len(live.replies) == 1
+    assert live.replies[0]["message_id"] == "9" * 32
+
+
+# ================================================================ FMC-15: reply survives shutdown
+
+
+async def test_shutdown_uses_fresh_connection_for_reply_sweep(monkeypatch):
+    """AC#4: `_shutdown` must reply launcher_shutdown via its OWN fresh connection. In
+    production, cancellation has already unwound through `_bridge`'s `async with
+    Client(...)` __aexit__ (tearing that connection down) by the time `_shutdown` runs —
+    reusing it would silently fail every call here."""
+    calls: list[tuple[str, dict]] = []
+
+    class _FreshClient:
+        async def call_tool(self, name, args):
+            calls.append((name, dict(args)))
+            if name == "list_messages":
+                return FakeClient._Res(
+                    {
+                        "success": True,
+                        "messages": [{"id": "a" * 32, "recipient_session": "mini2_launcher"}],
+                    }
+                )
+            if name == "reply":
+                return FakeClient._Res({"success": True})
+            raise AssertionError(f"unexpected call {name!r}")
+
+    class _Conn:
+        async def __aenter__(self):
+            return _FreshClient()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("fastmcp.Client", lambda *a, **kw: _Conn())
+    cfg = _cfg(identity="mini2_launcher")
+    await L._shutdown(cfg, {}, set(), set(), None)
+    assert [c[0] for c in calls] == ["list_messages", "reply"]
+    reply_args = calls[1][1]
+    assert reply_args["message_id"] == "a" * 32
+    assert json.loads(reply_args["response"])["error"] == "launcher_shutdown"
 
 
 # Reference os/sys so static checkers don't flag the imports used only in fakes.

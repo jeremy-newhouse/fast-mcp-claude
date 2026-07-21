@@ -3,9 +3,11 @@ id: FMC-15
 title: >-
   Fix launcher.py: duplicate-instance ownership is unenforced, and in-flight
   replies are lost across reconnect and shutdown
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@jeremy'
 created_date: '2026-07-21 14:44'
+updated_date: '2026-07-21 21:09'
 labels:
   - reliability
   - launcher
@@ -33,9 +35,81 @@ All three bugs live in src/fast_mcp_claude/launcher.py. The launcher has an ECA-
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A launcher process that receives an IDENTITY_LIVE_ELSEWHERE rejection from announce (meaning another live process already owns this identity) stops competing for and claiming work under that identity, instead of merely logging the rejection once and continuing to poll and claim exactly as before.
-- [ ] #2 The stale-claim reaper never runs, and the poll loop never claims new work, until this process's own ownership of the identity has actually been confirmed by a successful announce on the current connection -- so a duplicate/illegitimate launcher instance cannot reap the real owner's genuinely in-flight tasks nor start claiming new mailbox work.
-- [ ] #3 A task claimed before a client reconnect (transport blip, detected dead session, or local server restart) still results in its reply being delivered to the mesh after the reconnect completes, instead of the reply attempt silently failing against the now-closed pre-reconnect connection and the task sitting unresolved until the message's time-to-live expires.
-- [ ] #4 Every task that is genuinely in flight when the launcher receives a shutdown signal (SIGTERM or SIGINT) results in a launcher_shutdown reply actually delivered to the mesh, even though the process is being cancelled -- instead of the shutdown reply sweep silently failing because cancellation already tore down the client connection it depends on.
-- [ ] #5 Regression tests cover all three scenarios (a rogue second instance under IDENTITY_LIVE_ELSEWHERE no longer reaps/claims, a task's reply survives a mid-task client reconnect, and a task's reply survives a shutdown-time cancellation), with each test demonstrated to fail against the pre-fix code and pass against the fix.
+- [x] #1 A launcher process that receives an IDENTITY_LIVE_ELSEWHERE rejection from announce (meaning another live process already owns this identity) stops competing for and claiming work under that identity, instead of merely logging the rejection once and continuing to poll and claim exactly as before.
+- [x] #2 The stale-claim reaper never runs, and the poll loop never claims new work, until this process's own ownership of the identity has actually been confirmed by a successful announce on the current connection -- so a duplicate/illegitimate launcher instance cannot reap the real owner's genuinely in-flight tasks nor start claiming new mailbox work.
+- [x] #3 A task claimed before a client reconnect (transport blip, detected dead session, or local server restart) still results in its reply being delivered to the mesh after the reconnect completes, instead of the reply attempt silently failing against the now-closed pre-reconnect connection and the task sitting unresolved until the message's time-to-live expires.
+- [x] #4 Every task that is genuinely in flight when the launcher receives a shutdown signal (SIGTERM or SIGINT) results in a launcher_shutdown reply actually delivered to the mesh, even though the process is being cancelled -- instead of the shutdown reply sweep silently failing because cancellation already tore down the client connection it depends on.
+- [x] #5 Regression tests cover all three scenarios (a rogue second instance under IDENTITY_LIVE_ELSEWHERE no longer reaps/claims, a task's reply survives a mid-task client reconnect, and a task's reply survives a shutdown-time cancellation), with each test demonstrated to fail against the pre-fix code and pass against the fix.
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. ECA-71 owner-token gate (AC#1/#2): add owner_confirmed: asyncio.Event to _heartbeat_loop
+   (set on successful announce, cleared on any non-success incl. IDENTITY_LIVE_ELSEWHERE).
+   Add _wait_for_owner_confirmed_or_reconnect() helper (races owner_confirmed against
+   reconnect_needed, mirroring _wait_for_instruction_or_reconnect, to avoid deadlocking if
+   the heartbeat exits before ever confirming). _bridge awaits this gate before the first
+   reap AND re-checks it every poll-loop iteration.
+2. Reconnect-safe replies (AC#3): add _ClientBox (mutable holder for the bridge's CURRENT
+   connection, survives reconnects). _bridge passes the box (not the raw client) to
+   _handle_task. _send_reply re-reads client_source.client on every retry attempt when
+   given a box, and retry budget widened (_REPLY_RETRY_ATTEMPTS/_REPLY_RETRY_BACKOFF_S) to
+   outlast a typical heartbeat-detected reconnect.
+3. Shutdown-safe replies (AC#4): _shutdown no longer reuses _bridge's (already torn-down-by-
+   cancellation) connection; it opens its OWN fresh Client for the list_messages + reply
+   sweep. Signature changes from _shutdown(client, cfg, ...) to
+   _shutdown(cfg, client_kwargs, ...).
+4. Regression tests (AC#5): test_owner_token_refused_never_reaps_or_claims,
+   test_handle_task_reply_survives_reconnect, test_shutdown_uses_fresh_connection_for_reply_sweep
+   — each confirmed via git stash to fail against pre-fix launcher.py and pass post-fix.
+5. Prior art: mirrors channel.py's ECA-71 announce_confirmed gate (Layer B) for AC#1/#2,
+   adapted to launcher.py's single-connection _bridge structure (vs channel.py's split
+   presence/inbox connections) — gate is per-connection per AC#2's own wording ("confirmed
+   ... on the current connection").
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implementation complete on feature/FMC-15. Full diff touches only src/fast_mcp_claude/launcher.py
+(+ tests/test_launcher.py). Summary of the fix per bug:
+
+AC#1/#2 (owner-token gate): _heartbeat_loop now takes an owner_confirmed: asyncio.Event, set on
+a successful announce and cleared on any non-success (most notably IDENTITY_LIVE_ELSEWHERE).
+New helper _wait_for_owner_confirmed_or_reconnect races owner_confirmed against reconnect_needed
+(same shape as the existing _wait_for_instruction_or_reconnect) so the gate can't deadlock if the
+heartbeat exits before ever confirming. _bridge awaits this gate before running the reaper AND
+re-checks it on every poll-loop iteration (a later mid-run refusal also stops new claims, not
+just the very first reap). Design mirrors channel.py's ECA-71 announce_confirmed (Layer B),
+adapted to launcher.py's single shared connection (channel.py splits presence/inbox onto separate
+connections) -- gated per-connection to match AC#2's own wording ("confirmed ... on the current
+connection").
+
+AC#3 (reconnect-safe reply): new _ClientBox holds _bridge's CURRENT connection and survives
+reconnects (unlike the raw client). _bridge now passes the box (not the raw client `c`) into
+_handle_task, and _send_reply re-reads client_source.client on every retry attempt when given a
+box -- so a reply started against a connection that later closes picks up whatever connection is
+CURRENT instead of exhausting retries against the dead one. Retry budget widened
+(_REPLY_RETRY_ATTEMPTS=8, _REPLY_RETRY_BACKOFF_S=1.0, module-level so tests can shrink them) to
+outlast a typical heartbeat-detected reconnect.
+
+AC#4 (shutdown-safe reply): _shutdown no longer reuses _bridge's connection (already torn down by
+the time cancellation reaches _shutdown, since __aexit__ runs before the except-CancelledError
+clause). It now opens its OWN fresh Client for the list_messages + reply sweep. Signature changed
+from _shutdown(client, cfg, live, tasks, heartbeat_task) to
+_shutdown(cfg, client_kwargs, live, tasks, heartbeat_task).
+
+AC#5 (regression tests): three new tests in tests/test_launcher.py --
+test_owner_token_refused_never_reaps_or_claims, test_handle_task_reply_survives_reconnect,
+test_shutdown_uses_fresh_connection_for_reply_sweep. Verified via `git stash` (stashing only
+launcher.py, keeping the tests) that all three FAIL against pre-fix code (AttributeError /
+'called list_messages while unconfirmed' / '0 replies delivered'), then pass again after
+`git stash pop`.
+
+Verification: `uv run pytest` -- 365 passed (was 362; +3 new, 2 pre-existing heartbeat-loop call
+sites updated for the new owner_confirmed param, no others broken). `uv run ruff check src/
+tests/` -- all checks passed. `uv run ruff format --check` flags 9 files including launcher.py/
+test_launcher.py, but confirmed via `git stash` that this format drift PRE-EXISTS on dev
+(unrelated to this change) -- left untouched to avoid unrelated churn.
+<!-- SECTION:NOTES:END -->

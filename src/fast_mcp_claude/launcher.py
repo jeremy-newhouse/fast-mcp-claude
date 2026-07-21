@@ -22,10 +22,17 @@ Correctness invariants (do not "simplify" away):
   * STALE-CLAIM REAPER. At startup (before the poll loop), any 'delivered' row
     addressed to our identity — orphaned by a previous crash mid-task — is replied
     fail-fast (launcher_restarted_task_lost) so the controller doesn't hang to TTL.
+  * OWNER-TOKEN GATE (ECA-71/ADR-0029). The reaper and the poll loop never run until this
+    process's OWN announce on the CURRENT connection is confirmed successful; a duplicate
+    instance whose announce is refused (IDENTITY_LIVE_ELSEWHERE) never reaps the real
+    owner's in-flight tasks and never competes for new mailbox work (see
+    `_wait_for_owner_confirmed_or_reconnect`).
   * ALWAYS-REPLY. Every claimed message gets EXACTLY ONE reply() on EVERY exit path
     (success, nonzero exit, timeout-kill, spawn failure, envelope rejection, internal
-    exception, launcher shutdown). The whole task handler is wrapped so any unexpected
-    exception still posts a minimal launcher_internal reply.
+    exception, launcher shutdown, client reconnect). The whole task handler is wrapped so
+    any unexpected exception still posts a minimal launcher_internal reply, and replies are
+    routed through a `_ClientBox` so a mid-task reconnect or a shutdown-time cancellation
+    can't strand a reply on a connection that has already closed.
   * REPLY FITS. The JSON-encoded reply is pre-truncated (head+tail) to stay under
     launcher_reply_max_bytes (<< the server's 4 MB validate_response cap); a reply
     above 4 MB is rejected and the controller hangs to TTL.
@@ -801,20 +808,51 @@ async def _kill_group(lp: _LiveProc) -> None:
 # ----------------------------------------------------------------- reply sender
 
 
-async def _send_reply(client: Any, message_id: str, response: str) -> None:
-    """reply() to the local server; retry a couple times (controller hangs until TTL
-    otherwise)."""
+class _ClientBox:
+    """Mutable holder for the bridge's CURRENT connection.
+
+    A task handler is created against whichever connection is live when it starts, but its
+    reply may not run until well after `_bridge` has reconnected and replaced that connection
+    (a transport blip, a dead-session rebuild). Passing this box (instead of the raw client)
+    lets `_send_reply` re-read `.client` on every retry attempt, so a reply started against an
+    old connection picks up whatever connection is CURRENT instead of retrying forever against
+    one that has already closed (AC#3)."""
+
+    def __init__(self) -> None:
+        self.client: Any = None
+
+
+# Attempts * backoff must comfortably outlast a heartbeat-detected reconnect (up to
+# ~heartbeat * _ANNOUNCE_FAILS_BEFORE_RECONNECT to detect a dead session, plus reconnect
+# backoff to rebuild) so a task's reply doesn't give up while the bridge is mid-recovery
+# (AC#3). Module-level so tests can shrink them like KILL_GRACE_S.
+_REPLY_RETRY_ATTEMPTS = 8
+_REPLY_RETRY_BACKOFF_S = 1.0
+
+
+async def _send_reply(client_source: Any, message_id: str, response: str) -> None:
+    """reply() to the local server; retry several times with backoff (the controller hangs
+    until TTL otherwise).
+
+    `client_source` is either a live client directly, or a `_ClientBox` whose `.client` is
+    re-read on every attempt (see `_ClientBox`)."""
     last_err: Exception | None = None
-    for attempt in range(3):
-        try:
-            res = await client.call_tool("reply", {"message_id": message_id, "response": response})
-            data = _result_data(res)
-            if data.get("success"):
-                return
-            last_err = RuntimeError(f"reply not accepted: {data}")
-        except Exception as e:  # transport/encoding failure
-            last_err = e
-        await asyncio.sleep(0.5 * (attempt + 1))
+    for attempt in range(_REPLY_RETRY_ATTEMPTS):
+        client = client_source.client if isinstance(client_source, _ClientBox) else client_source
+        if client is None:
+            last_err = RuntimeError("no live client available for reply")
+        else:
+            try:
+                res = await client.call_tool(
+                    "reply", {"message_id": message_id, "response": response}
+                )
+                data = _result_data(res)
+                if data.get("success"):
+                    return
+                last_err = RuntimeError(f"reply not accepted: {data}")
+            except Exception as e:  # transport/encoding failure
+                last_err = e
+        await asyncio.sleep(_REPLY_RETRY_BACKOFF_S * (attempt + 1))
     _log(f"reply failed for message_id={message_id} after retries: {last_err}")
 
 
@@ -969,7 +1007,11 @@ def _announce_metadata(cfg: LauncherConfig) -> dict[str, Any]:
 
 
 async def _heartbeat_loop(
-    client: Any, cfg: LauncherConfig, running: "_Counter", reconnect_needed: asyncio.Event
+    client: Any,
+    cfg: LauncherConfig,
+    running: "_Counter",
+    reconnect_needed: asyncio.Event,
+    owner_confirmed: asyncio.Event,
 ) -> None:
     """Independent task: announce presence every cfg.heartbeat seconds (like channel.py).
 
@@ -978,7 +1020,13 @@ async def _heartbeat_loop(
     persistent 'Session terminated', and without this the launcher would announce-fail forever
     and drop out of who() while the main loop stayed blocked on a dead session (GH #3). Auth
     failures never trip a rebuild (reconnecting won't fix a bad bearer, and would risk the 60s
-    endpoint lockout)."""
+    endpoint lockout).
+
+    ECA-71 owner-token gate (AC#1/#2): `owner_confirmed` is set on every successful announce on
+    THIS connection and cleared on any non-success (most notably IDENTITY_LIVE_ELSEWHERE — a
+    second live launcher already owns this identity). `_bridge` gates reaping and claiming on
+    this event so a duplicate/illegitimate instance never reaps the real owner's in-flight tasks
+    nor competes for new mailbox work while refused."""
     consecutive = 0
     refusal_logged = False
     while True:
@@ -992,22 +1040,26 @@ async def _heartbeat_loop(
                 },
             )
             consecutive = 0
-            # ECA-71: tolerate a duplicate-identity refusal (a second launcher for this identity)
-            # — it is NOT a dead-session failure, so never trip a reconnect; just log loudly once
-            # so the operator can kill the offender. pm2 runs one launcher per peer, so this is a
-            # defensive backstop; the real fix lives in the channel sidecar.
             data = _result_data(res)
-            if not data.get("success"):
+            if data.get("success"):
+                owner_confirmed.set()
+                refusal_logged = False
+            else:
+                # Fail-closed: only an explicit success counts as confirmed ownership. Most
+                # commonly IDENTITY_LIVE_ELSEWHERE (a second live launcher already holds this
+                # identity) — log loudly once so the operator can kill the offender. pm2 runs
+                # one launcher per peer, so this is a defensive backstop; the real fix lives in
+                # the channel sidecar.
+                owner_confirmed.clear()
                 err = data.get("error") if isinstance(data.get("error"), dict) else {}
                 if err.get("code") == "IDENTITY_LIVE_ELSEWHERE" and not refusal_logged:
                     _log(
                         f"announce REFUSED for identity={cfg.identity!r}: another live launcher "
-                        f"already holds it (IDENTITY_LIVE_ELSEWHERE). Kill the duplicate if this "
-                        f"process should own it. Detail: {data}"
+                        f"already holds it (IDENTITY_LIVE_ELSEWHERE). This process will NOT reap "
+                        f"or claim work under this identity until ownership is confirmed. Kill "
+                        f"the duplicate if this process should own it. Detail: {data}"
                     )
                     refusal_logged = True
-            else:
-                refusal_logged = False
         except Exception as e:
             _log(f"announce failed (continuing): {e}")
             if any(h in str(e).lower() for h in _AUTH_HINTS):
@@ -1055,6 +1107,35 @@ async def _wait_for_instruction_or_reconnect(
                     pass
 
 
+async def _wait_for_owner_confirmed_or_reconnect(
+    owner_confirmed: asyncio.Event, reconnect_needed: asyncio.Event
+) -> None:
+    """Block until this connection's ownership is confirmed (a successful announce), or abort
+    with _ReconnectNeeded if the heartbeat gives up first.
+
+    AC#1/#2: `_bridge` must never reap or claim while ownership is unconfirmed, but blocking on
+    `owner_confirmed.wait()` alone would deadlock forever if the heartbeat loop exits (signalling
+    reconnect_needed) before ever announcing successfully on this connection — nothing would be
+    left to set owner_confirmed. Racing both events (mirrors
+    `_wait_for_instruction_or_reconnect`) closes that gap."""
+    if owner_confirmed.is_set():
+        return
+    confirmed = asyncio.ensure_future(owner_confirmed.wait())
+    dead = asyncio.ensure_future(reconnect_needed.wait())
+    try:
+        await asyncio.wait({confirmed, dead}, return_when=asyncio.FIRST_COMPLETED)
+        if not owner_confirmed.is_set():
+            raise _ReconnectNeeded()
+    finally:
+        for fut in (confirmed, dead):
+            if not fut.done():
+                fut.cancel()
+                try:
+                    await fut
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+
 async def _bridge(cfg: LauncherConfig) -> None:
     """Connect to the local server and pump inbox -> spawn until cancelled.
 
@@ -1077,14 +1158,32 @@ async def _bridge(cfg: LauncherConfig) -> None:
     running = _Counter()
     backoff = 1.0
     reaped_once = False  # full reaper runs ONCE per process lifetime (first connect)
+    # Survives reconnects (unlike `c` itself): task handlers reply through whichever
+    # connection is CURRENT rather than the one they were created against (AC#3).
+    box = _ClientBox()
     while True:
         heartbeat_task: asyncio.Task | None = None
-        client: Any = None
         try:
             async with Client(cfg.local_url, **client_kwargs) as c:
-                client = c
+                box.client = c
                 backoff = 1.0
                 _log(f"connected to {cfg.local_url} as identity={cfg.identity!r}")
+                # Fresh per connection: the heartbeat sets reconnect_needed if it detects the
+                # session has died (server restart), and the main poll races against it so a
+                # blocked long-poll can't strand us on a dead session (GH #3). owner_confirmed
+                # (ECA-71) is set by the heartbeat on THIS connection's first successful
+                # announce and cleared on any refusal (IDENTITY_LIVE_ELSEWHERE) — AC#1/#2 gate
+                # reaping and claiming on it below.
+                reconnect_needed = asyncio.Event()
+                owner_confirmed = asyncio.Event()
+                heartbeat_task = asyncio.create_task(
+                    _heartbeat_loop(c, cfg, running, reconnect_needed, owner_confirmed)
+                )
+                # AC#2: never reap or claim until THIS process's own ownership of the identity
+                # has been confirmed by a successful announce on the current connection — a
+                # duplicate/illegitimate instance must not reap the real owner's in-flight tasks
+                # nor start claiming new mailbox work while its announce is refused.
+                await _wait_for_owner_confirmed_or_reconnect(owner_confirmed, reconnect_needed)
                 # Run the full reaper ONCE per process lifetime, at the first
                 # successful connect (no tasks are in-flight yet, so every orphaned
                 # 'delivered' row really is from a PREVIOUS crash). We still pass
@@ -1099,13 +1198,6 @@ async def _bridge(cfg: LauncherConfig) -> None:
                     reaped_once = True
                 else:
                     _log("reconnect: skipping reaper (live in-flight tasks must not be reaped)")
-                # Fresh per connection: the heartbeat sets this if it detects the session has
-                # died (server restart), and the main poll races against it so a blocked
-                # long-poll can't strand us on a dead session (GH #3).
-                reconnect_needed = asyncio.Event()
-                heartbeat_task = asyncio.create_task(
-                    _heartbeat_loop(c, cfg, running, reconnect_needed)
-                )
                 while True:
                     # Slot FIRST: never claim a task we can't run (claiming flips it
                     # to 'delivered'; a crash before reply would lose it).
@@ -1113,6 +1205,15 @@ async def _bridge(cfg: LauncherConfig) -> None:
                     if reconnect_needed.is_set():
                         sem.release()  # heartbeat already flagged a dead session
                         raise _ReconnectNeeded()
+                    if not owner_confirmed.is_set():
+                        # AC#1: a refusal discovered mid-run (our own heartbeat went stale and
+                        # a legitimate takeover's announce won) must stop new claims too, not
+                        # just gate the very first reap/claim right after connecting.
+                        sem.release()
+                        await _wait_for_owner_confirmed_or_reconnect(
+                            owner_confirmed, reconnect_needed
+                        )
+                        continue
                     try:
                         res = await _wait_for_instruction_or_reconnect(c, cfg, reconnect_needed)
                     except Exception:
@@ -1130,12 +1231,12 @@ async def _bridge(cfg: LauncherConfig) -> None:
                         continue
                     _log(f"claimed task {msg.get('id')} from {msg.get('sender')}")
                     t = asyncio.create_task(
-                        _handle_task(c, msg, cfg, sem, live, running, inflight)
+                        _handle_task(box, msg, cfg, sem, live, running, inflight)
                     )
                     tasks.add(t)
                     t.add_done_callback(tasks.discard)
         except asyncio.CancelledError:
-            await _shutdown(client, cfg, live, tasks, heartbeat_task)
+            await _shutdown(cfg, client_kwargs, live, tasks, heartbeat_task)
             raise
         except _ReconnectNeeded:
             # Expected control-flow signal (heartbeat saw a dead session), not a crash: rebuild
@@ -1154,14 +1255,20 @@ async def _bridge(cfg: LauncherConfig) -> None:
 
 
 async def _shutdown(
-    client: Any,
     cfg: LauncherConfig,
+    client_kwargs: dict[str, Any],
     live: set["_LiveProc"],
     tasks: set[asyncio.Task],
     heartbeat_task: asyncio.Task | None,
 ) -> None:
     """On SIGTERM/SIGINT: SIGTERM live child groups, bounded grace, then reply
-    launcher_shutdown for every in-flight task (always-reply discipline), then exit."""
+    launcher_shutdown for every in-flight task (always-reply discipline), then exit.
+
+    AC#4: opens its OWN fresh connection for the reply sweep instead of reusing `_bridge`'s
+    connection. By the time cancellation reaches `_bridge`'s `except asyncio.CancelledError`
+    (which calls this), it has already unwound through that connection's own `async with`
+    __aexit__ and torn it down — reusing it here would silently fail every list_messages/reply
+    call below, exactly the bug this fixes."""
     if heartbeat_task is not None:
         heartbeat_task.cancel()
     # Snapshot in-flight message ids BEFORE cancelling the handlers (their finally
@@ -1174,9 +1281,12 @@ async def _shutdown(
     # Best-effort: drain cancellations.
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-    # Reply launcher_shutdown for anything still delivered to us.
-    if client is not None:
-        try:
+    # Reply launcher_shutdown for anything still delivered to us, via a FRESH connection (the
+    # bridge's own connection is already closed by this point — see the docstring above).
+    from fastmcp import Client
+
+    try:
+        async with Client(cfg.local_url, **client_kwargs) as client:
             res = await client.call_tool("list_messages", {"status": "delivered", "limit": 200})
             data = _result_data(res)
             for row in data.get("messages") or []:
@@ -1189,8 +1299,8 @@ async def _shutdown(
                     mid,
                     json.dumps({"ok": False, "error": "launcher_shutdown"}),
                 )
-        except Exception as e:
-            _log(f"shutdown reply sweep failed: {e}")
+    except Exception as e:
+        _log(f"shutdown reply sweep failed: {e}")
     _log(f"shutdown complete (replied launcher_shutdown for {len(inflight_ids)} task(s))")
 
 

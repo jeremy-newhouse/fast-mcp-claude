@@ -3,11 +3,11 @@ id: FMC-15
 title: >-
   Fix launcher.py: duplicate-instance ownership is unenforced, and in-flight
   replies are lost across reconnect and shutdown
-status: In Progress
+status: Done
 assignee:
   - '@jeremy'
 created_date: '2026-07-21 14:44'
-updated_date: '2026-07-21 21:09'
+updated_date: '2026-07-21 21:33'
 labels:
   - reliability
   - launcher
@@ -112,4 +112,74 @@ sites updated for the new owner_confirmed param, no others broken). `uv run ruff
 tests/` -- all checks passed. `uv run ruff format --check` flags 9 files including launcher.py/
 test_launcher.py, but confirmed via `git stash` that this format drift PRE-EXISTS on dev
 (unrelated to this change) -- left untouched to avoid unrelated churn.
+
+Adversarial review (general-purpose subagent, per this campaign's established requirement for
+concurrency/reconnect/shutdown-ordering fixes) ran against the first commit's diff. It found 3
+issues -- all fixed in a follow-up commit before opening the PR:
+
+1. CONFIRMED (empirically reproduced by the reviewer): a persistently bad MCP_API_KEY caused
+   every announce() to raise a 401-shaped exception. Since auth-shaped failures deliberately
+   never trip reconnect_needed (existing, correct design -- reconnecting won't fix a bad bearer
+   and risks the 5-in-5-minutes lockout), and an exception is never a well-formed
+   IDENTITY_LIVE_ELSEWHERE refusal either, _wait_for_owner_confirmed_or_reconnect would block
+   FOREVER with nothing able to wake it -- a new permanent-deadlock regression versus pre-fix
+   behavior (which at least reached the poll loop and let the existing reconnect-with-backoff
+   handling take over). Fixed with a separate owner_wait_abandoned escape valve: after
+   _AUTH_FAILS_BEFORE_GIVING_UP (3) consecutive auth-shaped exceptions, the gate proceeds anyway
+   (safe: every subsequent mesh call fails identically on the same bad bearer, so this can't let
+   a duplicate instance actually reap/claim anything) -- and is cleared the moment ANY
+   well-formed response (success or refusal) is observed again, so a genuine refusal discovered
+   once connectivity recovers still re-engages the gate. Regression test:
+   test_owner_wait_abandoned_lets_bridge_proceed_on_persistent_auth_failure.
+
+2. CONFIRMED (empirically verified against fastmcp 3.4.4's actual timeout defaults): _shutdown's
+   new fresh Client() connection had no timeout anywhere in the chain (client_init_timeout
+   defaults to disabled). If the local server is also going down but still accepting TCP
+   connections without answering, the reply sweep could hang indefinitely -- worse than the
+   pre-fix code it replaces, which failed near-instantly (calling a closed client raises
+   immediately). Fixed by wrapping the whole sweep in asyncio.wait_for(...,
+   timeout=_SHUTDOWN_REPLY_SWEEP_TIMEOUT_S=20.0), logging and proceeding to exit on timeout
+   (best-effort, matches channel.py's _graceful_forget's bounded-best-effort pattern).
+
+3. PLAUSIBLE (real gap by code reading, matches a documented residual in channel.py's own
+   _inbox_loop for the identical class of race): the owner-token gate is only rechecked BETWEEN
+   wait_for_instruction calls, not DURING one. wait_for_instruction claims the message
+   server-side before returning, so a refusal discovered while a poll is already in flight (up
+   to cfg.poll seconds) could still surface a real message after ownership was lost. Fixed by
+   adding an immediate recheck right after a message is claimed, mirroring channel.py's own
+   _IDENTITY_UNCERTAIN_BOUNCE handling: bounce the message (fail-fast reply,
+   launcher_identity_uncertain) instead of silently running it. Regression test:
+   test_bridge_bounces_message_claimed_after_mid_poll_refusal.
+
+Full suite after the follow-up fixes: `uv run pytest` -- 367 passed (was 365; +2 new tests for
+the two review-driven fixes). `uv run ruff check src/ tests/` -- all checks passed.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Fixed all three launcher.py bugs: (1) IDENTITY_LIVE_ELSEWHERE is now enforced via an
+owner_confirmed asyncio.Event set on successful announce and cleared on refusal, gating both the
+stale-claim reaper and every poll-loop iteration through a new _wait_for_owner_confirmed_or_reconnect
+helper (mirrors channel.py's ECA-71 announce_confirmed pattern). (2) Task replies now route through
+a _ClientBox holding the bridge's current connection (updated on every reconnect), so a reply
+started before a reconnect picks up whichever connection is live when it actually sends, instead
+of exhausting retries against a closed one. (3) _shutdown opens its own fresh connection for the
+launcher_shutdown reply sweep instead of reusing the bridge's connection, which cancellation has
+already torn down by the time _shutdown runs.
+
+An adversarial subagent review of the first pass found and (in a follow-up commit) fixed three
+further issues: a persistently bad bearer could deadlock the new owner-token gate forever (fixed
+with an owner_wait_abandoned escape valve); _shutdown's fresh connection had no timeout and could
+hang shutdown indefinitely against a half-dead server (bounded with asyncio.wait_for); and the
+gate was only rechecked between polls, not during one, so a refusal discovered mid-poll could
+still surface an already-claimed message (fixed by bouncing it immediately, mirroring channel.py's
+existing bounce pattern).
+
+Verified: 5 new regression tests (test_owner_token_refused_never_reaps_or_claims,
+test_handle_task_reply_survives_reconnect, test_shutdown_uses_fresh_connection_for_reply_sweep,
+test_owner_wait_abandoned_lets_bridge_proceed_on_persistent_auth_failure,
+test_bridge_bounces_message_claimed_after_mid_poll_refusal), each confirmed via git stash to fail
+against pre-fix code and pass post-fix. Full suite: uv run pytest -- 367 passed. uv run ruff check
+src/ tests/ -- all checks passed.
+<!-- SECTION:FINAL_SUMMARY:END -->

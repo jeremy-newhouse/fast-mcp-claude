@@ -19,7 +19,8 @@ import time
 _MAX_LAST = 200
 
 
-def _load(path: str) -> dict:
+def load_status_file(path: str) -> dict:
+    """Shared with statusline_hook.py: both merge fields into the same status file."""
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -28,7 +29,7 @@ def _load(path: str) -> dict:
         return {}
 
 
-def _atomic_write(path: str, data: dict) -> None:
+def atomic_write_status_file(path: str, data: dict) -> None:
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f)
@@ -47,7 +48,7 @@ def main(argv: list[str] | None = None) -> None:
             event = {}
         name = event.get("hook_event_name") or event.get("hookEventName") or ""
 
-        st = _load(path)
+        st = load_status_file(path)
         st.setdefault("started_at", time.time())
         # Seed static fields if the wrapper didn't (defensive; the wrapper normally does).
         if event.get("cwd") and not st.get("cwd"):
@@ -64,6 +65,9 @@ def main(argv: list[str] | None = None) -> None:
             prompt = (event.get("prompt") or "").strip().replace("\n", " ")
             if prompt:
                 st["last"] = prompt[:_MAX_LAST]
+            # ECA-49: one increment per operator turn, so fleet-wide presence can surface
+            # session activity volume alongside context/cost (statusline_hook.py's twin fields).
+            st["message_count"] = st.get("message_count", 0) + 1
         elif name == "Stop":
             st["status"] = "idle"
         elif name == "SessionStart":
@@ -72,7 +76,7 @@ def main(argv: list[str] | None = None) -> None:
             st.setdefault("status", "active")
         st["updated_at"] = time.time()
 
-        _atomic_write(path, st)
+        atomic_write_status_file(path, st)
     except Exception:
         # Never block or fail the session on an up-reporting hiccup.
         pass

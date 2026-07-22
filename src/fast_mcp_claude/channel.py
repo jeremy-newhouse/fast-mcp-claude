@@ -542,6 +542,13 @@ def _build_presence(cfg: ChannelConfig) -> tuple[str | None, dict[str, Any]]:
         # claude_session_id written by session_hook.py from the CC hook event).
         "session_description": st.get("session_description") or None,
         "claude_session_id": st.get("claude_session_id") or None,
+        # ECA-49: same context/cost/message-count/started_at fields as session.py's twin.
+        "context_pct": st.get("context_pct"),
+        "context_tokens_used": st.get("context_tokens_used"),
+        "context_window_size": st.get("context_window_size"),
+        "cost_usd": st.get("cost_usd"),
+        "message_count": st.get("message_count"),
+        "session_started_at": st.get("started_at"),
         # ECA-71 owner-token: identifies THIS process to the server's duplicate-identity guard.
         "announce_token": cfg.announce_token or None,
     }

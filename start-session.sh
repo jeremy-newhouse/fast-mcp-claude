@@ -3,8 +3,9 @@
 # start-session.sh — launch an interactive Claude Code dev session that is
 # "fleet-visible" to the eCA brain (Phase 4, live-session legs).
 #
-# It wires up-reporting hooks (SessionStart/UserPromptSubmit/Stop -> fast-mcp-claude-session-hook
-# that write a local status file) and ONE of two down-delivery mechanisms, then execs claude:
+# It wires up-reporting hooks (SessionStart/UserPromptSubmit/Stop -> fast-mcp-claude-session-hook,
+# plus a statusLine -> fast-mcp-claude-statusline-hook for context/cost telemetry, ECA-49 --
+# both write the same local status file) and ONE of two down-delivery mechanisms, then execs claude:
 #
 #   notify+pull (default):
 #     - the fast-mcp-claude-session SIDECAR (background) — sole announcer of this session's
@@ -125,9 +126,10 @@ resolve_bin() {
 }
 BIN_SESSION="$(resolve_bin fast-mcp-claude-session)"
 BIN_HOOK="$(resolve_bin fast-mcp-claude-session-hook)"
+BIN_STATUSLINE="$(resolve_bin fast-mcp-claude-statusline-hook)"
 BIN_CHANNEL="$(resolve_bin fast-mcp-claude-channel)"
-if [ -z "$BIN_SESSION" ] || [ -z "$BIN_HOOK" ]; then
-  echo "ERROR: fast-mcp-claude-session(-hook) not found. Run 'uv sync' in $FMC_REPO." >&2
+if [ -z "$BIN_SESSION" ] || [ -z "$BIN_HOOK" ] || [ -z "$BIN_STATUSLINE" ]; then
+  echo "ERROR: fast-mcp-claude-session(-hook/-statusline-hook) not found. Run 'uv sync' in $FMC_REPO." >&2
   exit 2
 fi
 if [ "$CHANNEL_MODE" = "1" ] && [ -z "$BIN_CHANNEL" ]; then
@@ -202,13 +204,19 @@ else:
 json.dump({"mcpServers": servers}, open(path, "w"))
 PY
 
-# up-reporting hooks: each invokes the status-writer with the status-file path in env.
+# up-reporting hooks: each invokes the status-writer with the status-file path in env. The
+# statusLine command (ECA-49) is a SEPARATE CC mechanism (not a "hooks" entry) that Claude Code
+# invokes on every new assistant message with live context-window/cost JSON on stdin -- richer
+# and non-cumulative, unlike the SessionStart/UserPromptSubmit/Stop hook events above, which
+# never carry token/context data. Its stdout also becomes the operator's visible status line.
 HOOK_CMD="CRM_SESSION_STATUS_FILE='$STATUS_FILE' '$BIN_HOOK'"
-python3 - "$SETTINGS" "$HOOK_CMD" <<'PY'
+STATUSLINE_CMD="CRM_SESSION_STATUS_FILE='$STATUS_FILE' '$BIN_STATUSLINE'"
+python3 - "$SETTINGS" "$HOOK_CMD" "$STATUSLINE_CMD" <<'PY'
 import json, sys
-path, cmd = sys.argv[1:3]
+path, cmd, statusline_cmd = sys.argv[1:4]
 entry = [{"matcher": "", "hooks": [{"type": "command", "command": cmd}]}]
-json.dump({"hooks": {"SessionStart": entry, "UserPromptSubmit": entry, "Stop": entry}},
+json.dump({"hooks": {"SessionStart": entry, "UserPromptSubmit": entry, "Stop": entry},
+           "statusLine": {"type": "command", "command": statusline_cmd}},
           open(path, "w"))
 PY
 

@@ -441,6 +441,34 @@ def test_presence_omits_description_and_claude_session_id_when_absent(tmp_path):
     assert "claude_session_id" not in meta
 
 
+def test_presence_includes_context_and_cost_telemetry(tmp_path):
+    # ECA-49: statusline_hook.py's fields + session_hook.py's message_count, same pipeline.
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({
+        "machine": "mini2", "repo": "evolv-coder-agent", "status": "active",
+        "context_pct": 42, "context_tokens_used": 84000, "context_window_size": 200000,
+        "cost_usd": 1.23, "message_count": 7, "started_at": 1700000000.0,
+    }))
+    cfg = _cfg(identity="mini2.eca", status_file=str(sf))
+    _, meta = channel_mod._build_presence(cfg)
+    assert meta["context_pct"] == 42
+    assert meta["context_tokens_used"] == 84000
+    assert meta["context_window_size"] == 200000
+    assert meta["cost_usd"] == 1.23
+    assert meta["message_count"] == 7
+    assert meta["session_started_at"] == 1700000000.0
+
+
+def test_presence_omits_context_and_cost_telemetry_when_absent(tmp_path):
+    sf = tmp_path / "status.json"
+    sf.write_text(json.dumps({"machine": "mini2", "repo": "evolv-coder-agent", "status": "active"}))
+    cfg = _cfg(identity="mini2.eca", status_file=str(sf))
+    _, meta = channel_mod._build_presence(cfg)
+    for key in ("context_pct", "context_tokens_used", "context_window_size", "cost_usd",
+                "message_count", "session_started_at"):
+        assert key not in meta
+
+
 # -------------------------------------------------- permission relay routing
 
 

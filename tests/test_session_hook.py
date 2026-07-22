@@ -77,6 +77,22 @@ def test_missing_session_id_does_not_clear_existing(tmp_path, monkeypatch):
     assert json.loads(sf.read_text())["claude_session_id"] == "abc-123"
 
 
+def test_user_prompt_submit_increments_message_count(tmp_path, monkeypatch):
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({"repo": "r"}))
+    _run(monkeypatch, {"hook_event_name": "UserPromptSubmit", "prompt": "one"}, str(sf))
+    assert json.loads(sf.read_text())["message_count"] == 1
+    _run(monkeypatch, {"hook_event_name": "UserPromptSubmit", "prompt": "two"}, str(sf))
+    assert json.loads(sf.read_text())["message_count"] == 2
+
+
+def test_stop_does_not_increment_message_count(tmp_path, monkeypatch):
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({"repo": "r", "message_count": 3}))
+    _run(monkeypatch, {"hook_event_name": "Stop"}, str(sf))
+    assert json.loads(sf.read_text())["message_count"] == 3
+
+
 def test_bad_stdin_does_not_raise(tmp_path, monkeypatch):
     sf = tmp_path / "s.json"
     sf.write_text(json.dumps({"repo": "r"}))

@@ -214,6 +214,15 @@ def _build_presence(cfg: SessionConfig) -> tuple[str | None, dict[str, Any]]:
         # ECA-23: same status-file-sourced fields as channel.py's twin.
         "session_description": st.get("session_description") or None,
         "claude_session_id": st.get("claude_session_id") or None,
+        # ECA-49: context/cost telemetry from statusline_hook.py, message count from
+        # session_hook.py's UserPromptSubmit branch, and started_at for age (all same
+        # status-file-sourced pattern as ECA-23's fields, same twin in channel.py).
+        "context_pct": st.get("context_pct"),
+        "context_tokens_used": st.get("context_tokens_used"),
+        "context_window_size": st.get("context_window_size"),
+        "cost_usd": st.get("cost_usd"),
+        "message_count": st.get("message_count"),
+        "session_started_at": st.get("started_at"),
     }
     return summary, {k: v for k, v in meta.items() if v is not None}
 

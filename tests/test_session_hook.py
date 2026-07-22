@@ -100,3 +100,76 @@ def test_bad_stdin_does_not_raise(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.stdin", io.StringIO("not json{"))
     session_hook.main([])  # must not raise; status file stays readable
     assert json.loads(sf.read_text())["repo"] == "r"
+
+
+def test_session_start_clear_resets_stale_context_telemetry(tmp_path, monkeypatch):
+    # A /clear within the SAME long-lived process doesn't re-exec start-session.sh (which
+    # would otherwise reseed the file), so stale pre-clear telemetry must be dropped here.
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({
+        "repo": "r", "message_count": 12, "context_pct": 91, "context_tokens_used": 180000,
+        "context_window_size": 200000, "cost_usd": 3.5, "context_updated_at": 1.0,
+    }))
+    _run(monkeypatch, {"hook_event_name": "SessionStart", "source": "clear"}, str(sf))
+    data = json.loads(sf.read_text())
+    for key in ("message_count", "context_pct", "context_tokens_used", "context_window_size",
+                "cost_usd", "context_updated_at"):
+        assert key not in data
+    assert data["status"] == "active"
+    assert data["repo"] == "r"  # unrelated fields untouched
+
+
+def test_session_start_compact_resets_stale_context_telemetry(tmp_path, monkeypatch):
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({"repo": "r", "message_count": 5, "context_pct": 88}))
+    _run(monkeypatch, {"hook_event_name": "SessionStart", "source": "compact"}, str(sf))
+    data = json.loads(sf.read_text())
+    assert "message_count" not in data
+    assert "context_pct" not in data
+
+
+def test_session_start_resume_preserves_context_telemetry(tmp_path, monkeypatch):
+    # resume continues prior context -- must NOT reset (unlike clear/compact).
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({"repo": "r", "message_count": 5, "context_pct": 60}))
+    _run(monkeypatch, {"hook_event_name": "SessionStart", "source": "resume"}, str(sf))
+    data = json.loads(sf.read_text())
+    assert data["message_count"] == 5
+    assert data["context_pct"] == 60
+
+
+def test_session_start_startup_preserves_context_telemetry(tmp_path, monkeypatch):
+    # startup is the normal fresh launch -- start-session.sh already reseeds the file with no
+    # telemetry keys at all, so there is nothing to reset here; a leftover value (e.g. a reused
+    # identity's stale file) should still be left alone, not actively wiped.
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({"repo": "r", "message_count": 5, "context_pct": 60}))
+    _run(monkeypatch, {"hook_event_name": "SessionStart", "source": "startup"}, str(sf))
+    data = json.loads(sf.read_text())
+    assert data["message_count"] == 5
+    assert data["context_pct"] == 60
+
+
+def test_locked_status_file_serializes_concurrent_callers(tmp_path):
+    import threading
+    import time as time_mod
+
+    path = str(tmp_path / "s.json")
+    events = []
+
+    def worker(label, hold_seconds):
+        with session_hook.locked_status_file(path):
+            events.append(f"{label}-start")
+            time_mod.sleep(hold_seconds)
+            events.append(f"{label}-end")
+
+    t1 = threading.Thread(target=worker, args=("first", 0.05))
+    t1.start()
+    time_mod.sleep(0.01)  # ensure t1 has acquired the lock before t2 tries
+    t2 = threading.Thread(target=worker, args=("second", 0))
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # t2 must be blocked until t1 fully releases -- never interleaved.
+    assert events == ["first-start", "first-end", "second-start", "second-end"]

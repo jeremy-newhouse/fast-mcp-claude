@@ -239,6 +239,19 @@ def validate_attachment(value: dict | None, *, field: str = "attachment") -> dic
         raise ValidationError(
             f"{field}.name exceeds {MAX_ATTACHMENT_NAME_BYTES} bytes", field=field
         )
+    # Defense in depth: this server has no code-level RBAC distinguishing the trusted
+    # channel sidecar (which only ever sends os.path.basename(path)) from any other
+    # caller holding the shared bearer key, and `name` may end up used as a filename
+    # downstream (the hub-side Graph upload). Reject path separators/traversal/control
+    # bytes here rather than relying on every downstream consumer to do it.
+    if (
+        "/" in name or "\\" in name or ".." in name
+        or any(ord(c) < 0x20 for c in name)
+    ):
+        raise ValidationError(
+            f"{field}.name must not contain path separators, '..', or control characters",
+            field=field,
+        )
 
     mime = value.get("mime")
     if not isinstance(mime, str) or not mime.strip():
@@ -251,6 +264,12 @@ def validate_attachment(value: dict | None, *, field: str = "attachment") -> dic
     content_b64 = value.get("content_b64")
     if not isinstance(content_b64, str) or not content_b64:
         raise ValidationError(f"{field}.content_b64 must be a non-empty string", field=field)
+    # Bound the ENCODED length before decoding — base64 inflates by ~4/3, so this is a
+    # cheap upper bound that rejects a wildly-oversized payload without first paying for
+    # a full decode of attacker-controlled input (matches validate_json_object_size's
+    # encoded-length-first precedent for other structured fields).
+    if len(content_b64) > (MAX_FILE_BYTES * 4 // 3) + 4:
+        raise ValidationError(f"{field} content exceeds {MAX_FILE_BYTES} bytes", field=field)
     try:
         decoded = base64.b64decode(content_b64, validate=True)
     except (binascii.Error, ValueError) as e:

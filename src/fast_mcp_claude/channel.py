@@ -1273,8 +1273,9 @@ def _read_attachment(path: str) -> dict[str, Any]:
 
     Runs in THIS process (the channel sidecar), never in the calling agent's own
     output — piping a multi-hundred-KB base64 blob through the LLM's context would be
-    wasteful and pointless (ECA-117). Raises ValueError with a message safe to show the
-    agent on any problem (missing file, not a regular file, oversized).
+    wasteful and pointless (ECA-117). Raises ValueError (missing file, not a regular
+    file, oversized) or OSError (unreadable/permission-denied, I/O error on the read)
+    — callers must catch both; either message is safe to show the agent.
     """
     if not os.path.isfile(path):
         raise ValueError(f"attachment_path does not exist or is not a file: {path}")
@@ -1431,7 +1432,7 @@ async def _handle_send_teams(
     if attachment_path:
         try:
             attachment = _read_attachment(str(attachment_path))
-        except ValueError as e:
+        except (ValueError, OSError) as e:
             return [types.TextContent(type="text", text=f"send_teams: {e}")]
 
     result = await _mesh_send_teams(cfg, text, target, metadata, attachment)

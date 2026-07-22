@@ -836,6 +836,28 @@ def test_send_teams_attachment_path_oversized_errors(send_teams_rig, tmp_path, m
     assert "exceeds" in out[0].text
 
 
+def test_send_teams_attachment_path_unreadable_file_gives_friendly_error(
+    send_teams_rig, tmp_path
+):
+    # Regression: _read_attachment can raise OSError (e.g. PermissionError), not just
+    # ValueError — _handle_send_teams must catch both, or this falls through to the
+    # generic MCP SDK error wrapper instead of the friendly "send_teams: ..." message
+    # every other attachment failure mode gets.
+    send_teams_rig["set_inflight"](None)
+    p = tmp_path / "secret.txt"
+    p.write_text("shh")
+    p.chmod(0o000)
+    try:
+        out = anyio.run(
+            channel_mod._call_tool, "send_teams",
+            {"text": "x", "attachment_path": str(p)},
+        )
+    finally:
+        p.chmod(0o644)  # restore so tmp_path cleanup can remove it
+    assert send_teams_rig["calls"] == []  # never reaches the mesh
+    assert out[0].text.startswith("send_teams: ")
+
+
 # -------------------------------------------------- session-to-session relay (ADR-0015)
 
 

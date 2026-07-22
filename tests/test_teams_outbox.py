@@ -1,12 +1,13 @@
 """Tests for the teams_outbox store queue (ADR-0013): create -> drain -> complete -> await."""
 
 import asyncio
+import base64
 
 import pytest
 
 from fast_mcp_claude.services.store import OUTBOX_CLAIMED, OUTBOX_DONE, Store
 from fast_mcp_claude.tools.teams_outbox import request_teams_send
-from fast_mcp_claude.utils.validation import MAX_METADATA_BYTES
+from fast_mcp_claude.utils.validation import MAX_FILE_BYTES, MAX_METADATA_BYTES
 
 
 @pytest.mark.asyncio
@@ -145,5 +146,70 @@ async def test_request_teams_send_rejects_oversized_metadata(wired_request_teams
     no prior cap."""
     oversized = {"blob": "x" * (MAX_METADATA_BYTES + 1)}
     result = await wired_request_teams_send(text="hi", metadata=oversized)
+    assert result["success"] is False
+
+
+# ── ECA-117: attachment field ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_attachment_round_trips_through_store(store: Store):
+    attachment = {
+        "name": "report.html",
+        "mime": "text/html",
+        "content_b64": base64.b64encode(b"<html></html>").decode(),
+    }
+    rid = await store.create_teams_send(requester="r", text="hi", attachment=attachment)
+
+    pending = await store.list_pending_teams_sends()
+    assert pending[0]["attachment"] == attachment
+
+    await store.complete_teams_send(rid, ok=True, detail="delivered")
+    record = await store.get_teams_send(rid)
+    assert record["attachment"] == attachment
+
+
+@pytest.mark.asyncio
+async def test_no_attachment_round_trips_as_none(store: Store):
+    rid = await store.create_teams_send(requester="r", text="hi")
+    record = await store.get_teams_send(rid)
+    assert record["attachment"] is None
+
+
+@pytest.mark.asyncio
+async def test_request_teams_send_accepts_valid_attachment(wired_request_teams_send, store: Store):
+    attachment = {
+        "name": "x.txt",
+        "mime": "text/plain",
+        "content_b64": base64.b64encode(b"hello").decode(),
+    }
+    result = await wired_request_teams_send(text="hi", attachment=attachment)
+    assert result["success"] is True
+    record = await store.get_teams_send(result["request_id"])
+    assert record["attachment"] == attachment
+
+
+@pytest.mark.asyncio
+async def test_request_teams_send_rejects_missing_attachment_fields(wired_request_teams_send):
+    result = await wired_request_teams_send(text="hi", attachment={"name": "x.txt"})
+    assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_request_teams_send_rejects_invalid_base64(wired_request_teams_send):
+    result = await wired_request_teams_send(
+        text="hi",
+        attachment={"name": "x.txt", "mime": "text/plain", "content_b64": "not-valid-base64!!"},
+    )
+    assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_request_teams_send_rejects_oversized_attachment(wired_request_teams_send):
+    oversized = base64.b64encode(b"x" * (MAX_FILE_BYTES + 1)).decode()
+    result = await wired_request_teams_send(
+        text="hi",
+        attachment={"name": "x.bin", "mime": "application/octet-stream", "content_b64": oversized},
+    )
     assert result["success"] is False
     assert result["error"]["code"] == "VALIDATION_ERROR"

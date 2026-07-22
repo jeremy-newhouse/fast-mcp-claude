@@ -208,7 +208,9 @@ PY
 # statusLine command (ECA-49) is a SEPARATE CC mechanism (not a "hooks" entry) that Claude Code
 # invokes on every new assistant message with live context-window/cost JSON on stdin -- richer
 # and non-cumulative, unlike the SessionStart/UserPromptSubmit/Stop hook events above, which
-# never carry token/context data. Its stdout also becomes the operator's visible status line.
+# never carry token/context data. Its stdout also becomes the operator's visible status line --
+# --settings is highest precedence, so THIS REPLACES (not merges with) any statusLine already
+# configured in the operator's own ~/.claude/settings.json for the duration of this session.
 HOOK_CMD="CRM_SESSION_STATUS_FILE='$STATUS_FILE' '$BIN_HOOK'"
 STATUSLINE_CMD="CRM_SESSION_STATUS_FILE='$STATUS_FILE' '$BIN_STATUSLINE'"
 python3 - "$SETTINGS" "$HOOK_CMD" "$STATUSLINE_CMD" <<'PY'

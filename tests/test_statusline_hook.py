@@ -78,3 +78,73 @@ def test_null_used_percentage_omitted_from_line(capsys, monkeypatch):
     payload = {"model": {"display_name": "Sonnet"}, "context_window": {"used_percentage": None}}
     line = _run(capsys, monkeypatch, payload, None)
     assert line == "Sonnet"
+
+
+def test_closed_stdin_still_prints_fallback_line(capsys, monkeypatch):
+    # sys.stdin=None (e.g. a closed fd) makes json.load raise AttributeError, not
+    # JSONDecodeError/ValueError -- must still be caught, not escape main() and print nothing.
+    monkeypatch.delenv("CRM_SESSION_STATUS_FILE", raising=False)
+    monkeypatch.setattr("sys.stdin", None)
+    statusline_hook.main([])
+    assert capsys.readouterr().out.strip() == "claude"
+
+
+def test_non_numeric_cost_does_not_block_context_pct_write(tmp_path, capsys, monkeypatch):
+    # A malformed cost field must not prevent context_pct from reaching the status file, and
+    # must not blow up _status_line's `:.2f` format.
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({"repo": "r"}))
+    payload = {
+        "model": {"display_name": "Sonnet"},
+        "context_window": {"used_percentage": 55},
+        "cost": {"total_cost_usd": "not-a-number"},
+    }
+    line = _run(capsys, monkeypatch, payload, str(sf))
+    assert line == "Sonnet · 55% context"  # no cost segment, but not blank/fallback either
+    data = json.loads(sf.read_text())
+    assert data["context_pct"] == 55  # the write still happened
+    assert "cost_usd" not in data
+
+
+def test_non_dict_cost_does_not_raise(capsys, monkeypatch):
+    payload = {"model": {"display_name": "Sonnet"}, "cost": "not-a-dict"}
+    line = _run(capsys, monkeypatch, payload, None)
+    assert line == "Sonnet"
+
+
+def test_concurrent_hooks_do_not_lose_each_others_update(tmp_path):
+    # Models the real race: session_hook.py (Stop -> status/updated_at) and statusline_hook.py
+    # (context_pct/cost_usd) both do a load-mutate-write cycle on the SAME file. Without
+    # locked_status_file wrapping both, a lost update reverts whichever side wrote first.
+    import threading
+    import time as time_mod
+
+    from fast_mcp_claude import session_hook
+
+    sf = tmp_path / "s.json"
+    sf.write_text(json.dumps({"repo": "r", "status": "working"}))
+
+    def session_side():
+        with session_hook.locked_status_file(str(sf)):
+            st = session_hook.load_status_file(str(sf))
+            time_mod.sleep(0.05)  # widen the race window
+            st["status"] = "idle"
+            session_hook.atomic_write_status_file(str(sf), st)
+
+    def statusline_side():
+        time_mod.sleep(0.01)  # start just after session_side acquires the lock
+        with session_hook.locked_status_file(str(sf)):
+            st = session_hook.load_status_file(str(sf))
+            st["context_pct"] = 42
+            session_hook.atomic_write_status_file(str(sf), st)
+
+    t1 = threading.Thread(target=session_side)
+    t2 = threading.Thread(target=statusline_side)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    data = json.loads(sf.read_text())
+    assert data["status"] == "idle"  # session_side's write survived
+    assert data["context_pct"] == 42  # statusline_side's write survived too -- neither lost

@@ -2,10 +2,12 @@
 
 import asyncio
 import base64
+import time
 
+import aiosqlite
 import pytest
 
-from fast_mcp_claude.services.store import OUTBOX_CLAIMED, OUTBOX_DONE, Store
+from fast_mcp_claude.services.store import OUTBOX_CLAIMED, OUTBOX_DONE, OUTBOX_PENDING, Store
 from fast_mcp_claude.tools.teams_outbox import request_teams_send
 from fast_mcp_claude.utils.validation import MAX_FILE_BYTES, MAX_METADATA_BYTES
 
@@ -213,3 +215,64 @@ async def test_request_teams_send_rejects_oversized_attachment(wired_request_tea
     )
     assert result["success"] is False
     assert result["error"]["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_attachment_column_migrates_onto_an_old_schema_db(settings_factory):
+    """Regression coverage for the actual mechanism upgrading an already-deployed
+    peer's DB needs: Store.initialize()'s SCHEMA executescript is CREATE TABLE IF
+    NOT EXISTS, a no-op against a pre-existing teams_outbox table -- the ALTER
+    TABLE ADD COLUMN migration is what actually adds `attachment` for a peer
+    upgrading in place. The `store` fixture always creates a brand-new DB
+    (already has the column), so it never exercises this path -- build an
+    old-schema DB by hand instead."""
+    settings = settings_factory()
+    db_path = settings.db_full_path
+
+    # Old schema: teams_outbox WITHOUT the attachment column, with one pre-existing
+    # pending row -- mirrors what a real peer's on-disk DB looks like pre-upgrade.
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.execute(
+            "CREATE TABLE teams_outbox ("
+            "id TEXT PRIMARY KEY, requester TEXT NOT NULL, target TEXT, text TEXT NOT NULL, "
+            "metadata TEXT, status TEXT NOT NULL, ok INTEGER, detail TEXT, "
+            "created_at REAL NOT NULL, completed_at REAL)"
+        )
+        await db.execute(
+            "INSERT INTO teams_outbox (id, requester, target, text, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("pre-existing-id", "r", None, "old row", OUTBOX_PENDING, time.time()),
+        )
+        await db.commit()
+
+    store = Store(settings)
+    try:
+        await store.initialize()  # the migration under test
+
+        # The pre-existing row survives and round-trips with attachment=None.
+        record = await store.get_teams_send("pre-existing-id")
+        assert record is not None
+        assert record["text"] == "old row"
+        assert record["attachment"] is None
+
+        # A NEW row on the migrated table works fully, attachment included.
+        rid = await store.create_teams_send(
+            requester="r", text="new row",
+            attachment={"name": "x.txt", "mime": "text/plain", "content_b64": "aGk="},
+        )
+        new_record = await store.get_teams_send(rid)
+        assert new_record["attachment"] == {
+            "name": "x.txt", "mime": "text/plain", "content_b64": "aGk=",
+        }
+    finally:
+        await store.close()
+
+    # A second initialize() (e.g. a process restart) against the now-migrated DB
+    # must be a clean no-op, not an "duplicate column" error.
+    store2 = Store(settings)
+    try:
+        await store2.initialize()
+        record = await store2.get_teams_send("pre-existing-id")
+        assert record is not None
+    finally:
+        await store2.close()

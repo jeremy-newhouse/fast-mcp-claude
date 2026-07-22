@@ -5,6 +5,8 @@ write and pub/sub broadcast, so every tool that takes untrusted input must
 funnel through these validators.
 """
 
+import base64
+import binascii
 import json
 import re
 from pathlib import Path
@@ -31,6 +33,8 @@ MAX_METADATA_BYTES = 256_000  # 256 KB
 # write relayed through the permission hook), so it gets the prompt cap.
 MAX_TOOL_INPUT_BYTES = 1_000_000  # 1 MB
 MAX_TOOL_NAME_BYTES = 256
+MAX_ATTACHMENT_NAME_BYTES = 256
+MAX_ATTACHMENT_MIME_BYTES = 128
 
 
 def validate_session_id(value: str | None, *, field: str = "session_id") -> str | None:
@@ -213,6 +217,52 @@ def validate_metadata(value: dict | None, *, field: str = "metadata") -> dict | 
     if value is None:
         return None
     return validate_json_object_size(value, max_bytes=MAX_METADATA_BYTES, field=field)
+
+
+def validate_attachment(value: dict | None, *, field: str = "attachment") -> dict | None:
+    """Validate an optional Teams-send file attachment: {name, mime, content_b64}.
+
+    content_b64 is base64-DECODED here (not just length-checked) so a caller can't
+    smuggle an oversized payload past a naive length check with non-standard padding —
+    the decoded byte count is what's actually capped, against the same MAX_FILE_BYTES
+    the file-bridge already uses (ECA-117).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValidationError(f"{field} must be a JSON object", field=field)
+
+    name = value.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValidationError(f"{field}.name must be a non-empty string", field=field)
+    if len(name.encode("utf-8")) > MAX_ATTACHMENT_NAME_BYTES:
+        raise ValidationError(
+            f"{field}.name exceeds {MAX_ATTACHMENT_NAME_BYTES} bytes", field=field
+        )
+
+    mime = value.get("mime")
+    if not isinstance(mime, str) or not mime.strip():
+        raise ValidationError(f"{field}.mime must be a non-empty string", field=field)
+    if len(mime.encode("utf-8")) > MAX_ATTACHMENT_MIME_BYTES:
+        raise ValidationError(
+            f"{field}.mime exceeds {MAX_ATTACHMENT_MIME_BYTES} bytes", field=field
+        )
+
+    content_b64 = value.get("content_b64")
+    if not isinstance(content_b64, str) or not content_b64:
+        raise ValidationError(f"{field}.content_b64 must be a non-empty string", field=field)
+    try:
+        decoded = base64.b64decode(content_b64, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValidationError(f"{field}.content_b64 is not valid base64", field=field) from e
+    if not decoded:
+        raise ValidationError(
+            f"{field}.content_b64 must not decode to empty content", field=field
+        )
+    if len(decoded) > MAX_FILE_BYTES:
+        raise ValidationError(f"{field} content exceeds {MAX_FILE_BYTES} bytes", field=field)
+
+    return {"name": name.strip(), "mime": mime.strip(), "content_b64": content_b64}
 
 
 def validate_tool_name(value: str, *, field: str = "tool_name") -> str:

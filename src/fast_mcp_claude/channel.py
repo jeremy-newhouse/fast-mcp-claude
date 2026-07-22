@@ -74,7 +74,9 @@ Config (CLI flag, else env, else Settings/.env default):
 
 import argparse
 import asyncio
+import base64
 import json
+import mimetypes
 import os
 import sys
 import time
@@ -1144,8 +1146,13 @@ async def _list_tools() -> list[types.Tool]:
                 "omitted) to post routine progress/results into your OWN eCA Fleet channel "
                 "thread instead of the current task's origin chat — use this for status you'd "
                 "otherwise dump into the asker's chat mid-task; it has no effect if `target` is "
-                "given. The hub posts only for admin-triggered tasks and resolves the chat name; "
-                "this returns whether it was delivered. Format per the Teams conventions in the "
+                "given. `attachment_path` (optional) attaches a real file — give a LOCAL path "
+                "(this machine, readable by this session); do NOT read the file yourself and "
+                "pass its content_b64 — the sidecar reads and encodes it for you, since piping "
+                "file bytes through your own output would waste your context budget. Max 10MB, "
+                "delivered via Microsoft Graph (works in DMs, group chats, and channels). The "
+                "hub posts only for admin-triggered tasks and resolves the chat name; this "
+                "returns whether it was delivered. Format per the Teams conventions in the "
                 "server instructions before sending: pipe-tables with each row on its own line; "
                 "every JIRA key / PR / commit / URL as a Markdown link (no bare refs); no emojis."
             ),
@@ -1162,6 +1169,13 @@ async def _list_tools() -> list[types.Tool]:
                         "description": (
                             "Post to your own eCA Fleet channel thread instead of the current "
                             "task's origin chat. Ignored if `target` is given."
+                        ),
+                    },
+                    "attachment_path": {
+                        "type": "string",
+                        "description": (
+                            "Local path to a file to attach (<=10MB). The sidecar reads and "
+                            "base64-encodes it itself — pass the path, never the file content."
                         ),
                     },
                 },
@@ -1251,8 +1265,42 @@ async def _mesh_reply(cfg: ChannelConfig, message_id: str, response: str) -> boo
         return False
 
 
+_MAX_ATTACHMENT_BYTES = 10_000_000  # 10MB — matches the hub's decoded-content cap (ECA-117)
+
+
+def _read_attachment(path: str) -> dict[str, Any]:
+    """Read a local file and build a {name, mime, content_b64} attachment dict.
+
+    Runs in THIS process (the channel sidecar), never in the calling agent's own
+    output — piping a multi-hundred-KB base64 blob through the LLM's context would be
+    wasteful and pointless (ECA-117). Raises ValueError with a message safe to show the
+    agent on any problem (missing file, not a regular file, oversized).
+    """
+    if not os.path.isfile(path):
+        raise ValueError(f"attachment_path does not exist or is not a file: {path}")
+    size = os.path.getsize(path)
+    if size == 0:
+        raise ValueError(f"attachment_path is empty: {path}")
+    if size > _MAX_ATTACHMENT_BYTES:
+        raise ValueError(
+            f"attachment_path is {size} bytes, exceeds the {_MAX_ATTACHMENT_BYTES}-byte cap: {path}"
+        )
+    with open(path, "rb") as f:
+        content = f.read()
+    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return {
+        "name": os.path.basename(path),
+        "mime": mime,
+        "content_b64": base64.b64encode(content).decode("ascii"),
+    }
+
+
 async def _mesh_send_teams(
-    cfg: ChannelConfig, text: str, target: str | None, metadata: dict[str, Any]
+    cfg: ChannelConfig,
+    text: str,
+    target: str | None,
+    metadata: dict[str, Any],
+    attachment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """request_teams_send -> await_teams_send on the LOCAL server. Returns {ok, detail|error}.
     The hub decides whether to actually post (honors metadata.triggering_admin)."""
@@ -1263,6 +1311,8 @@ async def _mesh_send_teams(
     }
     if target:
         args["target"] = target
+    if attachment:
+        args["attachment"] = attachment
     try:
         async with _make_client(cfg, timeout=cfg.decision_timeout + 30.0) as c:
             res = await c.call_tool("request_teams_send", args)
@@ -1375,7 +1425,16 @@ async def _handle_send_teams(
             metadata["origin_message_id"] = inflight.get("id")
     if not text.strip():
         return [types.TextContent(type="text", text="send_teams: `text` is required")]
-    result = await _mesh_send_teams(cfg, text, target, metadata)
+
+    attachment: dict[str, Any] | None = None
+    attachment_path = arguments.get("attachment_path")
+    if attachment_path:
+        try:
+            attachment = _read_attachment(str(attachment_path))
+        except ValueError as e:
+            return [types.TextContent(type="text", text=f"send_teams: {e}")]
+
+    result = await _mesh_send_teams(cfg, text, target, metadata, attachment)
     if result.get("ok"):
         if target:
             where = target
@@ -1386,7 +1445,8 @@ async def _handle_send_teams(
             where = "your eCA Fleet channel thread"
         else:
             where = "the originating chat"
-        return [types.TextContent(type="text", text=f"posted to Teams ({where})")]
+        suffix = f" with attachment {attachment['name']!r}" if attachment else ""
+        return [types.TextContent(type="text", text=f"posted to Teams ({where}){suffix}")]
     detail = result.get("detail") or result.get("error") or "unknown error"
     return [types.TextContent(type="text", text=f"NOT posted to Teams: {detail}")]
 

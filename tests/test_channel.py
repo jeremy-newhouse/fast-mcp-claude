@@ -10,6 +10,7 @@ The live two-session push path still requires launching a real worker with
 `--dangerously-load-development-channels` and is exercised manually.
 """
 
+import base64
 import json
 from pathlib import Path
 
@@ -644,9 +645,11 @@ def test_relay_send_teams_tool_always_allowed(relay):
 @pytest.fixture
 def send_teams_rig(monkeypatch):
     calls = []  # list of (text, target, metadata)
+    attachments = []  # list of attachment dicts (ECA-117), index-aligned with `calls`
 
-    async def fake_mesh_send_teams(cfg, text, target, metadata):
+    async def fake_mesh_send_teams(cfg, text, target, metadata, attachment=None):
         calls.append((text, target, metadata))
+        attachments.append(attachment)
         # Simulate the hub: it posts for admin-triggered OR operator-direct requests.
         if metadata.get("triggering_admin") or metadata.get("operator_direct"):
             return {"ok": True, "detail": f"delivered to '{target or 'origin'}'"}
@@ -658,7 +661,7 @@ def send_teams_rig(monkeypatch):
         channel_mod._RT = channel_mod._Runtime(cfg=_cfg(enabled=True, identity="x"))
         channel_mod._RT.inflight = inflight
 
-    yield {"calls": calls, "set_inflight": _set_inflight}
+    yield {"calls": calls, "attachments": attachments, "set_inflight": _set_inflight}
     channel_mod._RT = None
 
 
@@ -781,6 +784,56 @@ def test_send_teams_requires_text(send_teams_rig):
     out = anyio.run(channel_mod._call_tool, "send_teams", {"text": "   "})
     assert send_teams_rig["calls"] == []  # never reaches the mesh
     assert "required" in out[0].text
+
+
+# -------------------------------------------------- send_teams attachment_path (ECA-117)
+
+
+def test_send_teams_attachment_path_reads_and_encodes_file(send_teams_rig, tmp_path):
+    # attachment bytes must be read/encoded by THIS process, never by the calling agent —
+    # piping file content through the LLM's own output would waste its context budget.
+    send_teams_rig["set_inflight"](None)  # operator-direct, trusted
+    p = tmp_path / "report.txt"
+    p.write_text("hello report")
+    out = anyio.run(
+        channel_mod._call_tool, "send_teams",
+        {"text": "here's the report", "attachment_path": str(p)},
+    )
+    attachment = send_teams_rig["attachments"][0]
+    assert attachment["name"] == "report.txt"
+    assert attachment["mime"].startswith("text/")
+    assert base64.b64decode(attachment["content_b64"]) == b"hello report"
+    assert "with attachment 'report.txt'" in out[0].text
+
+
+def test_send_teams_no_attachment_path_means_no_attachment(send_teams_rig):
+    send_teams_rig["set_inflight"](None)
+    anyio.run(channel_mod._call_tool, "send_teams", {"text": "no file here"})
+    assert send_teams_rig["attachments"] == [None]
+
+
+def test_send_teams_attachment_path_missing_file_errors(send_teams_rig, tmp_path):
+    send_teams_rig["set_inflight"](None)
+    missing = tmp_path / "nope.txt"
+    out = anyio.run(
+        channel_mod._call_tool, "send_teams",
+        {"text": "x", "attachment_path": str(missing)},
+    )
+    assert send_teams_rig["calls"] == []  # never reaches the mesh
+    assert "does not exist" in out[0].text
+
+
+def test_send_teams_attachment_path_oversized_errors(send_teams_rig, tmp_path, monkeypatch):
+    monkeypatch.setattr(channel_mod, "_MAX_ATTACHMENT_BYTES", 10)
+    send_teams_rig["set_inflight"](None)
+    p = tmp_path / "big.txt"
+    p.write_text("x" * 11)
+    out = anyio.run(
+        channel_mod._call_tool, "send_teams",
+        {"text": "x", "attachment_path": str(p)},
+    )
+    assert send_teams_rig["calls"] == []  # never reaches the mesh
+    assert "exceeds" in out[0].text
 
 
 # -------------------------------------------------- session-to-session relay (ADR-0015)

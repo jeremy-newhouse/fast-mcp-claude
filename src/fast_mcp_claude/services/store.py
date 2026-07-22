@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS teams_outbox (
     target          TEXT,
     text            TEXT NOT NULL,
     metadata        TEXT,
+    attachment      TEXT,
     status          TEXT NOT NULL,
     ok              INTEGER,
     detail          TEXT,
@@ -285,6 +286,14 @@ class Store:
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.executescript(SCHEMA)
+        # ECA-117: teams_outbox predates the `attachment` column — CREATE TABLE IF NOT
+        # EXISTS is a no-op on an already-deployed peer's DB file, so add it explicitly
+        # for upgrades (no-op on a fresh DB, which already has it from SCHEMA above).
+        cur = await self._db.execute("PRAGMA table_info(teams_outbox)")
+        cols = {row[1] for row in await cur.fetchall()}
+        await cur.close()
+        if "attachment" not in cols:
+            await self._db.execute("ALTER TABLE teams_outbox ADD COLUMN attachment TEXT")
         await self._db.commit()
 
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
@@ -588,18 +597,20 @@ class Store:
         text: str,
         target: str | None = None,
         metadata: dict[str, Any] | None = None,
+        attachment: dict[str, Any] | None = None,
     ) -> str:
         request_id = uuid.uuid4().hex
         await self.db.execute(
             "INSERT INTO teams_outbox "
-            "(id, requester, target, text, metadata, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(id, requester, target, text, metadata, attachment, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 request_id,
                 requester,
                 target,
                 text,
                 json.dumps(metadata) if metadata else None,
+                json.dumps(attachment) if attachment else None,
                 OUTBOX_PENDING,
                 time.time(),
             ),
@@ -1198,6 +1209,7 @@ def _row_to_teams_send(row: aiosqlite.Row) -> dict[str, Any]:
         "target": row["target"],
         "text": row["text"],
         "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
+        "attachment": json.loads(row["attachment"]) if row["attachment"] else None,
         "status": row["status"],
         "ok": (None if row["ok"] is None else bool(row["ok"])),
         "detail": row["detail"],

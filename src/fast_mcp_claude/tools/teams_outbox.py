@@ -23,6 +23,7 @@ from ..errors import NotFoundError, ValidationError, format_error_response
 from ..logging_config import get_logger
 from ..server import mcp, settings, store
 from ..utils.validation import (
+    validate_attachment,
     validate_message_id,
     validate_metadata,
     validate_response,
@@ -38,9 +39,12 @@ _MAX_TARGET = 256
 @mcp.tool(
     description=(
         "[Channel] Ask the eCA hub to post a message to Teams. `target` is the destination "
-        "chat name (omit to use the conversation that triggered this session). Returns "
-        "request_id; call await_teams_send(request_id) to get the delivery result. The hub "
-        "decides whether to post (admin-triggered sessions only) and resolves the chat name."
+        "chat name (omit to use the conversation that triggered this session). `attachment` "
+        "(optional) is {name, mime, content_b64} for a real file upload — the hub delivers it "
+        "via Microsoft Graph (works in DMs, group chats, and channels), decoded content capped "
+        "at 10MB. Returns request_id; call await_teams_send(request_id) to get the delivery "
+        "result. The hub decides whether to post (admin-triggered sessions only) and resolves "
+        "the chat name."
     )
 )
 async def request_teams_send(
@@ -57,6 +61,10 @@ async def request_teams_send(
         str | None,
         Field(description="This session's identity (for traceability)"),
     ] = None,
+    attachment: Annotated[
+        dict[str, Any] | None,
+        Field(description="Optional file to attach: {name, mime, content_b64}, <=10MB decoded"),
+    ] = None,
 ) -> dict[str, Any]:
     try:
         text = validate_response(text, field="text")
@@ -67,10 +75,15 @@ async def request_teams_send(
                 raise ValidationError("target must be a string", field="target")
             target = target.strip()[:_MAX_TARGET] or None
         metadata = validate_metadata(metadata)
+        attachment = validate_attachment(attachment)
         requester = validate_session_id(requester_session, field="requester_session") or "default"
 
         request_id = await store.create_teams_send(
-            requester=requester, text=text, target=target, metadata=metadata
+            requester=requester,
+            text=text,
+            target=target,
+            metadata=metadata,
+            attachment=attachment,
         )
         logger.info(
             "Teams send requested",

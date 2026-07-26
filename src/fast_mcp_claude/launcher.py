@@ -67,6 +67,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -77,7 +78,7 @@ import traceback
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import __version__
 from .utils.validation import SESSION_RE
@@ -1596,15 +1597,111 @@ async def _preflight(cfg: LauncherConfig) -> Preflight:
     return Preflight(ok=True, bin_path=bin_path, version=version)
 
 
-async def _selftest_approval_hook(cfg: LauncherConfig, bin_path: str) -> bool:
+# Substrings the claude CLI puts in its JSON `result` when it never got as far as running
+# the model. Seen live: "Not logged in · Please run /login" and "Failed to authenticate:
+# OAuth session expired and could not be refreshed" (ECA-131).
+_CLI_AUTH_FAILURE_RE = re.compile(
+    r"not logged in|failed to authenticate|please run /login|oauth|invalid api key|"
+    r"authentication_error|credit balance",
+    re.IGNORECASE,
+)
+
+_SELFTEST_DETAIL_CAP = 300
+
+
+class SelftestResult(NamedTuple):
+    """Why the approval-hook self-test ended the way it did.
+
+    `armed` is the only pass. The other two are BOTH fail-closed, but they are not the same
+    finding and must not be reported as one:
+
+      * `cli_failed=True`  — the CLI never got as far as calling a tool (not logged in, expired
+        OAuth, missing credit, bad binary). The self-test is INCONCLUSIVE: it proves nothing
+        about the gate. The fix is on this host's claude install, not in the hook.
+      * `cli_failed=False` — the CLI ran and the hook still did not fire. THAT is the genuine
+        "gate cannot be proven" signal the guard exists for.
+
+    Collapsing the two is not cosmetic. It cost ~2 weeks of silent, fleet-wide launcher
+    downtime (ECA-131): every peer's claude.ai OAuth session had expired inside the pm2
+    daemon's environment, but the failure message blamed "--settings handling / the claude CLI
+    version", so the outage read as a possible security regression in the approval gate rather
+    than as three machines needing `/login`.
+    """
+
+    armed: bool
+    cli_failed: bool
+    detail: str
+
+
+def _selftest_failure_message(res: SelftestResult) -> str:
+    """Render the operator-facing refusal. Fail-closed either way — only the DIAGNOSIS differs."""
+    if res.cli_failed:
+        hint = (
+            "Run `claude` then `/login` on this host, then restart the launcher. "
+            "NOTE: the claude.ai session must be reachable from the process environment the "
+            "launcher runs in — a pm2 daemon started over non-interactive SSH (or by the "
+            "boot-time LaunchAgent) cannot read the login Keychain, so restart pm2 from an "
+            "interactive session."
+            if _CLI_AUTH_FAILURE_RE.search(res.detail)
+            else "Check the claude CLI on this host (it exited without running the model)."
+        )
+        return (
+            "LAUNCHER REFUSING TO ARM: the approval-hook self-test could not run — the claude "
+            f"CLI itself failed before any tool was attempted: {res.detail!r}. This does NOT "
+            "mean the approval gate is broken; it means the gate could not be TESTED. " + hint
+        )
+    return (
+        "LAUNCHER REFUSING TO ARM: approval-hook self-test FAILED (the claude CLI ran, but a "
+        '--settings PreToolUse hook did not fire under --setting-sources ""). The approval gate '
+        "cannot be proven, so workers are NOT spawned. Check the claude CLI version / "
+        "--settings handling, or set LAUNCHER_APPROVAL_HOOK_SELFTEST=false to bypass, then "
+        f"restart. Last CLI output: {res.detail!r}"
+    )
+
+
+def _classify_selftest_output(returncode: int, stdout: bytes, stderr: bytes) -> tuple[bool, str]:
+    """(cli_failed, detail) from a finished self-test subprocess.
+
+    `--output-format json` gives us `is_error` plus a human `result` string, which is exactly
+    the evidence needed to tell "never ran" from "ran but the hook is dead" — the old code
+    discarded this output entirely, which is why the distinction was unavailable.
+
+    KNOWN RESIDUAL: a clean run in which the MODEL simply declined to call the tool is
+    indistinguishable here from a genuinely dead hook, so it still reports as a gate failure.
+    Two attempts make that unlikely, and the refusal message now quotes the CLI's own output so
+    an operator can see which it was. Strictly better than before (where every cause, including
+    a logged-out CLI, reported as a dead gate) but not a complete classification — narrowing it
+    further would mean parsing the turn/tool-use structure, which is a bigger contract to depend
+    on than `is_error`.
+    """
+    out = (stdout or b"").decode("utf-8", "replace").strip()
+    err = (stderr or b"").decode("utf-8", "replace").strip()
+    try:
+        parsed = json.loads(out)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        detail = str(parsed.get("result") or parsed.get("error") or "")[:_SELFTEST_DETAIL_CAP]
+        if parsed.get("is_error"):
+            return True, detail or f"exit={returncode}"
+        # A clean CLI run: the hook's absence is a real gate finding, not a CLI problem.
+        return False, detail or f"exit={returncode}"
+    # No parseable envelope at all: the CLI did not complete a run.
+    return True, (err or out or f"exit={returncode}")[:_SELFTEST_DETAIL_CAP]
+
+
+async def _selftest_approval_hook(cfg: LauncherConfig, bin_path: str) -> SelftestResult:
     """Prove a --settings PreToolUse hook FIRES under --setting-sources "" before arming.
 
     Spawns a THROWAWAY `claude -p` whose hook touches a marker file and DENIES the tool;
     if the marker appears, --settings hooks execute and the gate is real. claude silently
     ignores a --settings object that fails validation (green exit, NO hook), so this is the
     only way to catch a disarmed gate. The hook DENIES, so the forced `echo` never runs (no
-    side effects). Two attempts (the model must actually call the tool); returns True iff the
-    hook fired. The caller idles (fail-closed) on False.
+    side effects). Two attempts (the model must actually call the tool).
+
+    Returns a `SelftestResult`, NOT a bool: the caller must be able to tell "the gate is dead"
+    from "the CLI could not run" — see that type's docstring for why. The caller idles
+    (fail-closed) on anything but `armed`.
     """
     deny = json.dumps(
         {
@@ -1615,6 +1712,8 @@ async def _selftest_approval_hook(cfg: LauncherConfig, bin_path: str) -> bool:
             }
         }
     )
+    # Bound before the loop so the return is well-defined even if every attempt raises.
+    last = SelftestResult(armed=False, cli_failed=True, detail="self-test did not complete")
     for attempt in (1, 2):
         try:
             with tempfile.TemporaryDirectory() as td:
@@ -1661,21 +1760,43 @@ async def _selftest_approval_hook(cfg: LauncherConfig, bin_path: str) -> bool:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
+                stdout: bytes = b""
+                stderr: bytes = b""
+                timed_out = False
                 try:
-                    await asyncio.wait_for(proc.communicate(), timeout=90.0)
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90.0)
                 except asyncio.TimeoutError:
+                    timed_out = True
                     _log(f"approval-hook self-test attempt {attempt} timed out; killing")
                     try:
                         proc.kill()
                     except ProcessLookupError:
                         pass
                     await _drain(proc)
+                # The marker is authoritative: if the hook fired, the gate is real regardless
+                # of what the CLI reported afterwards.
                 if marker.exists():
-                    return True
-                _log(f"approval-hook self-test attempt {attempt}: hook did NOT fire")
+                    return SelftestResult(armed=True, cli_failed=False, detail="")
+                if timed_out:
+                    # A hung CLI proves nothing about the gate either.
+                    last = SelftestResult(
+                        armed=False, cli_failed=True, detail="claude CLI timed out after 90s"
+                    )
+                else:
+                    cli_failed, detail = _classify_selftest_output(
+                        proc.returncode or 0, stdout, stderr
+                    )
+                    last = SelftestResult(armed=False, cli_failed=cli_failed, detail=detail)
+                _log(
+                    f"approval-hook self-test attempt {attempt}: hook did NOT fire "
+                    f"({'claude CLI did not run' if last.cli_failed else 'CLI ran'}: "
+                    f"{last.detail!r})"
+                )
         except Exception as e:
+            # Our own harness broke (tempdir, exec, decode). Inconclusive, not a gate verdict.
+            last = SelftestResult(armed=False, cli_failed=True, detail=f"self-test error: {e}")
             _log(f"approval-hook self-test attempt {attempt} errored: {e}")
-    return False
+    return last
 
 
 # ---------------------------------------------------------------- approval relay
@@ -1911,14 +2032,12 @@ async def _serve(cfg: LauncherConfig) -> None:
     # silently ignores a --settings object that fails validation — a green exit with NO
     # gate). Fail-closed: idle if it can't be proven.
     if cfg.approval_hook_enabled and cfg.approval_hook_selftest:
-        if not await _selftest_approval_hook(cfg, pf.bin_path or cfg.claude_bin):
-            await _idle_forever(
-                "LAUNCHER REFUSING TO ARM: approval-hook self-test FAILED (a --settings "
-                'PreToolUse hook did not fire under --setting-sources ""). The approval gate '
-                "cannot be proven, so workers are NOT spawned. Check the claude CLI version / "
-                "--settings handling, or set LAUNCHER_APPROVAL_HOOK_SELFTEST=false to bypass, "
-                "then restart."
-            )
+        selftest = await _selftest_approval_hook(cfg, pf.bin_path or cfg.claude_bin)
+        if not selftest.armed:
+            # Fail-closed either way, but say WHICH failure it is: "the CLI could not run" and
+            # "the gate is dead" need different fixes, and reporting the first as the second
+            # sent a fleet-wide login outage looking for a security regression (ECA-131).
+            await _idle_forever(_selftest_failure_message(selftest))
             return
         _log("approval-hook self-test PASSED: --settings PreToolUse gate is armed")
 

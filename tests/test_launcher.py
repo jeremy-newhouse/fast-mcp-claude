@@ -1546,5 +1546,156 @@ async def test_shutdown_uses_fresh_connection_for_reply_sweep(monkeypatch):
     assert json.loads(reply_args["response"])["error"] == "launcher_shutdown"
 
 
+
+# ---------------------------------------------------------------- approval-hook self-test
+#
+# ECA-131. The self-test used to return a bare bool and THROW AWAY the subprocess output, so
+# "the claude CLI could not log in" and "the --settings hook is dead" produced one identical
+# refusal that named --settings/CLI-version as the thing to check. Every peer's claude.ai
+# session had expired inside the pm2 daemon environment; headless dispatch was dark fleet-wide
+# for ~2 weeks and the message pointed at the wrong subsystem the whole time. These tests pin
+# the distinction, not the wording.
+
+
+class TestSelftestClassification:
+    """_classify_selftest_output: (cli_failed, detail) from a finished subprocess."""
+
+    def test_auth_failure_envelope_is_a_cli_failure_not_a_gate_verdict(self):
+        out = json.dumps(
+            {"is_error": True, "subtype": "success",
+             "result": "Not logged in \u00b7 Please run /login"}
+        ).encode()
+        cli_failed, detail = L._classify_selftest_output(1, out, b"")
+        assert cli_failed is True
+        assert "Not logged in" in detail
+
+    def test_expired_oauth_envelope_is_a_cli_failure(self):
+        # The exact string observed on a pm2-daemon-context run (mini2).
+        out = json.dumps(
+            {"is_error": True,
+             "result": "Failed to authenticate: OAuth session expired and could not be refreshed"}
+        ).encode()
+        cli_failed, detail = L._classify_selftest_output(1, out, b"")
+        assert cli_failed is True
+        assert "OAuth session expired" in detail
+
+    def test_clean_run_is_NOT_a_cli_failure(self):
+        # is_error false => the CLI ran. A missing marker here IS a real gate finding.
+        out = json.dumps({"is_error": False, "subtype": "success", "result": "done"}).encode()
+        cli_failed, detail = L._classify_selftest_output(0, out, b"")
+        assert cli_failed is False
+        assert detail == "done"
+
+    def test_unparseable_output_is_a_cli_failure(self):
+        cli_failed, detail = L._classify_selftest_output(127, b"", b"claude: command not found")
+        assert cli_failed is True
+        assert "command not found" in detail
+
+    def test_detail_is_capped(self):
+        out = json.dumps({"is_error": True, "result": "x" * 5000}).encode()
+        _, detail = L._classify_selftest_output(1, out, b"")
+        assert len(detail) <= L._SELFTEST_DETAIL_CAP
+
+
+class TestSelftestFailureMessage:
+    """The operator-facing refusal must name the RIGHT subsystem."""
+
+    def test_auth_failure_says_login_and_does_not_blame_the_gate(self):
+        msg = L._selftest_failure_message(
+            L.SelftestResult(
+                armed=False, cli_failed=True, detail="Not logged in \u00b7 Please run /login"
+            )
+        )
+        assert "/login" in msg
+        assert "does NOT" in msg and "approval gate is broken" in msg
+        # The old misdirection must be gone from THIS branch.
+        assert "--settings handling" not in msg
+
+    def test_auth_failure_warns_about_the_non_interactive_pm2_trap(self):
+        # The fix is not just "/login" — a pm2 daemon started over SSH or at boot cannot read
+        # the Keychain, which is why this recurred on every peer.
+        msg = L._selftest_failure_message(
+            L.SelftestResult(armed=False, cli_failed=True, detail="Not logged in")
+        )
+        assert "interactive" in msg
+
+    def test_cli_failure_without_auth_wording_still_avoids_blaming_the_gate(self):
+        msg = L._selftest_failure_message(
+            L.SelftestResult(armed=False, cli_failed=True, detail="exit=127")
+        )
+        assert "could not be TESTED" in msg
+        assert "/login" not in msg  # do not misdirect the other way either
+
+    def test_genuine_gate_failure_keeps_the_settings_diagnosis(self):
+        msg = L._selftest_failure_message(
+            L.SelftestResult(armed=False, cli_failed=False, detail="done")
+        )
+        assert "--settings" in msg
+        assert "LAUNCHER_APPROVAL_HOOK_SELFTEST=false" in msg
+        assert "the claude CLI ran" in msg
+
+    def test_both_paths_still_refuse_to_arm(self):
+        for res in (
+            L.SelftestResult(armed=False, cli_failed=True, detail="Not logged in"),
+            L.SelftestResult(armed=False, cli_failed=False, detail="done"),
+        ):
+            assert L._selftest_failure_message(res).startswith("LAUNCHER REFUSING TO ARM")
+
+
+@pytest.mark.asyncio
+class TestSelftestEndToEnd:
+    """Drive the real _selftest_approval_hook against a FAKE claude binary."""
+
+    def _fake_claude(self, tmp_path, body, *, fire_hook=False, rc=0):
+        """A stand-in CLI. When fire_hook, it executes the --settings hook like claude would."""
+        script = tmp_path / "fake-claude"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, subprocess, sys\n"
+            "argv = sys.argv[1:]\n"
+            f"fire = {fire_hook!r}\n"
+            "if fire:\n"
+            "    s = json.loads(argv[argv.index('--settings') + 1])\n"
+            "    cmd = s['hooks']['PreToolUse'][0]['hooks'][0]['command']\n"
+            "    subprocess.run([cmd], capture_output=True)\n"
+            f"print(json.dumps({body!r}))\n"
+            f"sys.exit({rc})\n"
+        )
+        script.chmod(0o755)
+        return str(script)
+
+    async def test_hook_fires_reports_armed(self, tmp_path):
+        binp = self._fake_claude(
+            tmp_path, {"is_error": False, "result": "ok"}, fire_hook=True
+        )
+        res = await L._selftest_approval_hook(_cfg(), binp)
+        assert res.armed is True
+        assert res.cli_failed is False
+
+    async def test_not_logged_in_reports_cli_failure_not_gate_failure(self, tmp_path):
+        binp = self._fake_claude(
+            tmp_path,
+            {"is_error": True, "result": "Not logged in \u00b7 Please run /login"},
+            rc=1,
+        )
+        res = await L._selftest_approval_hook(_cfg(), binp)
+        assert res.armed is False
+        assert res.cli_failed is True, "an unauthenticated CLI must NOT read as a dead gate"
+        assert "Not logged in" in res.detail
+        assert "/login" in L._selftest_failure_message(res)
+
+    async def test_clean_run_without_the_hook_reports_a_real_gate_failure(self, tmp_path):
+        # The CLI ran fine and simply never invoked the hook -> the guard's true purpose.
+        binp = self._fake_claude(tmp_path, {"is_error": False, "result": "ran"})
+        res = await L._selftest_approval_hook(_cfg(), binp)
+        assert res.armed is False
+        assert res.cli_failed is False
+        assert "--settings" in L._selftest_failure_message(res)
+
+    async def test_missing_binary_is_inconclusive_not_a_gate_verdict(self, tmp_path):
+        res = await L._selftest_approval_hook(_cfg(), str(tmp_path / "does-not-exist"))
+        assert res.armed is False
+        assert res.cli_failed is True
+
 # Reference os/sys so static checkers don't flag the imports used only in fakes.
 _ = (os, sys)

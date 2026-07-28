@@ -35,28 +35,13 @@ from .config import Config, Limits
 from .envbuild import build_worker_env, snapshot_boot_env
 from .events import EventLog
 from .gate import QuestionBridge, WorkerPolicy, make_gate, make_question_hook
+from .names import DAEMON_KEY, require_safe_worker_name
 from .registry import Registry, WORKER_GONE
 
-# A worker name is used verbatim as a filename (logs, capsules, and — since ECA-135 —
-# the lane's credential file). Leading char excludes '.', so no dotfiles and no '..'.
-# fullmatch, NOT `$`: `$` also matches before a trailing newline, so "Ultra1\n" would
-# pass and produce a filename with an embedded newline.
-_WORKER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-
-
-def _require_safe_worker_name(name: str) -> None:
-    """Reject any name that is not a plain filename component.
-
-    Lives at module level and is called from BOTH `spawn` and every path derivation:
-    validating only at spawn leaves the guard at the wrong layer, because `remove`,
-    the turn-end purge and boot recovery all consume a PERSISTED name as a path, and a
-    row written before this validator existed is not covered by it.
-    """
-    if not _WORKER_NAME_RE.fullmatch(name) or ".." in name:
-        raise ValueError(
-            f"invalid worker name {name!r}: must match {_WORKER_NAME_RE.pattern} "
-            "and contain no '..' (the name is used as a filename)"
-        )
+# ECA-137: the validator and its pattern moved to `names.py` so that `events.py` and
+# `capsule.py` — which this module imports, and which derive filenames from a name too
+# — can hold the SAME guard without an import cycle. Behaviour and message are
+# unchanged; only the home moved.
 
 # Nominal context window for pressure estimation (tokens). Context size is read
 # from the LAST AssistantMessage's per-request usage; ResultMessage.usage is the
@@ -283,7 +268,7 @@ class Engine:
             for path in d.glob("*.json"):
                 path.unlink(missing_ok=True)
         except Exception as e:  # noqa: BLE001 — boot must survive a cleanup failure
-            self._events.emit("-", "mcp_config_sweep_failed", error=f"{type(e).__name__}: {e}")
+            self._events.emit(DAEMON_KEY, "mcp_config_sweep_failed", error=f"{type(e).__name__}: {e}")
 
     async def stop(self) -> None:
         for task in [*self._runners.values(), *self._watchdogs]:
@@ -846,7 +831,7 @@ class Engine:
         start with another lane's bearers. That is precisely the cross-lane leak this
         task is about, so it must not be reintroduced by the fix for it.
         """
-        _require_safe_worker_name(name)
+        require_safe_worker_name(name)
         # NB: this read-then-insert is a TOCTOU — two concurrent spawns of `Ultra1` and
         # `ultra1` could both pass. The control surface handles connections in separate
         # tasks, so it is possible, just unlikely (spawns arrive serially in practice).
@@ -867,7 +852,7 @@ class Engine:
         by one guard rather than relying on spawn-time validation that a row persisted
         before it existed never passed through.
         """
-        _require_safe_worker_name(worker)  # no glob metacharacters survive this charset
+        require_safe_worker_name(worker)  # no glob metacharacters survive this charset
         # '-' is the field separator AND a legal name character, so a bare
         # `<worker>-*.json` glob matches a DIFFERENT lane whose name extends this one:
         # purging `ultra` would delete `ultra-2`'s live, in-flight config, and with
@@ -899,8 +884,11 @@ class Engine:
         EPERM (and an invalid persisted name) still escape unless caught here.
         """
         def _tell(key: str, event: str, **fields: Any) -> None:
-            # emit() is itself an unguarded file open, so an emit from inside a handler
-            # can escape and re-create the very wedge this method exists to prevent.
+            # emit() is a file open, so an emit from inside a handler can escape and
+            # re-create the very wedge this method exists to prevent. Still required
+            # after ECA-137: that guard covers a bad KEY (which emit now re-keys rather
+            # than raising on), and nothing else — ENOSPC, EACCES and a symlinked logs/
+            # all still reach here.
             try:
                 self._events.emit(key, event, **fields)
             except Exception:  # noqa: BLE001 — reporting a cleanup failure cannot fail loudly
@@ -912,7 +900,10 @@ class Engine:
             # Reported under the DAEMON key, never the worker's: EventLog derives its
             # filename from that key, so emitting under a traversing name would trade a
             # traversal-unlink for a traversal-write. Caught by this method's own test.
-            _tell("-", "mcp_config_purge_refused", lane=worker, error=f"{type(e).__name__}: {e}")
+            # Since ECA-137 EventLog refuses such a key itself and re-keys the record
+            # here anyway, so this is now belt-and-braces — kept because passing the key
+            # explicitly yields a clean record instead of one stamped `log_key_refused`.
+            _tell(DAEMON_KEY, "mcp_config_purge_refused", lane=worker, error=f"{type(e).__name__}: {e}")
             return
         try:
             for path in paths:
@@ -976,7 +967,7 @@ class Engine:
         # persisted before spawn-time validation existed would plant a credential file
         # OUTSIDE the supervisor home, where neither the purge nor the boot sweep can
         # ever reach it. Round 2 fixed the traversal unlink; this is the traversal write.
-        _require_safe_worker_name(worker)
+        require_safe_worker_name(worker)
         self._purge_mcp_config(worker)  # a retry/restart leftover must not accumulate
         d = self._cfg.mcp_config_dir
         if d.is_symlink():

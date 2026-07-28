@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .names import require_safe_worker_name
+
 LAST_N_EVENTS = 50
 
 
@@ -29,6 +31,14 @@ def write_capsule(
     """Write one capsule file; returns its path. Never raises past logging needs —
     callers treat capsule failure as non-fatal (the registry row still records why).
 
+    ECA-137: the filename is derived from `worker`, so the name is validated FIRST,
+    before any directory is created or any file opened. Raising is the right refusal
+    here (unlike `EventLog.emit`, which must stay silent): the only caller,
+    `Engine._finish_failure_capsule`, already catches everything from this function and
+    reports it as a `failure_capsule_error` event — whose key `EventLog` sanitises in
+    turn, so the refusal cannot escape either (the ECA-135 trap: a traversal-unlink
+    traded for a traversal-write).
+
     ECA-136: a capsule carries the turn's prompt and its raw subprocess stderr, so
     it is written 0600 in a 0700 directory rather than at the umask's 0644/0755.
     O_EXCL is deliberate, for the reason ECA-135 chose it: this filename is
@@ -39,6 +49,7 @@ def write_capsule(
     caller already handles: Engine._finish_failure_capsule catches and emits
     `failure_capsule_error`.
     """
+    require_safe_worker_name(worker)  # before mkdir: refuse without side effects
     capsules_dir.mkdir(parents=True, exist_ok=True)
     # Explicit: umask-masked, and not applied at all if the directory exists. Not
     # through a symlink though — Path.chmod follows one, and hardening.harden_home

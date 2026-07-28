@@ -19,10 +19,14 @@ from fastmcp import Client
 
 from .config import Config
 from .events import EventLog
+from .names import SUPERVISOR_STREAM
 from .registry import Registry
 
 _AUTH_HINTS = ("401", "unauthorized", "403", "forbidden", "invalid api key", "authentication")
-_SUPERVISOR_STREAM = "_supervisor"  # pseudo-worker for loop-level events
+# Pseudo-worker for loop-level events. Imported rather than re-declared (ECA-137): the key
+# is a FILENAME, so `EventLog` validates it, and it only passes because `names.py` reserves
+# it — a second literal here could drift out of that set and start being refused silently.
+_SUPERVISOR_STREAM = SUPERVISOR_STREAM
 
 
 def _is_auth_error(e: Exception) -> bool:

@@ -15,6 +15,7 @@ from .engine import Engine
 from .envbuild import scrub_daemon_env
 from .events import EventLog
 from .gate import QuestionBridge
+from .hardening import harden_home
 from .presence import Presence
 from .registry import Registry
 from .server import ControlServer
@@ -38,10 +39,18 @@ async def _idle_sweep(engine: Engine) -> None:
 
 async def _serve() -> None:
     cfg = load_config()
-    cfg.home.mkdir(parents=True, exist_ok=True)
+    # ECA-136: BEFORE the registry connects and before the event log opens — home
+    # must be 0700 before state.db is created inside it, and a stale 0644
+    # state.db-shm has to be tightened before SQLite reopens and reuses it.
+    hardened = harden_home(cfg)
+    _log(f"home hardened: {hardened}")
 
     registry = Registry(cfg.db_path)
     await registry.connect()
+    if registry.reclaim_error:
+        # ECA-136: non-fatal, but never silent — old credentials are still in the
+        # file's freed pages and the next boot will retry.
+        _log(f"WARNING: freed-page reclaim FAILED ({registry.reclaim_error})")
     stats = await registry.boot_reconcile()
     _log(f"boot reconcile: {stats}")
 

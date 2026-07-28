@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -22,13 +23,35 @@ class EventLog:
     def __init__(self, logs_dir: Path) -> None:
         self._dir = logs_dir
         self._dir.mkdir(parents=True, exist_ok=True)
+        # ECA-136: explicit — mkdir's mode is umask-masked, and is not applied at
+        # all when the directory already exists (which it does on a live install).
+        self._dir.chmod(0o700)
 
     def path(self, worker: str) -> Path:
         return self._dir / f"{worker}.jsonl"
 
     def emit(self, worker: str, event: str, **fields: Any) -> dict[str, Any]:
         record = {"ts": _now(), "worker": worker, "event": event, **fields}
-        with self.path(worker).open("a", encoding="utf-8") as f:
+        # ECA-136: a worker's event log carries the turn's raw subprocess stderr
+        # (turn_mcp_diagnostics.stderr_tail), so it is not public-by-default data.
+        # open("a") takes no mode, so this uses the ECA-135 idiom instead. The
+        # fchmod is required rather than belt-and-braces: O_CREAT's mode is ignored
+        # entirely for a file that already exists, and every log file on both live
+        # hosts already exists at 0644. No O_EXCL — this is an append log.
+        fd = os.open(
+            self.path(worker),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+        except BaseException:
+            os.close(fd)  # nothing owns it yet; don't leak the descriptor
+            raise
+        # fdopen takes ownership here and closes the fd itself if construction
+        # fails, so it must NOT sit inside the handler above or a failure would
+        # double-close a number another thread may already have been handed.
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         return record
 

@@ -128,6 +128,65 @@ class WorkerPolicy:
         return False
 
 
+def redact_policy(policy: Any) -> dict[str, Any]:
+    """Return a copy of a policy mapping safe to hand back over the control surface.
+
+    `mcp_servers` is the one credential-bearing part of a WorkerPolicy: each
+    server carries whatever it needs to authenticate INLINE (an http server's
+    `headers`, a stdio server's `env` — and nothing stops a token riding in
+    `args` or a `url` query string). Rather than redact by key name and miss a
+    shape, the whole block collapses to a sorted list of the granted server
+    NAMES — which is already what every other surface in this daemon exposes
+    (the engine's options snapshot, its MCP diagnostics, and failure capsules
+    all use `sorted(policy.mcp_servers.keys())`).
+
+    Nothing needs the values back: the caller supplied them moments earlier, and
+    echoing them turns every `workers spawn` into a credential disclosure in the
+    caller's transcript — which is persisted, shipped to a model provider, and
+    read by later sessions (ECA-133). Idempotent: re-redacting an already
+    redacted policy is a no-op.
+    """
+    out = dict(policy or {})
+    servers = out.get("mcp_servers")
+    if isinstance(servers, dict):
+        out["mcp_servers"] = sorted(servers.keys())
+    elif isinstance(servers, list):  # already redacted
+        out["mcp_servers"] = sorted(servers)
+    elif servers is not None:
+        # Unrecognized shape — never pass an unknown value through; it could be
+        # anything, including a credential.
+        out["mcp_servers"] = []
+    return out
+
+
+def redact_worker_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a `workers` registry row whose policy carries no secrets.
+
+    The row's `policy` column is a JSON string (SQLite); the redacted copy keeps
+    that shape so response consumers see no structural change — only the
+    `mcp_servers` block differs. Every control-surface response that includes a
+    worker row MUST go through this (see `server.ControlServer._dispatch`).
+    """
+    out = dict(row)
+    raw = out.get("policy")
+    if raw is None:
+        return out
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            # Unparseable policy: we cannot prove it holds no secret, so it does
+            # not leave the daemon.
+            out["policy"] = None
+            return out
+        out["policy"] = json.dumps(redact_policy(parsed))
+    elif isinstance(raw, dict):
+        out["policy"] = redact_policy(raw)
+    else:
+        out["policy"] = None
+    return out
+
+
 class QuestionBridge:
     """Parks AskUserQuestion escalations; answers arrive over the control surface.
 

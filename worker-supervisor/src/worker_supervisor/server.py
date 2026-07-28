@@ -7,6 +7,13 @@ its own session permission gate applies there.
 Request:  {"verb": "...", "args": {...}}\n
 Response: {"ok": true, "data": ...}\n  |  {"ok": false, "error": "..."}\n
 `attach` streams one JSON event per line until the client disconnects.
+
+Responses are the disclosure boundary: a worker's stored policy carries each
+granted MCP server's inline credentials, so any response that includes a worker
+registry row passes through `gate.redact_worker_row` first (ECA-133). Verbs that
+project explicit fields (`status`) or read tables without a policy column
+(`history`, `get`, `questions`) need no redaction — but adding a verb that hands
+back a row does.
 """
 
 from __future__ import annotations
@@ -20,7 +27,7 @@ from . import __version__
 from .config import Config
 from .engine import Engine
 from .events import EventLog
-from .gate import WorkerPolicy
+from .gate import WorkerPolicy, redact_worker_row
 from .registry import Registry
 
 
@@ -123,7 +130,10 @@ class ControlServer:
                 mcp_servers=args.get("mcp_servers", {}),
             )
             worker = await self._engine.spawn(args["name"], args["repo"], policy)
-            return {"worker": worker}
+            # The stored policy holds each MCP server's inline credentials; the
+            # response must not (ECA-133). Any future verb returning a worker row
+            # goes through redact_worker_row too.
+            return {"worker": redact_worker_row(worker)}
         if verb == "prompt":
             turn_id = await self._engine.prompt(args["name"], args["text"])
             return {"turn_id": turn_id}

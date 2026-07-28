@@ -1,4 +1,5 @@
-"""First-ever ControlServer tests: socket-refusal + argv-rejection (ECA-72 AC#5/AC#6).
+"""ControlServer tests: socket-refusal + argv-rejection (ECA-72 AC#5/AC#6), and
+the response-boundary credential redaction (ECA-133).
 
 Socket paths use /tmp (not pytest tmp_path) because macOS AF_UNIX sun_path is
 capped at 104 bytes and pytest's tmp_path can exceed that limit.
@@ -7,6 +8,7 @@ capped at 104 bytes and pytest's tmp_path can exceed that limit.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import socket as _socket
 import sys
@@ -16,6 +18,8 @@ from pathlib import Path
 import pytest
 
 from worker_supervisor.config import Config, Limits
+from worker_supervisor.engine import Engine
+from worker_supervisor.gate import QuestionBridge, redact_policy, redact_worker_row
 from worker_supervisor.server import ControlServer
 from worker_supervisor.__main__ import main
 
@@ -103,3 +107,169 @@ def test_argv_rejection(monkeypatch):
     with pytest.raises(SystemExit) as exc_info:
         main()
     assert exc_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# ECA-133: no control-surface response may carry MCP credentials
+# ---------------------------------------------------------------------------
+
+# Distinctive, obviously-fake markers. Credentials ride in at least two shapes —
+# an http server's `headers` and a stdio server's `env` — which is why the fix
+# collapses the whole block to server names rather than redacting by key name.
+HEADER_SENTINEL = "ECA133-HEADER-SENTINEL-NOT-A-REAL-SECRET"
+ENV_SENTINEL = "ECA133-ENV-SENTINEL-NOT-A-REAL-SECRET"
+ARG_SENTINEL = "ECA133-ARG-SENTINEL-NOT-A-REAL-SECRET"
+URL_SENTINEL = "ECA133-URL-SENTINEL-NOT-A-REAL-SECRET"
+SENTINELS = (HEADER_SENTINEL, ENV_SENTINEL, ARG_SENTINEL, URL_SENTINEL)
+
+MCP_SERVERS_WITH_SECRETS = {
+    "jira": {
+        "type": "http",
+        "url": f"https://example.invalid/mcp?token={URL_SENTINEL}",
+        "headers": {"Authorization": f"Bearer {HEADER_SENTINEL}"},
+    },
+    "langfuse": {
+        "command": "/bin/true",
+        "args": ["--api-key", ARG_SENTINEL],
+        "env": {"LANGFUSE_SECRET": ENV_SENTINEL},
+    },
+}
+
+
+@pytest.fixture
+async def control(cfg, registry, events, monkeypatch):
+    """A real ControlServer over a real Engine + Registry.
+
+    The per-worker runner loop is parked so no turn can ever be claimed: these
+    tests are about what the control surface SERIALIZES, and a live runner would
+    otherwise pick up the turn minted below and launch a real Claude subprocess.
+    """
+
+    async def _parked(self, name: str) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(Engine, "_worker_loop", _parked)
+    engine = Engine(cfg, registry, events, QuestionBridge(registry, events))
+    yield ControlServer(cfg, engine, registry, events)
+    await engine.stop()
+
+
+def _wire(data) -> str:
+    """Exactly what `_reply` puts on the socket, so assertions cover the bytes a
+    caller actually sees — not a friendlier in-memory view of them."""
+    return json.dumps({"ok": True, "data": data}, default=str)
+
+
+async def _spawn_probe(control, repo, name: str = "probe"):
+    return await control._dispatch(
+        "spawn",
+        {
+            "name": name,
+            "repo": str(repo),
+            "allowed_tools": ["Read"],
+            "mcp_servers": MCP_SERVERS_WITH_SECRETS,
+        },
+    )
+
+
+async def test_spawn_response_carries_no_credential_material(control, repo):
+    """AC#1: a spawn response must not echo any credential the caller passed in.
+
+    The pre-fix daemon returned the stored policy verbatim, so a single spawn put
+    every granted server's bearer/env value into the caller's transcript.
+    """
+    data = await _spawn_probe(control, repo)
+    wire = _wire(data)
+    for sentinel in SENTINELS:
+        assert sentinel not in wire, f"{sentinel} leaked into the spawn response"
+
+    policy = json.loads(data["worker"]["policy"])
+    # The caller still learns WHICH servers were granted — just not their secrets.
+    assert policy["mcp_servers"] == ["jira", "langfuse"]
+    # Everything else about the applied policy survives; only the block changed.
+    assert policy["allowed_tools"] == ["Read"]
+
+
+async def test_spawn_still_stores_the_real_credentials(control, registry, repo):
+    """Negative control: redaction is a RESPONSE concern only.
+
+    The engine launches each MCP server from the stored policy, so blanking the
+    stored row would break every credentialed lane — a 'fix' that passes the leak
+    test by breaking the feature.
+    """
+    await _spawn_probe(control, repo)
+    row = await registry.get_worker("probe")
+    stored = json.loads(row["policy"])
+    assert stored["mcp_servers"]["jira"]["headers"]["Authorization"] == (
+        f"Bearer {HEADER_SENTINEL}"
+    )
+    assert stored["mcp_servers"]["langfuse"]["env"]["LANGFUSE_SECRET"] == ENV_SENTINEL
+
+
+@pytest.mark.parametrize(
+    "verb",
+    ["status", "events", "history", "questions", "get"],
+)
+async def test_no_other_control_verb_leaks_credentials(control, registry, repo, verb):
+    """AC#2: the same credentials must not resurface through any other verb.
+
+    Every verb reachable without launching a turn subprocess is swept here. A
+    turn is minted for `get`/`history` via the registry directly — no worker
+    process runs.
+    """
+    await _spawn_probe(control, repo)
+    turn_id = await registry.enqueue_turn("probe", "hello")
+
+    args = {
+        "status": {},
+        "events": {"name": "probe"},
+        "history": {"name": "probe"},
+        "questions": {"name": "probe"},
+        "get": {"turn_id": turn_id},
+    }[verb]
+    wire = _wire(await control._dispatch(verb, args))
+    for sentinel in SENTINELS:
+        assert sentinel not in wire, f"{sentinel} leaked through the {verb!r} verb"
+
+
+def test_redact_policy_collapses_every_server_shape():
+    """AC#3: the helper keeps the granted server NAMES and nothing else."""
+    out = redact_policy(
+        {"allowed_tools": ["Read"], "mcp_servers": MCP_SERVERS_WITH_SECRETS}
+    )
+    assert out["mcp_servers"] == ["jira", "langfuse"]
+    assert out["allowed_tools"] == ["Read"]
+    for sentinel in SENTINELS:
+        assert sentinel not in json.dumps(out)
+
+
+def test_redact_policy_is_idempotent_and_shape_safe():
+    """Re-redacting is a no-op; an unrecognized mcp_servers value never passes
+    through (it could be anything, including a credential)."""
+    once = redact_policy({"mcp_servers": MCP_SERVERS_WITH_SECRETS})
+    assert redact_policy(once) == once
+    assert redact_policy({"mcp_servers": HEADER_SENTINEL})["mcp_servers"] == []
+    assert redact_policy({"mcp_servers": None})["mcp_servers"] is None
+    assert "mcp_servers" not in redact_policy({"model": "opus"})
+    # The input is never mutated in place.
+    src = {"mcp_servers": dict(MCP_SERVERS_WITH_SECRETS)}
+    redact_policy(src)
+    assert src["mcp_servers"]["jira"]["headers"]["Authorization"].endswith(
+        HEADER_SENTINEL
+    )
+
+
+def test_redact_worker_row_handles_both_policy_shapes_and_garbage():
+    """The row's policy is a JSON string from SQLite, but the engine also passes
+    dicts around; an unparseable policy is withheld rather than guessed at."""
+    as_string = redact_worker_row(
+        {"name": "w", "policy": json.dumps({"mcp_servers": MCP_SERVERS_WITH_SECRETS})}
+    )
+    assert json.loads(as_string["policy"])["mcp_servers"] == ["jira", "langfuse"]
+
+    as_dict = redact_worker_row({"name": "w", "policy": {"mcp_servers": MCP_SERVERS_WITH_SECRETS}})
+    assert as_dict["policy"]["mcp_servers"] == ["jira", "langfuse"]
+
+    assert redact_worker_row({"name": "w", "policy": "{not json"})["policy"] is None
+    assert redact_worker_row({"name": "w", "policy": None})["policy"] is None
+    assert redact_worker_row({"name": "w"}) == {"name": "w"}

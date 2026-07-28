@@ -140,6 +140,16 @@ class EventLog:
 
         Propagates a refused key like `read` (ECA-137): `attach` is an interactive
         operator verb, where tailing nothing forever is worse than an error.
+
+        ECA-139 — that rationale was false as first shipped, which is worth recording
+        here rather than quietly fixing. This is an async generator, so the raise lands at
+        the first `__anext__`, inside `ControlServer._attach`'s `async for`; that handler
+        caught only three connection exceptions, and the attach verb is dispatched outside
+        the wrapper that JSON-ifies every other verb's error. So the ValueError escaped
+        into asyncio, the operator got a silent EOF and exit 0, and the daemon logged a
+        traceback — no error at all, which is the opposite of the sentence above. `_attach`
+        now replies `{"ok": false, "error": ...}`. Any NEW streaming consumer of this
+        generator must handle the refusal itself for the same reason.
         """
         p = self.path(worker)
         pos = p.stat().st_size if p.exists() else 0

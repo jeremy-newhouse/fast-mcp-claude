@@ -40,8 +40,10 @@ from .registry import Registry, WORKER_GONE
 
 # ECA-137: the validator and its pattern moved to `names.py` so that `events.py` and
 # `capsule.py` — which this module imports, and which derive filenames from a name too
-# — can hold the SAME guard without an import cycle. Behaviour and message are
-# unchanged; only the home moved.
+# — can hold the SAME guard without an import cycle. The refusal MESSAGE is byte-identical
+# to ECA-135's; the behaviour is not quite ("only the home moved" was a review finding) —
+# a non-str name now raises ValueError where it used to raise TypeError out of
+# `re.fullmatch`, which is deliberate. See `names.is_safe_worker_name`.
 
 # Nominal context window for pressure estimation (tokens). Context size is read
 # from the LAST AssistantMessage's per-request usage; ResultMessage.usage is the

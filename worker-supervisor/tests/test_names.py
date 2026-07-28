@@ -12,20 +12,31 @@ actually happened, because neither alone is sufficient and which one carries the
 depends on the input. Be precise about that rather than implying the tree check proves
 every case:
 
-* `../../escaped`, `..`, `../x`, `a/../../b` — the tree assertion is the proof. It fails
-  with the guards removed, because the escape lands inside `tmp_path`, where `_tree` sees
-  it.
+* `../../escaped` — the ONLY shape the tree assertion actually proves. Target
+  `<tmp>/escaped.jsonl`, outside the home and inside `tmp_path`, so `_tree` sees it.
+* `..`, `../x`, `a/../../b` — these do NOT leave the home once resolved:
+  `logs/...jsonl`, `home/x.jsonl`, `home/b.jsonl` respectively. `_tree` filters the home
+  out, so the tree assertion is INERT for them and the refusal assertion does all the
+  work. An earlier version of this docstring credited the tree assertion for all four,
+  which is the exact overclaim this file exists to avoid — corrected after a reviewer
+  computed the resolved targets.
 * `with space`, `.hidden`, `a..b`, `x`*65 — nothing escapes at all; these would create an
-  odd file INSIDE the home. Only the refusal assertion catches them.
+  odd file INSIDE the home. Refusal assertion only.
 * `/absolute` — `_tree` is BLIND here. `dir / "/absolute"` discards `dir` entirely in
   pathlib, so the target is `/absolute…` at the filesystem root, outside the observed
-  tree. The `raises` assertion is the whole proof for this shape, which is also why the
-  charset check matters more than any amount of `..` filtering.
+  tree. The `raises` assertion is the whole proof, which is also why the charset check
+  matters more than any amount of `..` filtering.
 
 A raises-only test would conversely pass a guard that raised the right error after
-already creating the file, which is why both assertions stay. Every case in this file
-fails with the guards removed, and the run FINISHES rather than hanging — `follow` had to
-be given an explicit timeout to make that true.
+already creating the file, which is why both assertions stay.
+
+Falsification, measured rather than claimed: with `is_safe_worker_name` stubbed to
+`return True`, **74 fail and 14 pass** — the 14 are the positive cases (legal names,
+reserved keys, the literal constants) which SHOULD pass without a guard. "Every case here
+fails" was the previous wording and was wrong. Re-measure this pair if you add tests; a
+reviewer's count of 73/14 was already stale by two assertions when it reached me, which is
+the whole argument for measuring instead of quoting. The run also FINISHES rather than
+hanging; `follow` needed an explicit timeout to make that true.
 """
 
 from __future__ import annotations
@@ -175,13 +186,19 @@ def test_every_daemon_owned_stream_key_in_the_source_is_reserved():
 
 
 def test_the_reserved_key_literals_match_what_is_on_disk_in_production():
-    """These two strings ARE filenames on two production hosts.
+    """These strings become filenames on two production hosts, so they are pinned.
 
-    `logs/-.jsonl` and `logs/_supervisor.jsonl` exist on mini2 and mbpm2 today (48 live
-    identifiers were checked against this module's predicates for ECA-137 AC#3). Renaming
-    either constant silently orphans an existing stream and starts a new one beside it,
-    which no other test here would notice — every one of them derives its expectation from
-    the constant it is testing. Mutation-testing found exactly that hole.
+    Precise about which, because the first version of this docstring was not and two
+    reviewers independently caught it: **`logs/_supervisor.jsonl` exists on mini2 and
+    mbpm2** and is appended on every announce beat, so renaming `SUPERVISOR_STREAM`
+    orphans a live 3MB stream and silently starts a new one beside it. **`logs/-.jsonl`
+    exists on NEITHER host** — `mcp_config_purge_refused` and `mcp_config_sweep_failed`
+    have never fired in production — so for `DAEMON_KEY` the argument is not "don't orphan
+    a file" but "this is the re-key target `emit` falls back to, and the value is
+    referenced from `engine.py` and asserted in ECA-135's tests".
+
+    Either way nothing else here would notice a rename: every other test derives its
+    expectation from the constant it is testing. Mutation-testing found that hole.
     """
     assert DAEMON_KEY == "-"
     assert SUPERVISOR_STREAM == "_supervisor"
@@ -278,10 +295,17 @@ def test_the_daemon_key_still_round_trips_through_emit_and_read(cfg):
 
 
 @pytest.mark.parametrize("name", ["../../escaped", "/absolute", ".."])
-def test_read_and_follow_refuse_a_hostile_key(cfg, name):
-    """`server.py` hands both of these a CALLER-SUPPLIED name over the control socket,
-    so without the guard in `path()` they were a traversal READ. Unlike `emit` they
-    propagate: both callers handle it, and a silent `[]` would read as 'no events'."""
+def test_read_and_path_refuse_a_hostile_key(cfg, name):
+    """`server.py` hands both of these a CALLER-SUPPLIED name over the control socket, so
+    without the guard in `path()` they were a traversal READ. Unlike `emit` they
+    propagate, because a silent `[]` would read as 'no events'.
+
+    Renamed: this used to say "read_and_follow" while only exercising `read` and `path` —
+    `follow` is covered by the next test. And the claim that "both callers handle it" was
+    only half true when written: `read`'s two callers did (server.py inside `_dispatch`,
+    `_finish_failure_capsule` inside its try), but `follow`'s single caller did NOT, which
+    shipped as ECA-139 — a silent EOF plus a daemon traceback. Fixed there.
+    """
     log = EventLog(cfg.logs_dir)
     with pytest.raises(ValueError, match="invalid event log key"):
         log.read(name)
@@ -306,11 +330,21 @@ async def test_follow_refuses_a_hostile_key_before_yielding(cfg):
 
 
 def test_read_cannot_be_pointed_at_a_file_outside_the_home(cfg, tmp_path):
-    """The traversal READ, demonstrated rather than argued: a real JSONL file planted
-    outside the home is reachable by name arithmetic alone."""
+    """The traversal READ, demonstrated rather than argued.
+
+    Both halves are asserted, because a reviewer noted the first version planted the file
+    and then only checked for a raise — which would pass even if the name arithmetic never
+    reached it, proving nothing about traversal. So: first confirm the planted file IS what
+    the derived path resolves to and IS parseable as this log's format (i.e. the read would
+    genuinely have returned operator data), then confirm the API refuses.
+    """
     planted = tmp_path / "outside.jsonl"
     planted.write_text(json.dumps({"secret": "operator data"}) + "\n")
     log = EventLog(cfg.logs_dir)
+
+    # The traversal target really is the planted file — name arithmetic alone gets there.
+    assert (cfg.logs_dir / "../../outside.jsonl").resolve() == planted.resolve()
+    assert json.loads(planted.read_text())["secret"] == "operator data"
 
     with pytest.raises(ValueError, match="invalid event log key"):
         log.read("../../outside")

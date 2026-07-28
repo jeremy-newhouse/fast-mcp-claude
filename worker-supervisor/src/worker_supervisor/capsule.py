@@ -37,13 +37,26 @@ def write_capsule(
     validated — corrected rather than left to mislead the next reader into removing a
     caller's handler.
 
-    ECA-137: the filename is derived from `worker`, so the name is validated FIRST,
-    before any directory is created or any file opened. Raising is the right refusal
-    here (unlike `EventLog.emit`, which must stay silent): the only caller,
+    ECA-137: the filename is derived from `worker` (and from `turn['id']`, which is an
+    INTEGER primary key on every path and so is not attacker-controlled), so the name is
+    validated FIRST, before any directory is created or any file opened. Raising is the
+    right refusal here, unlike `EventLog.emit` which must stay silent: the only caller,
     `Engine._finish_failure_capsule`, already catches everything from this function and
     reports it as a `failure_capsule_error` event — whose key `EventLog` sanitises in
     turn, so the refusal cannot escape either (the ECA-135 trap: a traversal-unlink
     traded for a traversal-write).
+
+    THIS GUARD IS DEFENCE IN DEPTH, NOT THE THING THAT STOPS THE ESCAPE IN PRODUCTION,
+    and the distinction was a review finding worth keeping. `_finish_failure_capsule`
+    passes `events_tail=self._events.read(name, ...)` as an ARGUMENT, and Python evaluates
+    arguments before entering the call — so for a hostile name `EventLog.read` raises
+    first and this function is never reached at all. Verified by instrumentation: it is
+    entered for a legal lane and never for `../../escaped`; deleting this guard leaves the
+    engine-level test green, because the events guard is carrying that assertion. Keep it
+    anyway — it is what protects a DIRECT caller, a future caller that does not read the
+    event tail first, and a reordering of that argument list. But do not read the engine
+    test's name as proof that this line fires: the operator-visible error on that path
+    says "invalid event log key", not "invalid worker name".
 
     ECA-136: a capsule carries the turn's prompt and its raw subprocess stderr, so
     it is written 0600 in a 0700 directory rather than at the umask's 0644/0755.

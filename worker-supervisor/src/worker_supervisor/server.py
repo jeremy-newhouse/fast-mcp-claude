@@ -175,7 +175,23 @@ class ControlServer:
         raise ValueError(f"unknown verb: {verb}")
 
     async def _attach(self, writer: asyncio.StreamWriter, args: dict[str, Any]) -> None:
-        """Follow a worker's event stream live (Amendment A9) until disconnect."""
+        """Follow a worker's event stream live (Amendment A9) until disconnect.
+
+        ECA-139: this verb needs its OWN error reply, because `_handle` dispatches it
+        BEFORE the `try/except Exception` that turns every other verb's failure into
+        `{"ok": false, ...}` — attach streams many lines instead of returning one, so it
+        cannot sit inside that wrapper. The consequence was that ECA-137's new
+        `ValueError` from `EventLog.follow` (an async generator, so it raises at the
+        first `__anext__` — i.e. inside the `async for` below) escaped into asyncio's
+        `client_connected_cb`: the client got EOF with no error line and exited 0, while
+        the daemon logged a traceback on every attempt. Silent where it should be loud
+        and loud where it should be silent.
+
+        Catch ValueError explicitly rather than broadening to `Exception`: a refused key
+        is a client error that belongs in the reply, whereas an unexpected fault should
+        still surface as a daemon-side traceback rather than being reported to the
+        client as if it were their mistake.
+        """
         name = args["name"]
         try:
             async for record in self._events.follow(name):
@@ -183,3 +199,7 @@ class ControlServer:
                 await writer.drain()
         except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
             pass
+        except ValueError as e:
+            # Same shape as _handle's reply, so a streaming client can tell an error
+            # object from a record by the presence of "ok".
+            await self._reply(writer, {"ok": False, "error": str(e)})

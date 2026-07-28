@@ -8,14 +8,24 @@ ECA-135 regression test persisted a row named `../../escaped` and a failure caps
 landed outside the supervisor home.
 
 Each test asserts BOTH that nothing appeared outside the home and that the refusal
-actually happened, because neither alone is sufficient and the two carry the weight for
-different inputs. Falsifying this file (guards replaced with `if False`, `__pycache__`
-purged) showed why: for a traversal shape like `../../escaped` it is the tree assertion
-that fails, but for `with space` or `.hidden` nothing escapes at all — those would create
-an odd file INSIDE the home — and only the refusal assertion catches them. A raises-only
-test would likewise pass a guard that raised the right error after already creating the
-file. Every case in this file fails with the guards removed, and the run FINISHES rather
-than hanging — `follow` had to be given an explicit timeout to make that true.
+actually happened, because neither alone is sufficient and which one carries the weight
+depends on the input. Be precise about that rather than implying the tree check proves
+every case:
+
+* `../../escaped`, `..`, `../x`, `a/../../b` — the tree assertion is the proof. It fails
+  with the guards removed, because the escape lands inside `tmp_path`, where `_tree` sees
+  it.
+* `with space`, `.hidden`, `a..b`, `x`*65 — nothing escapes at all; these would create an
+  odd file INSIDE the home. Only the refusal assertion catches them.
+* `/absolute` — `_tree` is BLIND here. `dir / "/absolute"` discards `dir` entirely in
+  pathlib, so the target is `/absolute…` at the filesystem root, outside the observed
+  tree. The `raises` assertion is the whole proof for this shape, which is also why the
+  charset check matters more than any amount of `..` filtering.
+
+A raises-only test would conversely pass a guard that raised the right error after
+already creating the file, which is why both assertions stay. Every case in this file
+fails with the guards removed, and the run FINISHES rather than hanging — `follow` had to
+be given an explicit timeout to make that true.
 """
 
 from __future__ import annotations

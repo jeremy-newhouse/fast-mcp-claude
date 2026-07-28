@@ -25,7 +25,13 @@ class EventLog:
         self._dir.mkdir(parents=True, exist_ok=True)
         # ECA-136: explicit — mkdir's mode is umask-masked, and is not applied at
         # all when the directory already exists (which it does on a live install).
-        self._dir.chmod(0o700)
+        # Skipped for a symlink, because Path.chmod FOLLOWS one: an operator who
+        # relocates logs/ onto another volume would otherwise have the daemon
+        # silently re-mode whatever is at the other end. `hardening.harden_home`
+        # takes exactly this posture and would have reported this path as skipped;
+        # the two must not disagree.
+        if not self._dir.is_symlink():
+            self._dir.chmod(0o700)
 
     def path(self, worker: str) -> Path:
         return self._dir / f"{worker}.jsonl"

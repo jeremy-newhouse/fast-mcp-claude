@@ -11,17 +11,19 @@ class of reason.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import sqlite3
 import stat
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from worker_supervisor.capsule import write_capsule
 from worker_supervisor.events import EventLog
-from worker_supervisor.hardening import harden_home
+from worker_supervisor.hardening import HardenResult, harden_home
 from worker_supervisor.registry import _SCHEMA, Registry
 
 SENTINEL = "FAKE-SENTINEL-ECA136-NOT-A-REAL-CREDENTIAL"
@@ -43,22 +45,44 @@ def _loose_umask():
 
 def _loose_tree(cfg) -> dict[str, object]:
     """Build a supervisor home in exactly the shape both live hosts are in today:
-    0755 dirs, 0644 files, including the sqlite sidecars."""
+    0755 dirs, 0644 files, including the sqlite sidecars.
+
+    MULTIPLE files per directory on purpose. With one apiece, a build that hardened
+    only the FIRST entry it walked in each directory passed every assertion —
+    mbpm2 has ten event logs and six capsules, so that build would have left nine
+    and five at 0644 with the suite green. Review caught it; the fixture now makes
+    it impossible.
+
+    It also includes shapes the first version of the sweep silently missed: a
+    NESTED directory, a file with an unexpected extension, and the operator-owned
+    `mcp-configs/`/`secrets/` directories that hold credentials but that no daemon
+    code path creates.
+    """
     cfg.home.mkdir(parents=True)
     cfg.logs_dir.mkdir()
     cfg.capsules_dir.mkdir()
+    nested = cfg.logs_dir / "archive"
+    nested.mkdir()
+    secrets = cfg.home / "secrets"
+    secrets.mkdir()
     db = cfg.db_path
     files = {
         "db": db,
         "wal": db.parent / f"{db.name}-wal",
         "shm": db.parent / f"{db.name}-shm",
-        "log": cfg.logs_dir / "w1.jsonl",
-        "capsule": cfg.capsules_dir / "w1-turn1-20260728T000000Z.json",
+        "log1": cfg.logs_dir / "w1.jsonl",
+        "log2": cfg.logs_dir / "w2.jsonl",
+        "log3": cfg.logs_dir / "_supervisor.jsonl",
+        "log_other_ext": cfg.logs_dir / "notes.txt",
+        "nested_log": nested / "old.jsonl",
+        "capsule1": cfg.capsules_dir / "w1-turn1-20260728T000000Z.json",
+        "capsule2": cfg.capsules_dir / "w2-turn9-20260728T000001Z.json",
+        "secret": secrets / "greptile.token",
     }
     for p in files.values():
         p.write_text("{}\n")
         p.chmod(0o644)
-    for d in (cfg.home, cfg.logs_dir, cfg.capsules_dir):
+    for d in (cfg.home, cfg.logs_dir, cfg.capsules_dir, nested, secrets):
         d.chmod(0o755)
     return files
 
@@ -77,12 +101,15 @@ def test_a_pre_existing_loose_home_and_artifact_tree_is_tightened(cfg):
 
     res = harden_home(cfg)
 
-    for d in (cfg.home, cfg.logs_dir, cfg.capsules_dir, cfg.mcp_config_dir):
+    for d in (cfg.home, cfg.logs_dir, cfg.capsules_dir, cfg.mcp_config_dir,
+              cfg.logs_dir / "archive", cfg.home / "secrets"):
         assert _mode(d) == 0o700, d
     for key, p in files.items():
         assert _mode(p) == 0o600, key
-    assert res.skipped == []
-    assert res.dirs == 4 and res.files == 5
+    assert res.skipped == [] and res.failed == []
+    # Every file in the fixture, counted — not a sample. A sweep that stopped after
+    # the first entry per directory would report a smaller number here.
+    assert res.files == len(files)
 
 
 def test_the_sweep_covers_the_sqlite_sidecars_specifically(cfg):
@@ -109,7 +136,16 @@ def test_the_sweep_skips_symlinks_rather_than_chmodding_through_them(cfg, tmp_pa
     points at."""
     outside = tmp_path / "outside"
     outside.mkdir()
+    # The target must CONTAIN something. With an empty directory, a build walking
+    # with followlinks=True has nothing to chmod inside it and passes anyway —
+    # review caught exactly that, and the mutation now dies on these two files.
+    victim_file = outside / "someone-elses.jsonl"
+    victim_file.write_text("{}\n")
+    victim_file.chmod(0o644)
+    victim_dir = outside / "nested"
+    victim_dir.mkdir()
     outside.chmod(0o755)
+    victim_dir.chmod(0o755)
     cfg.home.mkdir(parents=True)
     cfg.home.chmod(0o755)
     cfg.logs_dir.symlink_to(outside)
@@ -117,6 +153,8 @@ def test_the_sweep_skips_symlinks_rather_than_chmodding_through_them(cfg, tmp_pa
     res = harden_home(cfg)
 
     assert _mode(outside) == 0o755, "the symlink target was chmod'd!"
+    assert _mode(victim_file) == 0o644, "a file INSIDE the symlink target was chmod'd!"
+    assert _mode(victim_dir) == 0o755, "a dir INSIDE the symlink target was chmod'd!"
     assert str(cfg.logs_dir) in res.skipped
 
 
@@ -131,6 +169,31 @@ def test_the_sweep_skips_a_symlinked_state_db(cfg, tmp_path):
 
     assert _mode(victim) == 0o644, "the symlink target was chmod'd!"
     assert str(cfg.db_path) in res.skipped
+
+
+def test_a_path_that_cannot_be_chmodded_is_reported_not_fatal(cfg, monkeypatch):
+    """harden_home runs FIRST in _serve() — ahead of the registry, the event log and
+    the socket preflight — and a boot failure in this daemon is a 30s lazy-fail
+    RETRY. So one un-chmoddable artifact (root-owned after a restore, `uchg`, a
+    hostile mount) escaping from here would take the whole lane fleet down
+    permanently, which is strictly worse than the loose mode it was trying to fix.
+    Pins BOTH halves: it must not raise, and it must not fail silently either."""
+    files = _loose_tree(cfg)
+    victim = files["log2"]
+    real_chmod = Path.chmod
+
+    def flaky(self, mode, *a, **k):
+        if self.name == victim.name:
+            raise PermissionError(13, "Operation not permitted")
+        return real_chmod(self, mode, *a, **k)
+
+    monkeypatch.setattr(Path, "chmod", flaky)
+    res = harden_home(cfg)  # must NOT raise
+
+    assert any(victim.name in f for f in res.failed), f"not reported: {res.failed}"
+    assert _mode(files["log1"]) == 0o600, "the rest of the sweep must still run"
+    assert _mode(cfg.home) == 0o700
+    assert _mode(victim) == 0o644, "precondition: the victim really was not tightened"
 
 
 def test_the_sweep_is_idempotent(cfg):
@@ -164,6 +227,58 @@ async def test_a_fresh_state_db_and_its_sidecars_are_0600(cfg):
                 assert _mode(side) == 0o600, suffix
         finally:
             await reg.close()
+
+
+async def test_connect_tightens_pre_existing_loose_sidecars_without_the_sweep(cfg):
+    """The case where Registry's own chmods are the ONLY thing that helps.
+
+    For a FRESH database the two mechanisms are redundant — harden_home tightens
+    the home, and SQLite gives a sidecar created afterwards the main db's mode, so
+    dropping Registry's chmods entirely still yields 0600 and the test above cannot
+    tell the difference (three mutants survived it, correctly). Inheritance does
+    NOT apply to a sidecar that already exists, so this pins the real job:
+    Registry.connect() called on a loose install with no sweep in front of it."""
+    cfg.home.mkdir(parents=True)
+    db = cfg.db_path
+    names = (db.name, f"{db.name}-wal", f"{db.name}-shm")
+
+    # A REAL connection to produce real sidecars. Hand-writing empty -wal/-shm files
+    # instead wedges SQLite outright (it blocks trying to recover them) — the same
+    # trap that hung an earlier probe in this task. Held open so the sidecars still
+    # exist when the second Registry connects; a clean close removes them.
+    holder = Registry(db)
+    await holder.connect()
+    try:
+        for name in names:
+            (db.parent / name).chmod(0o644)
+        assert _mode(db) == 0o644, "precondition: the install really is loose"
+
+        reg = Registry(db)
+        await reg.connect()  # deliberately no harden_home() in front of it
+        try:
+            for name in names:
+                p = db.parent / name
+                assert p.exists(), name
+                assert _mode(p) == 0o600, name
+        finally:
+            await reg.close()
+    finally:
+        await holder.close()
+
+
+async def test_connect_does_not_chmod_through_a_symlinked_state_db(cfg, tmp_path):
+    victim = tmp_path / "victim.db"
+    victim.write_bytes(b"")
+    victim.chmod(0o644)
+    cfg.home.mkdir(parents=True)
+    cfg.db_path.symlink_to(victim)
+
+    reg = Registry(cfg.db_path)
+    await reg.connect()
+    try:
+        assert _mode(victim) == 0o644, "the symlink target was chmod'd!"
+    finally:
+        await reg.close()
 
 
 async def test_secure_delete_is_on_not_fast(cfg):
@@ -201,12 +316,26 @@ def _sentinel_bytes(cfg) -> int:
 
 async def test_a_deleted_workers_policy_is_not_recoverable_from_the_file_bytes(cfg):
     """The behavioural test. `PRAGMA secure_delete` echoing back 1 only proves the
-    statement executed; this proves it did something."""
+    statement executed; this proves it did something.
+
+    Asserted while the connection is still OPEN, which is the whole point and was
+    the bug review found in the first version. secure_delete zeroes the freed cell
+    in a NEW page image, and in WAL mode that image goes to state.db-wal while the
+    PRE-delete image stays there untouched: measured 900 sentinel occurrences still
+    in the -wal after deleting every worker. close() checkpoints and removes the
+    WAL, so asserting after it passed even with delete_worker's checkpoint deleted.
+    The daemon holds this connection for its entire uptime and never closes it, so
+    the open-connection state is the only one that describes production."""
     cfg.home.mkdir(parents=True)
     reg = Registry(cfg.db_path)
     await reg.connect()
     await _fill_and_delete(reg)
-    await reg.close()
+    try:
+        assert _sentinel_bytes(cfg) == 0, (
+            "a revoked grant is still recoverable from the files while the daemon runs"
+        )
+    finally:
+        await reg.close()
 
     assert _sentinel_bytes(cfg) == 0
 
@@ -290,32 +419,86 @@ async def test_the_reclaim_preserves_live_rows(cfg):
         await reg2.close()
 
 
-async def test_the_reclaim_runs_once_and_leaves_the_mode_intact(cfg):
+async def test_the_reclaim_marks_itself_done_and_leaves_the_mode_intact(cfg):
+    """VACUUM preserves the file's mode and user_version, so the chmod survives it.
+
+    (An earlier version of this test also built a `seen` list and an execute spy
+    that it never asserted on, and which was installed AFTER connect() had already
+    run the reclaim — so it could not have observed it. Review flagged it as
+    reading like coverage while pinning nothing; the real coverage is
+    test_the_reclaim_vacuums_on_the_first_boot_and_never_again.)"""
+    cfg.home.mkdir(parents=True)
+    reg = Registry(cfg.db_path)
+    with _loose_umask():
+        await reg.connect()
+    try:
+        cur = await reg.db.execute("PRAGMA user_version")
+        assert (await cur.fetchone())[0] == 1
+    finally:
+        await reg.close()
+
+    assert _mode(cfg.db_path) == 0o600
+
+
+async def test_a_failing_reclaim_is_recorded_and_never_fatal(cfg, monkeypatch):
+    """The reclaim is a one-shot remediation, not a boot requirement — but a silent
+    failure would leave old credentials in the file while the boot looked clean.
+    Pins both halves: connect() still succeeds, AND reclaim_error is set."""
+    cfg.home.mkdir(parents=True)
+
+    async def boom(self):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(Registry, "_checkpoint_truncate", boom)
+    reg = Registry(cfg.db_path)
+    await reg.connect()  # must NOT raise
+    try:
+        assert reg.reclaim_error is not None
+        assert "OperationalError" in reg.reclaim_error
+        cur = await reg.db.execute("PRAGMA user_version")
+        assert (await cur.fetchone())[0] == 0, "must stay 0 so the next boot retries"
+    finally:
+        await reg.close()
+
+
+async def test_a_healthy_reclaim_records_no_error(cfg):
+    """Negative control: without it, a build that ALWAYS set reclaim_error would
+    pass the test above."""
     cfg.home.mkdir(parents=True)
     reg = Registry(cfg.db_path)
     await reg.connect()
-    cur = await reg.db.execute("PRAGMA user_version")
-    assert (await cur.fetchone())[0] == 1
-    await reg.close()
-
-    seen: list[str] = []
-    reg2 = Registry(cfg.db_path)
-    await reg2.connect()
     try:
-        real = reg2.db.execute
-
-        async def spy(sql, *a, **k):
-            seen.append(str(sql))
-            return await real(sql, *a, **k)
-
-        reg2.db.execute = spy  # type: ignore[method-assign]
-        cur = await reg2.db.execute("PRAGMA user_version")
-        assert (await cur.fetchone())[0] == 1
+        assert reg.reclaim_error is None
     finally:
-        await reg2.close()
+        await reg.close()
 
-    # VACUUM preserves the file's mode and user_version, so the chmod survives it.
-    assert _mode(cfg.db_path) == 0o600
+
+def test_serve_hardens_the_home_before_touching_anything_else(monkeypatch, cfg):
+    """The ONE line that reaches both live installs is `harden_home(cfg)` in
+    _serve(). Nothing tested that it is called: deleting it left 118/118 green while
+    shipping a daemon that boots normally and hardens nothing. Also pins the
+    ORDERING — it must run before the registry connects, which is when state.db is
+    created inside the home."""
+    import worker_supervisor.__main__ as main_mod
+
+    order: list[str] = []
+    monkeypatch.setattr(main_mod, "load_config", lambda: cfg)
+    monkeypatch.setattr(main_mod, "harden_home",
+                        lambda c: (order.append("harden"), HardenResult())[1])
+
+    class StopHere(Exception):
+        pass
+
+    class FakeRegistry:
+        def __init__(self, *a, **k):
+            order.append("registry")
+            raise StopHere
+
+    monkeypatch.setattr(main_mod, "Registry", FakeRegistry)
+    with pytest.raises(StopHere):
+        asyncio.run(main_mod._serve())
+
+    assert order == ["harden", "registry"]
 
 
 async def _connect_recording_reclaim_sql(reg, seen: list[str]) -> None:
@@ -413,6 +596,27 @@ def test_the_events_mode_does_not_depend_on_the_open_mode(cfg, monkeypatch):
         real_umask(old_umask)
 
     assert _mode(cfg.logs_dir / "w1.jsonl") == 0o600
+
+
+def test_the_creation_sites_do_not_chmod_through_a_symlinked_directory(cfg, tmp_path):
+    """harden_home reports a symlinked logs/ or capsules/ as SKIPPED and refuses to
+    chmod the target. EventLog.__init__ and write_capsule run a few lines later in
+    the same boot and would have re-moded it anyway — the two must not disagree
+    about the posture, or the sweep's refusal is decorative."""
+    outside_logs = tmp_path / "elsewhere-logs"
+    outside_caps = tmp_path / "elsewhere-capsules"
+    for d in (outside_logs, outside_caps):
+        d.mkdir()
+        d.chmod(0o755)
+    cfg.home.mkdir(parents=True)
+    cfg.logs_dir.symlink_to(outside_logs)
+    cfg.capsules_dir.symlink_to(outside_caps)
+
+    EventLog(cfg.logs_dir)
+    _capsule(cfg)
+
+    assert _mode(outside_logs) == 0o755, "EventLog chmod'd through the symlink!"
+    assert _mode(outside_caps) == 0o755, "write_capsule chmod'd through the symlink!"
 
 
 def test_emit_refuses_to_write_through_a_symlink(cfg, tmp_path):

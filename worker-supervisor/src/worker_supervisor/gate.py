@@ -162,10 +162,16 @@ def redact_policy(policy: Any) -> dict[str, Any]:
 def redact_worker_row(row: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of a `workers` registry row whose policy carries no secrets.
 
-    The row's `policy` column is a JSON string (SQLite); the redacted copy keeps
-    that shape so response consumers see no structural change — only the
+    The row's `policy` column is a JSON string (SQLite), and the redacted copy
+    keeps that shape so response consumers see no structural change — only the
     `mcp_servers` block differs. Every control-surface response that includes a
     worker row MUST go through this (see `server.ControlServer._dispatch`).
+
+    The dict branch is defensive, not a live path: today every row comes from the
+    TEXT column, so `policy` is always a `str`. Anything that is neither a JSON
+    object nor absent — a bare list, a scalar, unparseable text — is withheld
+    rather than guessed at: we cannot prove it holds no secret, so it does not
+    leave the daemon.
     """
     out = dict(row)
     raw = out.get("policy")
@@ -175,11 +181,9 @@ def redact_worker_row(row: dict[str, Any]) -> dict[str, Any]:
         try:
             parsed = json.loads(raw or "{}")
         except json.JSONDecodeError:
-            # Unparseable policy: we cannot prove it holds no secret, so it does
-            # not leave the daemon.
             out["policy"] = None
             return out
-        out["policy"] = json.dumps(redact_policy(parsed))
+        out["policy"] = json.dumps(redact_policy(parsed)) if isinstance(parsed, dict) else None
     elif isinstance(raw, dict):
         out["policy"] = redact_policy(raw)
     else:

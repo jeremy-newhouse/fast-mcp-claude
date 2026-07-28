@@ -8,6 +8,7 @@ capped at 104 bytes and pytest's tmp_path can exceed that limit.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import shutil
 import socket as _socket
@@ -19,7 +20,12 @@ import pytest
 
 from worker_supervisor.config import Config, Limits
 from worker_supervisor.engine import Engine
-from worker_supervisor.gate import QuestionBridge, redact_policy, redact_worker_row
+from worker_supervisor.gate import (
+    QuestionBridge,
+    WorkerPolicy,
+    redact_policy,
+    redact_worker_row,
+)
 from worker_supervisor.server import ControlServer
 from worker_supervisor.__main__ import main
 
@@ -213,12 +219,25 @@ async def test_spawn_still_stores_the_real_credentials(control, registry, repo):
 async def test_no_other_control_verb_leaks_credentials(control, registry, repo, verb):
     """AC#2: the same credentials must not resurface through any other verb.
 
-    Every verb reachable without launching a turn subprocess is swept here. A
-    turn is minted for `get`/`history` via the registry directly — no worker
-    process runs.
+    Every verb reachable without launching a turn subprocess is swept. Note what
+    each case is worth: `status` and `events` are real forward guards (both
+    project from live policy-derived data), while `history`/`get`/`questions`
+    read tables with no policy column at all — those cases are cheap boundary
+    documentation, not defect detectors. Reverting the spawn fix does not make
+    them fail, and that is expected.
     """
     await _spawn_probe(control, repo)
     turn_id = await registry.enqueue_turn("probe", "hello")
+    # The one event that carries MCP context is emitted per-turn, and the parked
+    # runner means no turn ever runs — so emit it directly. Without this the
+    # `events` case never sees the record that could plausibly grow a leak.
+    control._engine._emit_mcp_diagnostics(
+        "probe",
+        turn_id,
+        WorkerPolicy(mcp_servers=MCP_SERVERS_WITH_SECRETS),
+        mcp_init=[{"name": "jira", "status": "connected"}],
+        stderr_tail=["mcp server startup line"],
+    )
 
     args = {
         "status": {},
@@ -230,6 +249,32 @@ async def test_no_other_control_verb_leaks_credentials(control, registry, repo, 
     wire = _wire(await control._dispatch(verb, args))
     for sentinel in SENTINELS:
         assert sentinel not in wire, f"{sentinel} leaked through the {verb!r} verb"
+
+
+async def test_mcp_diagnostics_event_records_names_not_configs(control, registry, repo):
+    """The per-turn MCP diagnostics event is the nearest thing to a second leak:
+    it fires only for credentialed lanes and rides both `events` and `attach`.
+
+    It records `sorted(mcp_servers.keys())` today. Pin that, so widening it to
+    the granted server CONFIGS is a visible decision rather than silent drift.
+    """
+    await _spawn_probe(control, repo)
+    control._engine._emit_mcp_diagnostics(
+        "probe",
+        1,
+        WorkerPolicy(mcp_servers=MCP_SERVERS_WITH_SECRETS),
+        mcp_init=None,
+        stderr_tail=[],
+    )
+    records = control._events.read("probe")
+    diagnostics = [r for r in records if r["event"] == "turn_mcp_diagnostics"]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["granted"] == ["jira", "langfuse"]
+    # Also assert it against the on-disk JSONL: `events` reads that file back,
+    # and the log outlives the process.
+    assert not any(
+        s in control._events.path("probe").read_text() for s in SENTINELS
+    )
 
 
 def test_redact_policy_collapses_every_server_shape():
@@ -251,17 +296,26 @@ def test_redact_policy_is_idempotent_and_shape_safe():
     assert redact_policy({"mcp_servers": HEADER_SENTINEL})["mcp_servers"] == []
     assert redact_policy({"mcp_servers": None})["mcp_servers"] is None
     assert "mcp_servers" not in redact_policy({"model": "opus"})
-    # The input is never mutated in place.
-    src = {"mcp_servers": dict(MCP_SERVERS_WITH_SECRETS)}
+    # The input is never mutated in place. Deep-copied on purpose: a shallow copy
+    # would share the nested server dicts with the module-level constant, so an
+    # in-place redaction would corrupt it for every test that runs afterwards —
+    # and a later leak test would then pass against already-blank values.
+    src = {"mcp_servers": copy.deepcopy(MCP_SERVERS_WITH_SECRETS)}
     redact_policy(src)
     assert src["mcp_servers"]["jira"]["headers"]["Authorization"].endswith(
         HEADER_SENTINEL
     )
+    assert src["mcp_servers"]["langfuse"]["env"]["LANGFUSE_SECRET"] == ENV_SENTINEL
 
 
-def test_redact_worker_row_handles_both_policy_shapes_and_garbage():
-    """The row's policy is a JSON string from SQLite, but the engine also passes
-    dicts around; an unparseable policy is withheld rather than guessed at."""
+def test_redact_worker_row_handles_every_policy_shape():
+    """Live rows always carry the TEXT column, so `policy` is always a `str`; the
+    dict branch is defensive for future callers, not a path in use today.
+
+    Everything that is neither a JSON object nor absent is withheld — the helper
+    cannot prove such a value holds no secret, and raising instead would turn a
+    spawn that actually succeeded into an error reply.
+    """
     as_string = redact_worker_row(
         {"name": "w", "policy": json.dumps({"mcp_servers": MCP_SERVERS_WITH_SECRETS})}
     )
@@ -273,3 +327,8 @@ def test_redact_worker_row_handles_both_policy_shapes_and_garbage():
     assert redact_worker_row({"name": "w", "policy": "{not json"})["policy"] is None
     assert redact_worker_row({"name": "w", "policy": None})["policy"] is None
     assert redact_worker_row({"name": "w"}) == {"name": "w"}
+
+    # Valid JSON that is not an object: withheld, never raised.
+    for not_an_object in ("[1, 2]", '"a string"', "123", "true", "null"):
+        assert redact_worker_row({"name": "w", "policy": not_an_object})["policy"] is None
+    assert redact_worker_row({"name": "w", "policy": 123})["policy"] is None

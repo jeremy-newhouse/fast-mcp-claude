@@ -59,13 +59,21 @@ class WorkerPolicy:
     # That is false, and was proven false live on mbpm2 (2026-07-28): the lane runs
     # as the SAME uid as the daemon, so anything the CLI can read, a lane with
     # arbitrary command execution can read. Until ECA-135 the whole config sat in
-    # the CLI's argv, one `ps` away for that lane AND for every other lane on the
-    # box; it is now a 0600 file, one `cat` away for that lane only. The true
-    # boundary is therefore a TRUST one, not a containment one: grant MCP
-    # credentials only to a lane you would trust with those credentials directly.
-    # Narrowing it further needs a tool ceiling that withholds arbitrary execution,
-    # or per-lane OS isolation — neither of which the daemon can synthesize from
-    # inside the same uid.
+    # the CLI's argv, one `ps` away; it is now a turn-scoped 0600 file, one `cat`
+    # away. Say it plainly: THERE IS NO LANE-TO-LANE BOUNDARY. Same uid means every
+    # lane can read every other lane's file, and `state.db` (0644, ECA-136) holds
+    # the same credentials durably for anyone on the box. ECA-135 changed the SHAPE
+    # of the exposure — accidental capture (`ps aux` in a debugging session, which
+    # scoops up every concurrent lane's config at once) became deliberate opening
+    # of a named file — and shortened its life to the turn. It did not contain it.
+    # The true boundary is therefore a TRUST one: grant MCP credentials only to a
+    # lane you would trust with those credentials directly. The one control that
+    # actually narrows this is the tool ceiling — a lane with no arbitrary execution
+    # genuinely cannot reach these paths, since gate._path_escapes pins the
+    # file-taking tools to the repo, and Bash is the deliberate exception. The
+    # shipped evolv-ultra profile grants bare Bash, so those lanes have no such
+    # narrowing today. Anything stronger needs per-lane OS isolation, which the
+    # daemon cannot synthesize from inside the same uid.
     mcp_servers: dict[str, Any] = field(default_factory=dict)
 
     @classmethod

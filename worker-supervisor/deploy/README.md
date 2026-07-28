@@ -15,6 +15,7 @@ This is deployment config, not supervisor code — it lives here only because mb
 | cwd | `~/worker-repos/<lane>/evolv-ultra` (repo root → project `/pr-review` skill loads; be/fe siblings at `../`) |
 | Tools | `Read,Write,Edit,Glob,Grep,Bash,Skill,Task` + MCP `jira, confluence, langfuse, greptile, context7` (`Task` = pr-review's subagent fan-out) |
 | MCP creds | materialised at runtime into `~/.worker-supervisor/mcp-configs/evolv-ultra.json` (0600, **not committed**); each server's creds in its own headers block — worker process env stays scrubbed (envbuild A3) |
+| MCP creds — exposure | **A3 is about env inheritance only; it is not containment.** These lanes grant bare `Bash`, and a lane runs as the same uid as the daemon, so any granted lane can read these credentials, and so can any UN-granted lane on the same box — from the daemon's per-turn config file and, durably, from `state.db` (0644; ECA-136). ECA-135 took them out of the CLI's argv, which is what a stray `ps aux` used to scoop up by accident; it did not build a lane-to-lane boundary and there is none. Grant a server to a lane only if you would hand that lane the credential directly. |
 
 ## Run
 

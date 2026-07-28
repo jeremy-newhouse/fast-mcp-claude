@@ -544,6 +544,29 @@ def granted_policy() -> WorkerPolicy:
     )
 
 
+def capture_config_state(monkeypatch, sink: dict) -> None:
+    """Snapshot the credential file as the CLI sees it — DURING the turn.
+
+    _worker_loop unlinks it the moment the turn ends (that transience is the point,
+    and its own test), so anything asserted about the file itself has to be captured
+    while it is live rather than read back afterwards."""
+    original = Engine._write_mcp_config
+
+    def spy(self, worker, servers):
+        arg = original(self, worker, servers)
+        if isinstance(arg, str):
+            path = Path(arg)
+            sink[worker] = {
+                "path": path,
+                "content": path.read_text(),
+                "mode": stat.S_IMODE(path.stat().st_mode),
+                "dir_mode": stat.S_IMODE(path.parent.stat().st_mode),
+            }
+        return arg
+
+    monkeypatch.setattr(Engine, "_write_mcp_config", spy)
+
+
 def sdk_argv(options: Any) -> list[str]:
     """The argv the REAL SDK would exec for these options, spawning nothing."""
     from claude_agent_sdk._internal.transport.subprocess_cli import (
@@ -570,43 +593,52 @@ async def test_granted_mcp_credentials_never_reach_the_cli_argv(
 
 
 async def test_mcp_config_file_carries_the_policy_at_0600_in_a_0700_dir(
-    make_engine, registry, repo
+    make_engine, registry, repo, monkeypatch
 ):
     """Moving the credential from argv to disk is only a gain if the file is not
-    itself readable — and the content must still be what the CLI expects."""
+    itself loosely permissioned — and the content must still be what the CLI expects."""
+    seen: dict = {}
+    capture_config_state(monkeypatch, seen)
     engine, calls = make_engine([[r("s1")]])
     policy = granted_policy()
     await engine.spawn("w1", str(repo), policy)
     await terminal_turn(registry, await engine.prompt("w1", "go"))
 
-    path = Path(calls[0].mcp_servers)
-    assert json.loads(path.read_text()) == {"mcpServers": policy.mcp_servers}
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    live = seen["w1"]
+    assert live["path"] == Path(calls[0].mcp_servers)
+    assert json.loads(live["content"]) == {"mcpServers": policy.mcp_servers}
+    assert live["mode"] == 0o600
     # NB: on a fresh dir under a tight umask (this dev host runs 077) mkdir alone
     # already yields 0700, so this line does not by itself prove the explicit
     # chmod is there — test_mcp_config_write_tightens_a_pre_existing_loose_file
     # is the one that pins it umask-independently. Kept as the end-state assertion.
-    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert live["dir_mode"] == 0o700
 
 
 async def test_mcp_config_write_tightens_a_pre_existing_loose_file(
-    make_engine, registry, repo, cfg
+    make_engine, registry, repo, cfg, monkeypatch
 ):
-    """O_CREAT's mode is ignored when the file already exists — a lane whose config
-    was left world-readable by anything else must still end up 0600."""
+    """O_CREAT's mode is ignored when the file already exists, and mkdir's mode is
+    ignored when the directory does — a lane whose config was left world-readable by
+    anything else must still end up 0600 in a 0700 dir. This is the one assertion that
+    pins the explicit chmod/fchmod umask-independently."""
     cfg.mcp_config_dir.mkdir(parents=True)
     cfg.mcp_config_dir.chmod(0o755)
     loose = cfg.mcp_config_dir / "w1.json"
     loose.write_text("{}")
     loose.chmod(0o644)
 
+    seen: dict = {}
+    capture_config_state(monkeypatch, seen)
     engine, calls = make_engine([[r("s1")]])
     await engine.spawn("w1", str(repo), granted_policy())
     await terminal_turn(registry, await engine.prompt("w1", "go"))
 
-    assert stat.S_IMODE(loose.stat().st_mode) == 0o600
-    assert stat.S_IMODE(cfg.mcp_config_dir.stat().st_mode) == 0o700
-    assert ECA135_SENTINEL in loose.read_text()  # it really was rewritten
+    live = seen["w1"]
+    assert live["path"] == loose
+    assert live["mode"] == 0o600
+    assert live["dir_mode"] == 0o700
+    assert ECA135_SENTINEL in live["content"]  # it really was rewritten
 
 
 async def test_lane_without_an_mcp_grant_is_byte_for_byte_unchanged(
@@ -648,14 +680,174 @@ async def test_retry_ladder_writes_the_config_once(
     assert calls[0].mcp_servers == calls[1].mcp_servers
 
 
-async def test_remove_purges_the_lanes_mcp_config_file(make_engine, registry, repo):
-    """`remove` purges a worker's artifacts; the credential file is one of them."""
-    engine, calls = make_engine([[r("s1")]])
+async def test_remove_sweeps_a_config_file_left_by_a_crashed_daemon(
+    make_engine, registry, repo, cfg
+):
+    """With the turn-end unlink in place, `remove` covers exactly one case: a daemon
+    that died mid-turn and left the file behind. Stage that state directly — asserting
+    it after a NORMAL turn would assert nothing, since the file is already gone."""
+    engine, _ = make_engine([[r("s1")]])
     await engine.spawn("w1", str(repo), granted_policy())
     await terminal_turn(registry, await engine.prompt("w1", "go"))
-    path = Path(calls[0].mcp_servers)
-    assert path.exists()
+
+    orphan = cfg.mcp_config_dir / "w1.json"
+    assert not orphan.exists(), "the turn-end unlink should already have removed it"
+    orphan.write_text('{"mcpServers": {}}')  # simulate the crash leftover
 
     await engine.kill("w1")
     await engine.remove("w1")
-    assert not path.exists()
+    assert not orphan.exists()
+
+
+# --- ECA-135, second round: the gaps the adversarial review found ---------------
+
+
+async def test_strict_mcp_config_still_rides_with_the_grant(
+    make_engine, registry, repo
+):
+    """The flag that stops an ambient repo .mcp.json widening a lane's surface sits one
+    line from the code this change rewrote, and NOTHING in the suite pinned it —
+    deleting it outright left 67/67 green. It matters more with a file config, not
+    less: a corrupt file plus strict mode means a granted lane silently runs with zero
+    servers rather than erroring."""
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert calls[0].strict_mcp_config is True
+    assert "--strict-mcp-config" in sdk_argv(calls[0])
+
+
+async def test_two_lanes_get_separate_files_and_remove_is_surgical(
+    make_engine, registry, repo, cfg
+):
+    """Cross-lane isolation of the FILES was pinned only incidentally, by another test
+    hardcoding 'w1.json' — and cross-lane is the whole subject of ECA-135.
+
+    Note what this does NOT claim: the files are 0600 but every lane runs as the same
+    uid, so lane B can still read lane A's file. This asserts that the daemon keeps
+    them SEPARATE and that removing one leaves the other, not that the OS keeps them
+    apart. It does not."""
+    engine, calls = make_engine([[r("s1")], [r("s2")]])
+    a_policy = granted_policy()
+    b_policy = WorkerPolicy(
+        mcp_servers={"other": {"type": "stdio", "command": "/bin/true"}}
+    )
+    await engine.spawn("lanea", str(repo), a_policy)
+    await engine.spawn("laneb", str(repo), b_policy)
+    await terminal_turn(registry, await engine.prompt("lanea", "go"))
+    await terminal_turn(registry, await engine.prompt("laneb", "go"))
+
+    a_path = cfg.mcp_config_dir / "lanea.json"
+    b_path = cfg.mcp_config_dir / "laneb.json"
+    assert {Path(c.mcp_servers) for c in calls} == {a_path, b_path}
+
+    # The turn-end unlink means neither survives its turn; re-derive content from the
+    # captured options instead of the (correctly) absent files.
+    assert not a_path.exists() and not b_path.exists()
+    assert calls[0].mcp_servers != calls[1].mcp_servers
+
+    await engine.kill("lanea")
+    await engine.remove("lanea")
+    assert await registry.get_worker("laneb") is not None
+
+
+async def test_config_file_does_not_outlive_its_turn(make_engine, registry, repo, cfg):
+    """Argv's one virtue was being transient. A file that persisted past the turn — let
+    alone past `kill` — would trade a turn-scoped exposure for a permanent one."""
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert not Path(calls[0].mcp_servers).exists()
+    assert list(cfg.mcp_config_dir.iterdir()) == []
+
+
+async def test_mcp_config_write_failure_fails_the_turn_instead_of_wedging_the_lane(
+    make_engine, registry, repo, cfg, events
+):
+    """Regression found in review: the write is the first filesystem touch _run_turn
+    makes, and it sits OUTSIDE the attempt loop's handlers. Nothing supervises a runner
+    task, so an escaping OSError killed the lane's loop — turn stuck `claimed`, worker
+    stuck `running`, no event, no capsule, forever. It must fail the TURN."""
+    cfg.mcp_config_dir.parent.mkdir(parents=True, exist_ok=True)
+    cfg.mcp_config_dir.write_text("not a directory")  # mkdir(exist_ok=True) -> OSError
+
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    turn = await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert turn["state"] == "error"
+    assert "mcp config write failed" in turn["error"]
+    assert calls == [], "the CLI must never have been spawned"
+    assert (await registry.get_worker("w1"))["status"] == "idle"
+    assert [e for e in events.read("w1") if e["event"] == "turn_error"]
+    assert list(cfg.capsules_dir.glob("w1-turn*.json")), "failure capsule missing"
+
+
+async def test_a_symlinked_config_path_is_refused_not_followed(
+    make_engine, registry, repo, cfg, tmp_path
+):
+    """Without O_NOFOLLOW the daemon becomes a deputy for truncate+chmod on whatever a
+    pre-planted symlink points at. Same-uid, so not a privilege boundary — but the
+    daemon should not be the one doing it."""
+    victim = tmp_path / "victim.json"
+    victim.write_text('{"operator": "config"}')
+    cfg.mcp_config_dir.mkdir(parents=True)
+    (cfg.mcp_config_dir / "w1.json").symlink_to(victim)
+
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    turn = await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert turn["state"] == "error"
+    assert victim.read_text() == '{"operator": "config"}', "the victim was written!"
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "bad", ["../../.claude", "a/b", ".hidden", "..", "", "x" * 65, "na me"]
+)
+async def test_spawn_rejects_names_that_are_not_safe_filenames(
+    make_engine, repo, bad
+):
+    """A worker name becomes a filename, and since this change that filename is
+    TRUNCATED and UNLINKED. Review demonstrated `../../.claude` overwriting the
+    operator's real ~/.claude.json — the file the deploy generator reads live
+    credentials out of."""
+    engine, _ = make_engine([[r("s1")]])
+    with pytest.raises(ValueError, match="invalid worker name"):
+        await engine.spawn(bad, str(repo), granted_policy())
+
+
+async def test_spawn_rejects_a_case_folded_collision(make_engine, repo):
+    """APFS is case-insensitive; the registry's TEXT PRIMARY KEY is not. Two distinct
+    workers would share one credential file and the last writer would win — a lane
+    starting with another lane's bearers, which is exactly the leak this task is
+    about."""
+    engine, _ = make_engine([[r("s1")]])
+    await engine.spawn("Ultra1", str(repo), granted_policy())
+    with pytest.raises(ValueError, match="collides case-insensitively"):
+        await engine.spawn("ultra1", str(repo), granted_policy())
+
+
+async def test_a_symlinked_config_DIRECTORY_is_refused_not_followed(
+    make_engine, registry, repo, cfg, tmp_path
+):
+    """Path.mkdir(exist_ok=True) accepts a symlink-to-directory and Path.chmod then
+    chmods the TARGET — so without the explicit is_symlink guard the daemon would
+    relocate a lane's credentials into an attacker-chosen directory and set it 0700."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    elsewhere.chmod(0o755)
+    cfg.mcp_config_dir.parent.mkdir(parents=True, exist_ok=True)
+    cfg.mcp_config_dir.symlink_to(elsewhere)
+
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    turn = await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert turn["state"] == "error"
+    assert list(elsewhere.iterdir()) == [], "credentials landed in the symlink target"
+    assert stat.S_IMODE(elsewhere.stat().st_mode) == 0o755, "target was chmod'd"
+    assert calls == []

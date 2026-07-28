@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
+import stat
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -516,3 +519,143 @@ async def test_mcp_startup_grace_skipped_without_mcp_grant(
         assert asyncio.get_event_loop().time() - start < 0.2
     finally:
         await engine.stop()
+
+
+# --- ECA-135: granted MCP credentials must never enter the child's argv ---------
+#
+# Confirmed live on mbpm2 (CLI 2.1.220 / SDK 0.2.91, 2026-07-28) before the fix: a
+# worker turn read both of its own planted sentinels out of its parent's argv with
+# one `ps`, and `workers get` handed them back to the caller. These tests exercise
+# the real SDK argv builder, so they fail against the pre-fix engine rather than
+# merely restating what the new code does.
+
+ECA135_SENTINEL = "ECA135-SENTINEL-vd83ka-not-a-real-credential"
+
+
+def granted_policy() -> WorkerPolicy:
+    return WorkerPolicy(
+        mcp_servers={
+            "paid": {
+                "type": "http",
+                "url": "http://127.0.0.1:1/mcp",
+                "headers": {"Authorization": f"Bearer {ECA135_SENTINEL}"},
+            }
+        }
+    )
+
+
+def sdk_argv(options: Any) -> list[str]:
+    """The argv the REAL SDK would exec for these options, spawning nothing."""
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport,
+    )
+
+    resolved = dataclasses.replace(options, cli_path="/nonexistent/claude")
+    return SubprocessCLITransport(prompt="x", options=resolved)._build_command()
+
+
+async def test_granted_mcp_credentials_never_reach_the_cli_argv(
+    make_engine, registry, repo
+):
+    """The load-bearing assertion: the secret is absent from the command line the
+    SDK would exec, and what replaces it is the config PATH."""
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    argv = sdk_argv(calls[0])
+    assert ECA135_SENTINEL not in " ".join(argv)
+    assert argv[argv.index("--mcp-config") + 1] == calls[0].mcp_servers
+    assert isinstance(calls[0].mcp_servers, str)
+
+
+async def test_mcp_config_file_carries_the_policy_at_0600_in_a_0700_dir(
+    make_engine, registry, repo
+):
+    """Moving the credential from argv to disk is only a gain if the file is not
+    itself readable — and the content must still be what the CLI expects."""
+    engine, calls = make_engine([[r("s1")]])
+    policy = granted_policy()
+    await engine.spawn("w1", str(repo), policy)
+    await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    path = Path(calls[0].mcp_servers)
+    assert json.loads(path.read_text()) == {"mcpServers": policy.mcp_servers}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    # NB: on a fresh dir under a tight umask (this dev host runs 077) mkdir alone
+    # already yields 0700, so this line does not by itself prove the explicit
+    # chmod is there — test_mcp_config_write_tightens_a_pre_existing_loose_file
+    # is the one that pins it umask-independently. Kept as the end-state assertion.
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+async def test_mcp_config_write_tightens_a_pre_existing_loose_file(
+    make_engine, registry, repo, cfg
+):
+    """O_CREAT's mode is ignored when the file already exists — a lane whose config
+    was left world-readable by anything else must still end up 0600."""
+    cfg.mcp_config_dir.mkdir(parents=True)
+    cfg.mcp_config_dir.chmod(0o755)
+    loose = cfg.mcp_config_dir / "w1.json"
+    loose.write_text("{}")
+    loose.chmod(0o644)
+
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert stat.S_IMODE(loose.stat().st_mode) == 0o600
+    assert stat.S_IMODE(cfg.mcp_config_dir.stat().st_mode) == 0o700
+    assert ECA135_SENTINEL in loose.read_text()  # it really was rewritten
+
+
+async def test_lane_without_an_mcp_grant_is_byte_for_byte_unchanged(
+    make_engine, registry, repo, cfg
+):
+    """Negative control: the un-granted lane keeps the empty-dict option and gets no
+    --mcp-config at all, so this fix cannot regress the lanes it does not concern."""
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo))  # no mcp_servers granted
+    await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert calls[0].mcp_servers == {}
+    assert "--mcp-config" not in sdk_argv(calls[0])
+    assert not cfg.mcp_config_dir.exists()
+
+
+async def test_retry_ladder_writes_the_config_once(
+    make_engine, registry, repo, monkeypatch
+):
+    """Written once per TURN, before the attempt loop. The path alone cannot show
+    this — it is derived from the worker name, so a per-attempt write would land on
+    the same path — so count the writes."""
+    writes: list[str] = []
+    original = Engine._write_mcp_config
+
+    def counting(self, worker, servers):
+        writes.append(worker)
+        return original(self, worker, servers)
+
+    monkeypatch.setattr(Engine, "_write_mcp_config", counting)
+
+    engine, calls = make_engine([RuntimeError("boom 1"), [r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert len(calls) == 2, "expected the retry ladder to run two attempts"
+    assert writes == ["w1"]
+    assert isinstance(calls[0].mcp_servers, str)
+    assert calls[0].mcp_servers == calls[1].mcp_servers
+
+
+async def test_remove_purges_the_lanes_mcp_config_file(make_engine, registry, repo):
+    """`remove` purges a worker's artifacts; the credential file is one of them."""
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    await terminal_turn(registry, await engine.prompt("w1", "go"))
+    path = Path(calls[0].mcp_servers)
+    assert path.exists()
+
+    await engine.kill("w1")
+    await engine.remove("w1")
+    assert not path.exists()

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -312,6 +313,10 @@ class Engine:
                 f"worker {name!r} is {worker['status']}; kill it before remove"
             )
         await self._reg.delete_worker(name)
+        # ECA-135: purge the lane's credential file with the rest of its artifacts.
+        # `kill` deliberately does NOT — a killed row keeps its policy (credentials
+        # included) in state.db, so unlinking there would buy nothing.
+        self._mcp_config_path(name).unlink(missing_ok=True)
         for bookkeeping in (self._runners, self._kicks, self._current):
             bookkeeping.pop(name, None)
         self._events.emit(name, "worker_removed")
@@ -437,6 +442,10 @@ class Engine:
             "wall_clock_s": limits.wall_clock_s,
         }
 
+        # ECA-135: written ONCE per turn, before the retry ladder — a retry reuses
+        # the same file rather than rewriting the lane's credentials on each attempt.
+        mcp_arg = self._write_mcp_config(name, policy.mcp_servers)
+
         attempt = 0
         while True:
             attempt += 1
@@ -488,7 +497,9 @@ class Engine:
                 # granted so an ambient repo .mcp.json can't widen the surface;
                 # off (default discovery, which finds nothing at the workspace
                 # root) when the lane has no MCP grant, preserving prior behavior.
-                mcp_servers=policy.mcp_servers,
+                # ECA-135: a 0600 FILE PATH, never the credential-bearing dict —
+                # see _write_mcp_config for what that does and does not buy.
+                mcp_servers=mcp_arg,
                 strict_mcp_config=bool(policy.mcp_servers),
                 can_use_tool=gate,
                 # AskUserQuestion never reaches can_use_tool (UI tool) — the
@@ -747,6 +758,50 @@ class Engine:
             mcp_init=mcp_init,
             stderr_tail=list(stderr_tail),
         )
+
+    def _mcp_config_path(self, worker: str) -> Path:
+        return self._cfg.mcp_config_dir / f"{worker}.json"
+
+    def _write_mcp_config(self, worker: str, servers: dict[str, Any]) -> str | dict[str, Any]:
+        """ECA-135: hand the CLI a 0600 config FILE PATH, never inline JSON.
+
+        The SDK renders a DICT-valued `ClaudeAgentOptions.mcp_servers` into
+        `--mcp-config <the entire JSON>` in the child's ARGV (0.2.91
+        subprocess_cli.py, dict branch). Argv is world-readable to every process of
+        the same uid, so a granted lane's bearers sat in the process table for the
+        whole turn — readable by that lane's own `Bash`, and by every OTHER lane
+        running concurrently, granted or not. Confirmed live on mbpm2 (CLI 2.1.220 /
+        SDK 0.2.91, 2026-07-28): a worker turn read both planted sentinels out of its
+        parent's argv, and `workers get` then returned them to the caller.
+
+        The SDK's documented str/Path branch passes the value through as a file path
+        instead, so no credential ever enters argv.
+
+        What this does NOT do: make the credentials unreachable. The PATH is still in
+        argv and the file is owned by the same uid as the lane, so a lane with
+        arbitrary command execution can still read it deliberately — one `cat` away.
+        It closes the ACCIDENTAL and CROSS-LANE surface (a stray `ps aux` while
+        debugging; an un-granted lane incidentally capturing a granted lane's secrets)
+        and leaves the deliberate one, which is a tool-ceiling / OS-isolation question,
+        not something the daemon can fix from inside the same uid. See the residual
+        recorded on gate.WorkerPolicy.mcp_servers.
+
+        Returns `{}` for an un-granted lane so its options are byte-for-byte what they
+        were before this change (and no `--mcp-config` reaches its argv at all).
+        """
+        if not servers:
+            return {}
+        d = self._cfg.mcp_config_dir
+        d.mkdir(parents=True, exist_ok=True)
+        d.chmod(0o700)  # explicit: mkdir's mode is umask-masked and skipped if it exists
+        path = self._mcp_config_path(worker)
+        # O_CREAT's mode only applies to a NEW file; fchmod covers a pre-existing one
+        # (an older build wrote none, but a mode change must not depend on that).
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"mcpServers": servers}, fh)
+        return str(path)
 
     async def _finish_failure_capsule(
         self,

@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import os
 import stat
 from pathlib import Path
 from typing import Any
@@ -552,8 +553,8 @@ def capture_config_state(monkeypatch, sink: dict) -> None:
     while it is live rather than read back afterwards."""
     original = Engine._write_mcp_config
 
-    def spy(self, worker, servers):
-        arg = original(self, worker, servers)
+    def spy(self, worker, turn_id, servers):
+        arg = original(self, worker, turn_id, servers)
         if isinstance(arg, str):
             path = Path(arg)
             sink[worker] = {
@@ -615,18 +616,15 @@ async def test_mcp_config_file_carries_the_policy_at_0600_in_a_0700_dir(
     assert live["dir_mode"] == 0o700
 
 
-async def test_mcp_config_write_tightens_a_pre_existing_loose_file(
+async def test_a_pre_existing_loose_config_dir_is_tightened(
     make_engine, registry, repo, cfg, monkeypatch
 ):
-    """O_CREAT's mode is ignored when the file already exists, and mkdir's mode is
-    ignored when the directory does — a lane whose config was left world-readable by
-    anything else must still end up 0600 in a 0700 dir. This is the one assertion that
-    pins the explicit chmod/fchmod umask-independently."""
+    """mkdir's mode is umask-masked and skipped entirely when the directory already
+    exists, so a dir left at 0755 by anything else must still be tightened. This is the
+    assertion that pins the explicit chmod umask-independently — on a fresh dir under a
+    tight umask (this dev host runs 077) mkdir alone already yields 0700."""
     cfg.mcp_config_dir.mkdir(parents=True)
     cfg.mcp_config_dir.chmod(0o755)
-    loose = cfg.mcp_config_dir / "w1.json"
-    loose.write_text("{}")
-    loose.chmod(0o644)
 
     seen: dict = {}
     capture_config_state(monkeypatch, seen)
@@ -634,11 +632,77 @@ async def test_mcp_config_write_tightens_a_pre_existing_loose_file(
     await engine.spawn("w1", str(repo), granted_policy())
     await terminal_turn(registry, await engine.prompt("w1", "go"))
 
-    live = seen["w1"]
-    assert live["path"] == loose
-    assert live["mode"] == 0o600
-    assert live["dir_mode"] == 0o700
-    assert ECA135_SENTINEL in live["content"]  # it really was rewritten
+    assert seen["w1"]["dir_mode"] == 0o700
+    assert seen["w1"]["mode"] == 0o600
+    assert ECA135_SENTINEL in seen["w1"]["content"]
+
+
+async def test_the_config_mode_does_not_depend_on_the_open_mode(
+    make_engine, registry, repo, monkeypatch
+):
+    """O_EXCL means the file is always brand-new, so O_CREAT's 0600 normally governs and
+    the explicit fchmod is belt-and-braces — for a filesystem that applies inherited
+    ACLs or otherwise ignores the open mode. Simulate one, so the fchmod is pinned by
+    something rather than carried on faith."""
+    real_open, real_umask = os.open, os.umask
+    monkeypatch.setattr(
+        "worker_supervisor.engine.os.open",
+        lambda path, flags, mode=0o777: real_open(path, flags, 0o666),
+    )
+    # Without this the host umask (077 here) masks the simulated loose mode back down
+    # to 0600 on its own and the assertion below passes with no fchmod at all.
+    old_umask = os.umask(0)
+    monkeypatch.setattr(os, "umask", lambda m: old_umask)  # keep pytest teardown honest
+    seen: dict = {}
+    capture_config_state(monkeypatch, seen)
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    try:
+        await terminal_turn(registry, await engine.prompt("w1", "go"))
+    finally:
+        real_umask(old_umask)
+
+    assert seen["w1"]["mode"] == 0o600
+
+
+@pytest.mark.parametrize("link", ["symlink", "hardlink"])
+async def test_a_pre_planted_link_never_receives_the_credential(
+    make_engine, registry, repo, cfg, tmp_path, monkeypatch, link
+):
+    """The round-1 fix used a derived (therefore predictable) filename, and O_NOFOLLOW
+    rejects symlinks while saying nothing about HARD links — a hard link planted at that
+    path took the whole credential write: O_TRUNC destroying the target, fchmod setting
+    it 0600, and the credential surviving at the attacker's path even after the turn-end
+    unlink, which removes the link and not the inode.
+
+    Two changes kill the class outright rather than by enumerating link types: the
+    filename carries a random component (so it cannot be predicted), and the open is
+    O_EXCL after a purge (so the daemon never opens an inode it did not just create).
+    Whatever was planted is unlinked as a leftover, which for a link removes the LINK,
+    never the victim."""
+    victim = tmp_path / "victim.json"
+    victim.write_text('{"operator": "config"}')
+    victim.chmod(0o644)
+    cfg.mcp_config_dir.mkdir(parents=True)
+    monkeypatch.setattr(
+        "worker_supervisor.engine.secrets.token_hex", lambda n: "deadbeefdeadbeef"
+    )
+    # The turn id is assigned by the registry, so plant across the plausible range.
+    for tid in range(1, 6):
+        planted = cfg.mcp_config_dir / f"w1-{tid}-deadbeefdeadbeef.json"
+        if link == "symlink":
+            planted.symlink_to(victim)
+        else:
+            os.link(victim, planted)
+
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    turn = await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert turn["state"] == "done"
+    assert victim.read_text() == '{"operator": "config"}', "the victim was written!"
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644, "the victim was chmod'd!"
+    assert ECA135_SENTINEL not in victim.read_text()
 
 
 async def test_lane_without_an_mcp_grant_is_byte_for_byte_unchanged(
@@ -664,9 +728,9 @@ async def test_retry_ladder_writes_the_config_once(
     writes: list[str] = []
     original = Engine._write_mcp_config
 
-    def counting(self, worker, servers):
+    def counting(self, worker, turn_id, servers):
         writes.append(worker)
-        return original(self, worker, servers)
+        return original(self, worker, turn_id, servers)
 
     monkeypatch.setattr(Engine, "_write_mcp_config", counting)
 
@@ -690,8 +754,8 @@ async def test_remove_sweeps_a_config_file_left_by_a_crashed_daemon(
     await engine.spawn("w1", str(repo), granted_policy())
     await terminal_turn(registry, await engine.prompt("w1", "go"))
 
-    orphan = cfg.mcp_config_dir / "w1.json"
-    assert not orphan.exists(), "the turn-end unlink should already have removed it"
+    orphan = cfg.mcp_config_dir / "w1-99-deadbeefdeadbeef.json"
+    assert not list(cfg.mcp_config_dir.iterdir()), "the turn-end purge should have run"
     orphan.write_text('{"mcpServers": {}}')  # simulate the crash leftover
 
     await engine.kill("w1")
@@ -719,7 +783,7 @@ async def test_strict_mcp_config_still_rides_with_the_grant(
 
 
 async def test_two_lanes_get_separate_files_and_remove_is_surgical(
-    make_engine, registry, repo, cfg
+    make_engine, registry, repo, cfg, monkeypatch
 ):
     """Cross-lane isolation of the FILES was pinned only incidentally, by another test
     hardcoding 'w1.json' — and cross-lane is the whole subject of ECA-135.
@@ -728,8 +792,10 @@ async def test_two_lanes_get_separate_files_and_remove_is_surgical(
     uid, so lane B can still read lane A's file. This asserts that the daemon keeps
     them SEPARATE and that removing one leaves the other, not that the OS keeps them
     apart. It does not."""
+    seen: dict = {}
+    capture_config_state(monkeypatch, seen)
     engine, calls = make_engine([[r("s1")], [r("s2")]])
-    a_policy = granted_policy()
+    a_policy = granted_policy()  # carries ECA135_SENTINEL
     b_policy = WorkerPolicy(
         mcp_servers={"other": {"type": "stdio", "command": "/bin/true"}}
     )
@@ -738,14 +804,13 @@ async def test_two_lanes_get_separate_files_and_remove_is_surgical(
     await terminal_turn(registry, await engine.prompt("lanea", "go"))
     await terminal_turn(registry, await engine.prompt("laneb", "go"))
 
-    a_path = cfg.mcp_config_dir / "lanea.json"
-    b_path = cfg.mcp_config_dir / "laneb.json"
-    assert {Path(c.mcp_servers) for c in calls} == {a_path, b_path}
-
-    # The turn-end unlink means neither survives its turn; re-derive content from the
-    # captured options instead of the (correctly) absent files.
-    assert not a_path.exists() and not b_path.exists()
-    assert calls[0].mcp_servers != calls[1].mcp_servers
+    # CONTENT, not just paths: comparing filenames cannot see the failure that
+    # actually matters here — lane B's file holding lane A's bearer.
+    assert ECA135_SENTINEL in seen["lanea"]["content"]
+    assert ECA135_SENTINEL not in seen["laneb"]["content"]
+    assert json.loads(seen["laneb"]["content"]) == {"mcpServers": b_policy.mcp_servers}
+    assert seen["lanea"]["path"] != seen["laneb"]["path"]
+    assert not seen["lanea"]["path"].exists() and not seen["laneb"]["path"].exists()
 
     await engine.kill("lanea")
     await engine.remove("lanea")
@@ -783,30 +848,15 @@ async def test_mcp_config_write_failure_fails_the_turn_instead_of_wedging_the_la
     assert (await registry.get_worker("w1"))["status"] == "idle"
     assert [e for e in events.read("w1") if e["event"] == "turn_error"]
     assert list(cfg.capsules_dir.glob("w1-turn*.json")), "failure capsule missing"
-
-
-async def test_a_symlinked_config_path_is_refused_not_followed(
-    make_engine, registry, repo, cfg, tmp_path
-):
-    """Without O_NOFOLLOW the daemon becomes a deputy for truncate+chmod on whatever a
-    pre-planted symlink points at. Same-uid, so not a privilege boundary — but the
-    daemon should not be the one doing it."""
-    victim = tmp_path / "victim.json"
-    victim.write_text('{"operator": "config"}')
-    cfg.mcp_config_dir.mkdir(parents=True)
-    (cfg.mcp_config_dir / "w1.json").symlink_to(victim)
-
-    engine, calls = make_engine([[r("s1")]])
-    await engine.spawn("w1", str(repo), granted_policy())
-    turn = await terminal_turn(registry, await engine.prompt("w1", "go"))
-
-    assert turn["state"] == "error"
-    assert victim.read_text() == '{"operator": "config"}', "the victim was written!"
-    assert calls == []
+    # Every assertion above is satisfied BEFORE the loop's finally runs, so without
+    # this one the test passes with the lane's runner dead — which is precisely how
+    # the first fix for this bug reintroduced it one line lower.
+    assert not engine._runners["w1"].done(), "the runner loop died"
 
 
 @pytest.mark.parametrize(
-    "bad", ["../../.claude", "a/b", ".hidden", "..", "", "x" * 65, "na me"]
+    "bad",
+    ["../../.claude", "a/b", ".hidden", "..", "", "x" * 65, "na me", "w1\n", "w1\nx"],
 )
 async def test_spawn_rejects_names_that_are_not_safe_filenames(
     make_engine, repo, bad
@@ -840,6 +890,11 @@ async def test_a_symlinked_config_DIRECTORY_is_refused_not_followed(
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     elsewhere.chmod(0o755)
+    # A victim that MATCHES the purge glob. Without it the target is empty, so a purge
+    # that follows the symlink and a purge that refuses look identical — which is how
+    # the first version of this test missed a confused-deputy unlink.
+    victim = elsewhere / "w1-1-deadbeefdeadbeef.json"
+    victim.write_text('{"operator": "config"}')
     cfg.mcp_config_dir.parent.mkdir(parents=True, exist_ok=True)
     cfg.mcp_config_dir.symlink_to(elsewhere)
 
@@ -848,6 +903,154 @@ async def test_a_symlinked_config_DIRECTORY_is_refused_not_followed(
     turn = await terminal_turn(registry, await engine.prompt("w1", "go"))
 
     assert turn["state"] == "error"
-    assert list(elsewhere.iterdir()) == [], "credentials landed in the symlink target"
+    assert victim.read_text() == '{"operator": "config"}', "the victim was deleted!"
+    assert list(elsewhere.iterdir()) == [victim], "credentials landed in the target"
     assert stat.S_IMODE(elsewhere.stat().st_mode) == 0o755, "target was chmod'd"
     assert calls == []
+
+
+# --- ECA-135 round 3: guards the round-2 tests could not see --------------------
+
+
+async def test_a_failing_turn_end_purge_cannot_kill_the_worker_loop(
+    make_engine, registry, repo, cfg, events, monkeypatch
+):
+    """The purge runs in `_worker_loop`'s finally, BEFORE `_after_turn`. An escape there
+    kills the runner and silently stops all lifecycle chaining — no epoch roll, no
+    restore enqueue, no auto-cycle — while the turn still reports success. That is the
+    same wedge this task fixed at the write site and then reintroduced six lines above
+    it; both reviewers found it independently.
+
+    Make the purge genuinely fail: strip write permission from the config dir once the
+    file is in place, so the unlink gets EACCES."""
+    original = Engine._write_mcp_config
+
+    def write_then_lock_the_dir(self, worker, turn_id, servers):
+        arg = original(self, worker, turn_id, servers)
+        self._cfg.mcp_config_dir.chmod(0o500)  # r-x: unlink now raises EACCES
+        return arg
+
+    monkeypatch.setattr(Engine, "_write_mcp_config", write_then_lock_the_dir)
+
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    turn = await terminal_turn(registry, await engine.prompt("w1", "go"))
+    try:
+        assert turn["state"] == "done"
+
+        # WAIT for the purge to have happened. `terminal_turn` returns as soon as the
+        # turn row is terminal, which _run_turn writes BEFORE the loop's finally — so
+        # asserting on the runner here would be a race, and would pass whether or not
+        # the exception escapes. Waiting on the event is the deterministic form: if the
+        # handler is gone, the exception escapes before the emit and this times out.
+        async def _purge_failed():
+            hits = [
+                e for e in events.read("w1") if e["event"] == "mcp_config_purge_failed"
+            ]
+            return hits or None
+
+        failures = await wait_until(_purge_failed)
+        assert "PermissionError" in failures[0]["error"]
+        assert not engine._runners["w1"].done(), "the runner loop died on cleanup"
+    finally:
+        cfg.mcp_config_dir.chmod(0o700)
+
+
+async def test_a_link_planted_after_the_purge_is_still_refused(
+    make_engine, registry, repo, cfg, tmp_path, monkeypatch
+):
+    """O_EXCL is the last line of defence, and the purge normally clears the path before
+    it — so nothing pins O_EXCL unless the plant lands in the window BETWEEN them. Use
+    the daemon's own `chmod` on the config dir as that seam: it runs after the purge and
+    before the open."""
+    victim = tmp_path / "victim.json"
+    victim.write_text('{"operator": "config"}')
+    monkeypatch.setattr(
+        "worker_supervisor.engine.secrets.token_hex", lambda n: "deadbeefdeadbeef"
+    )
+    real_chmod = Path.chmod
+
+    def chmod_then_plant(self, mode, **kw):
+        real_chmod(self, mode, **kw)
+        if self == cfg.mcp_config_dir:
+            for tid in range(1, 6):
+                target = cfg.mcp_config_dir / f"w1-{tid}-deadbeefdeadbeef.json"
+                if not target.exists():
+                    os.link(victim, target)
+
+    monkeypatch.setattr(Path, "chmod", chmod_then_plant)
+
+    engine, calls = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    turn = await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert turn["state"] == "error"
+    assert "File exists" in turn["error"] or "EEXIST" in turn["error"]
+    assert victim.read_text() == '{"operator": "config"}', "the victim was written!"
+    assert calls == [], "the CLI must never have been spawned"
+
+
+async def test_the_config_filename_is_not_predictable(
+    make_engine, registry, repo, monkeypatch
+):
+    """Unpredictability is what makes pre-planting impossible, so it is a security
+    property and not a detail: a name derived from the worker alone is guessable from
+    `workers status` or the mesh announcement."""
+    paths: list[Path] = []
+    original = Engine._write_mcp_config
+
+    def record(self, worker, turn_id, servers):
+        arg = original(self, worker, turn_id, servers)
+        paths.append(Path(arg))
+        return arg
+
+    monkeypatch.setattr(Engine, "_write_mcp_config", record)
+    engine, calls = make_engine([[r("s1")], [r("s2")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    await terminal_turn(registry, await engine.prompt("w1", "one"))
+    await terminal_turn(registry, await engine.prompt("w1", "two"))
+
+    assert len(paths) == 2
+    tokens = [p.stem.rsplit("-", 1)[-1] for p in paths]
+    assert tokens[0] != tokens[1], "the filename repeats across turns"
+    assert all(len(t) == 16 and set(t) <= set("0123456789abcdef") for t in tokens)
+
+
+async def test_boot_sweeps_credential_files_a_killed_daemon_left_behind(
+    make_engine, registry, repo, cfg
+):
+    """A SIGKILLed daemon runs no `finally`, and an orphan for a lane never prompted
+    again would sit there indefinitely — the permanent exposure this fix exists to
+    avoid. No turn can be in flight at boot, so everything present is an orphan."""
+    engine, _ = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo), granted_policy())
+    cfg.mcp_config_dir.mkdir(parents=True, exist_ok=True)
+    orphan = cfg.mcp_config_dir / "w1-7-deadbeefdeadbeef.json"
+    orphan.write_text('{"mcpServers": {"paid": {"headers": {"x": "leftover"}}}}')
+
+    await engine.start()
+
+    assert not orphan.exists()
+
+
+async def test_purging_a_hostile_persisted_name_cannot_escape_the_directory(
+    make_engine, repo, tmp_path, events
+):
+    """Spawn-time validation does not cover a row persisted BEFORE that validator
+    existed, and `remove`, the turn-end purge and boot recovery all consume a stored
+    name as a path. Hence the guard sits at path derivation, where every consumer passes
+    through — verified here by calling the purge directly with a name `spawn` would now
+    reject."""
+    victim = tmp_path / "outside.json"
+    victim.write_text("operator data")
+
+    engine, _ = make_engine([[r("s1")]])
+    before = set(tmp_path.iterdir())
+    engine._purge_mcp_config("../../outside")  # must not raise, must not delete
+
+    assert victim.exists(), "the purge escaped the config directory"
+    refused = [e for e in events.read("-") if e["event"] == "mcp_config_purge_refused"]
+    assert refused and refused[-1]["lane"] == "../../outside"
+    # ...and the REFUSAL must not itself escape: EventLog names its file after the key
+    # it is given, so emitting under the hostile name would write outside the home.
+    assert set(tmp_path.iterdir()) == before, "the refusal event escaped the directory"

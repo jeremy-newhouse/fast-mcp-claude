@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,7 +39,24 @@ from .registry import Registry, WORKER_GONE
 
 # A worker name is used verbatim as a filename (logs, capsules, and — since ECA-135 —
 # the lane's credential file). Leading char excludes '.', so no dotfiles and no '..'.
-_WORKER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# fullmatch, NOT `$`: `$` also matches before a trailing newline, so "Ultra1\n" would
+# pass and produce a filename with an embedded newline.
+_WORKER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def _require_safe_worker_name(name: str) -> None:
+    """Reject any name that is not a plain filename component.
+
+    Lives at module level and is called from BOTH `spawn` and every path derivation:
+    validating only at spawn leaves the guard at the wrong layer, because `remove`,
+    the turn-end purge and boot recovery all consume a PERSISTED name as a path, and a
+    row written before this validator existed is not covered by it.
+    """
+    if not _WORKER_NAME_RE.fullmatch(name) or ".." in name:
+        raise ValueError(
+            f"invalid worker name {name!r}: must match {_WORKER_NAME_RE.pattern} "
+            "and contain no '..' (the name is used as a filename)"
+        )
 
 # Nominal context window for pressure estimation (tokens). Context size is read
 # from the LAST AssistantMessage's per-request usage; ResultMessage.usage is the
@@ -238,8 +256,27 @@ class Engine:
 
     async def start(self) -> None:
         """Arm runners for every persisted active worker (boot recovery path)."""
+        self._sweep_orphan_mcp_configs()
         for w in await self._reg.list_workers():
             self._ensure_runner(w["name"])
+
+    def _sweep_orphan_mcp_configs(self) -> None:
+        """ECA-135: drop credential files a SIGKILLed daemon left behind.
+
+        The turn-end purge covers every in-process path, but a killed process runs no
+        `finally`, and an orphan for a lane that is never prompted again would sit there
+        indefinitely — the permanent exposure this fix exists to avoid. No turn can be
+        in flight at boot (one daemon per socket), so everything here is an orphan.
+        Never raises: a boot that dies here would take the whole daemon down.
+        """
+        try:
+            d = self._cfg.mcp_config_dir
+            if d.is_symlink():
+                raise OSError(f"{d} is a symlink; refusing to sweep through it")
+            for path in d.glob("*.json"):
+                path.unlink(missing_ok=True)
+        except Exception as e:  # noqa: BLE001 — boot must survive a cleanup failure
+            self._events.emit("-", "mcp_config_sweep_failed", error=f"{type(e).__name__}: {e}")
 
     async def stop(self) -> None:
         for task in [*self._runners.values(), *self._watchdogs]:
@@ -317,11 +354,10 @@ class Engine:
             raise ValueError(
                 f"worker {name!r} is {worker['status']}; kill it before remove"
             )
-        # ECA-135: belt-and-braces. _worker_loop already unlinks at every turn end, so
-        # this only catches a file left by a daemon that died mid-turn. Before
-        # delete_worker: a failure here (path is a directory, dir perms) must not
-        # strand a half-removed worker whose row is already gone.
-        self._mcp_config_path(name).unlink(missing_ok=True)
+        # ECA-135: belt-and-braces. _worker_loop purges at every turn end, so this only
+        # catches a file left by a daemon that died mid-turn. Never raises, so a
+        # cleanup failure cannot make a worker permanently unremovable.
+        self._purge_mcp_config(name)
         await self._reg.delete_worker(name)
         for bookkeeping in (self._runners, self._kicks, self._current):
             bookkeeping.pop(name, None)
@@ -401,13 +437,14 @@ class Engine:
                     raise
                 finally:
                     self._current.pop(name, None)
-                    # ECA-135: the credential file lives exactly as long as the turn
-                    # that needs it. Argv's one virtue was being transient — a file
-                    # that outlived `kill` would have traded a turn-scoped exposure
-                    # for a permanent one, which is a worse deal, not a better one.
-                    # Here (not in _run_turn) because every one of that method's many
-                    # return paths and the kill-cancellation both land in this finally.
-                    self._mcp_config_path(name).unlink(missing_ok=True)
+                    # ECA-135: the credential file lives no longer than the turn that
+                    # needs it, on every in-process path — normal completion, every
+                    # failure-ladder return, kill-cancellation and daemon stop all land
+                    # in this finally. (A SIGKILLed daemon still leaves one; that is
+                    # what the boot sweep in start() is for.) Argv's one virtue was
+                    # being transient, and a file that outlived `kill` would have traded
+                    # a turn-scoped exposure for a permanent one.
+                    self._purge_mcp_config(name)
             await self._after_turn(name, turn["id"])
 
     async def _run_turn(self, name: str, turn_id: int) -> None:
@@ -463,7 +500,7 @@ class Engine:
         # leave the turn `claimed` and the worker `running` forever, with no event and
         # no capsule. Fail the TURN through the normal ladder instead.
         try:
-            mcp_arg = self._write_mcp_config(name, policy.mcp_servers)
+            mcp_arg = self._write_mcp_config(name, turn_id, policy.mcp_servers)
         except OSError as e:
             await self._fail_turn(
                 name, turn_id, TurnOutcome(), f"mcp config write failed: {e}",
@@ -802,11 +839,11 @@ class Engine:
         start with another lane's bearers. That is precisely the cross-lane leak this
         task is about, so it must not be reintroduced by the fix for it.
         """
-        if not _WORKER_NAME_RE.match(name) or ".." in name:
-            raise ValueError(
-                f"invalid worker name {name!r}: must match {_WORKER_NAME_RE.pattern} "
-                "and contain no '..' (the name is used as a filename)"
-            )
+        _require_safe_worker_name(name)
+        # NB: this read-then-insert is a TOCTOU — two concurrent spawns of `Ultra1` and
+        # `ultra1` could both pass. The control surface handles connections in separate
+        # tasks, so it is possible, just unlikely (spawns arrive serially in practice).
+        # A real fix needs a case-insensitive uniqueness constraint in the registry.
         for existing in await self._reg.list_workers(include_gone=True):
             if existing["name"] != name and existing["name"].casefold() == name.casefold():
                 raise ValueError(
@@ -814,10 +851,56 @@ class Engine:
                     f"{existing['name']!r}; they would share one MCP config file"
                 )
 
-    def _mcp_config_path(self, worker: str) -> Path:
-        return self._cfg.mcp_config_dir / f"{worker}.json"
+    def _mcp_config_paths(self, worker: str) -> list[Path]:
+        """Every config file belonging to this worker.
 
-    def _write_mcp_config(self, worker: str, servers: dict[str, Any]) -> str | dict[str, Any]:
+        A glob rather than a derived name because the filename carries a random
+        component (see _write_mcp_config). Validates the name HERE, at the point of
+        path derivation, so every consumer — write, turn-end purge, remove — is covered
+        by one guard rather than relying on spawn-time validation that a row persisted
+        before it existed never passed through.
+        """
+        _require_safe_worker_name(worker)  # no glob metacharacters survive this charset
+        d = self._cfg.mcp_config_dir
+        if d.is_symlink():
+            # The WRITE refuses a symlinked dir; if the purge did not, the guard would
+            # be worse than useless — refusing to create a file there while happily
+            # DELETING whatever is already there. A confused-deputy unlink is strictly
+            # worse than the truncate the write guard exists to prevent.
+            raise OSError(f"{d} is a symlink; refusing to purge MCP configs through it")
+        return sorted(d.glob(f"{worker}-*.json"))
+
+    def _purge_mcp_config(self, worker: str) -> None:
+        """Remove this lane's config file(s). NEVER raises.
+
+        Called from a `finally` and from `remove`, so an escape here would kill the
+        worker's runner loop and skip `_after_turn` — no epoch roll, no restore
+        enqueue, no auto-cycle, no retirement — while the lane still answered prompts.
+        That is exactly the failure this task already fixed once at the write site;
+        `unlink(missing_ok=True)` swallows only FileNotFoundError, so ENOTDIR/EACCES/
+        EPERM (and an invalid persisted name) still escape unless caught here.
+        """
+        try:
+            paths = self._mcp_config_paths(worker)
+        except Exception as e:  # noqa: BLE001 — invalid persisted name, or a symlinked dir
+            # Emitted under the DAEMON key, never the worker's: EventLog derives its
+            # filename from that key, so emitting under a traversing name would trade a
+            # traversal-unlink for a traversal-write. Caught by this method's own test.
+            self._events.emit(
+                "-", "mcp_config_purge_refused",
+                lane=worker, error=f"{type(e).__name__}: {e}",
+            )
+            return
+        try:
+            for path in paths:
+                path.unlink(missing_ok=True)
+        except Exception as e:  # noqa: BLE001 — a cleanup failure must never wedge a lane
+            # `worker` is known-valid here (it survived _mcp_config_paths).
+            self._events.emit(worker, "mcp_config_purge_failed", error=f"{type(e).__name__}: {e}")
+
+    def _write_mcp_config(
+        self, worker: str, turn_id: int, servers: dict[str, Any]
+    ) -> str | dict[str, Any]:
         """ECA-135: hand the CLI a 0600 config FILE PATH, never inline JSON.
 
         The SDK renders a DICT-valued `ClaudeAgentOptions.mcp_servers` into
@@ -842,8 +925,10 @@ class Engine:
         gain, and it is worth having, but "cross-lane" is NOT closed.
         The file is also a WRITE target for any same-uid process, so a lane can in
         principle swap another lane's config between this write and the CLI's read.
-        `_worker_loop` unlinks it as soon as the turn ends so the window stays
-        turn-scoped, matching the property argv had.
+        `_worker_loop` purges it as soon as the turn ends, so the window is turn-scoped
+        on every in-process path. Not quite the property argv had — argv died with the
+        process even on SIGKILL, and a SIGKILLed daemon does leave this file behind
+        until the boot sweep in `start()` clears it.
 
         NOT ADDRESSED HERE, and larger: `state.db` stores every worker's policy —
         credentials verbatim — and is 0644 in a 0755 directory. That copy is durable and
@@ -859,28 +944,39 @@ class Engine:
         """
         if not servers:
             return {}
+        self._purge_mcp_config(worker)  # a retry/restart leftover must not accumulate
         d = self._cfg.mcp_config_dir
         if d.is_symlink():
             # Following it would chmod 0700 and plant credentials in whatever it
             # points at. Same-uid, so not a privilege boundary — but the daemon
-            # should not be the deputy that does it.
+            # should not be the deputy that does it. (Only the final component is
+            # guarded; a symlinked ~/.worker-supervisor itself is not.)
             raise OSError(f"{d} is a symlink; refusing to write MCP config through it")
         d.mkdir(parents=True, exist_ok=True)
         d.chmod(0o700)  # explicit: mkdir's mode is umask-masked and skipped if it exists
-        path = self._mcp_config_path(worker)
-        # O_NOFOLLOW: a pre-planted symlink here would otherwise redirect the write
-        # (and the fchmod) onto an arbitrary path. O_CREAT's mode only applies to a
-        # NEW file, so fchmod covers a pre-existing one too.
+        # The filename is UNPREDICTABLE and the open is exclusive, which together kill
+        # the pre-planting class outright instead of enumerating link types. O_NOFOLLOW
+        # alone did not: it rejects symlinks and says nothing about HARD links, and a
+        # hard link planted at a derived (therefore predictable) path was demonstrated
+        # taking the full credential write — O_TRUNC destroying the target, fchmod
+        # setting it 0600, and the credential surviving at the attacker's path after
+        # the turn-end unlink, which removes the link and not the inode. O_EXCL means
+        # the daemon never opens an inode it did not just create.
+        path = d / f"{worker}-{turn_id}-{secrets.token_hex(8)}.json"
         fd = os.open(
-            path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
         )
         try:
             os.fchmod(fd, 0o600)
-            fh = os.fdopen(fd, "w")
         except BaseException:
-            os.close(fd)  # fdopen never took ownership; don't leak the descriptor
+            os.close(fd)  # nothing owns it yet; don't leak the descriptor
             raise
-        with fh:
+        # fdopen takes ownership here, and closes the fd itself if construction fails —
+        # so it must NOT be inside the handler above, or a failure would double-close a
+        # number another thread may already have been handed.
+        with os.fdopen(fd, "w") as fh:
             json.dump({"mcpServers": servers}, fh)
         return str(path)
 

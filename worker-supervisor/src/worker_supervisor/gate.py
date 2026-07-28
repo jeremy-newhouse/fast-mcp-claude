@@ -69,9 +69,11 @@ class WorkerPolicy:
     # The true boundary is therefore a TRUST one: grant MCP credentials only to a
     # lane you would trust with those credentials directly. The one control that
     # actually narrows this is the tool ceiling — a lane with no arbitrary execution
-    # genuinely cannot reach these paths, since gate._path_escapes pins the
-    # file-taking tools to the repo, and Bash is the deliberate exception. The
-    # shipped evolv-ultra profile grants bare Bash, so those lanes have no such
+    # cannot reach these paths with the BUILT-IN file tools, since _path_escapes pins
+    # them to the repo, and Bash is the deliberate exception. Scoped deliberately:
+    # _path_escapes inspects four key names, so an MCP tool taking a path under some
+    # other key would not be pinned by it (none of the granted servers has one today).
+    # The shipped evolv-ultra profile grants bare Bash, so those lanes have no such
     # narrowing today. Anything stronger needs per-lane OS isolation, which the
     # daemon cannot synthesize from inside the same uid.
     mcp_servers: dict[str, Any] = field(default_factory=dict)

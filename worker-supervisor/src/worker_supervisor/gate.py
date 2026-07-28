@@ -53,6 +53,19 @@ class WorkerPolicy:
     # ClaudeAgentOptions.mcp_servers. Any credential a server needs lives in ITS
     # own env/headers block here, NOT the worker's process env (envbuild's A3
     # scrub stays intact). Empty = no MCP tools for the lane.
+    #
+    # ECA-135 correction — what that does NOT mean. "Not in the worker's process
+    # env" was read as "the worker's own process never handles these credentials".
+    # That is false, and was proven false live on mbpm2 (2026-07-28): the lane runs
+    # as the SAME uid as the daemon, so anything the CLI can read, a lane with
+    # arbitrary command execution can read. Until ECA-135 the whole config sat in
+    # the CLI's argv, one `ps` away for that lane AND for every other lane on the
+    # box; it is now a 0600 file, one `cat` away for that lane only. The true
+    # boundary is therefore a TRUST one, not a containment one: grant MCP
+    # credentials only to a lane you would trust with those credentials directly.
+    # Narrowing it further needs a tool ceiling that withholds arbitrary execution,
+    # or per-lane OS isolation — neither of which the daemon can synthesize from
+    # inside the same uid.
     mcp_servers: dict[str, Any] = field(default_factory=dict)
 
     @classmethod

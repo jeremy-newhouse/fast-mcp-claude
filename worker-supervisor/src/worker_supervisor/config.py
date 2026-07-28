@@ -80,6 +80,16 @@ class Config:
     def capsules_dir(self) -> Path:
         return self.home / "capsules"
 
+    @property
+    def mcp_config_dir(self) -> Path:
+        """Per-lane MCP config files handed to the CLI as a path (ECA-135).
+
+        Credential-bearing: the engine keeps this directory 0700 and each file
+        0600. Distinct from the OPERATOR's own `mcp-configs/` (the source JSON a
+        `workers spawn --mcp-config` reads) — this one is daemon-owned.
+        """
+        return self.home / "mcp"
+
 
 def _i(name: str, default: int) -> int:
     return int(os.environ.get(name, "") or default)

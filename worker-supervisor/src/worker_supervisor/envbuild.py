@@ -13,6 +13,16 @@ remove variables. The structural guarantee therefore has two halves:
    rejected outright, so a spawn can't opt a worker into API billing.
 
 Model auth stays the host's logged-in Claude CLI subscription (A3/G11).
+
+Scope of the A3 guarantee (ECA-135, reaffirmed 2026-07-28). Both halves above are
+about ENV INHERITANCE, and both still hold exactly as written. They say nothing
+about credentials that reach a worker by another route: a lane's per-policy MCP
+grant (ECA-100) is handed to the CLI directly, and the CLI runs as the same uid as
+the lane. Until ECA-135 that meant the granted bearers were in the CLI's argv and
+readable by any lane on the machine; they are now in a 0600 file instead, readable
+by a lane that goes looking. Do not cite the A3 scrub as evidence that a worker
+cannot obtain its own MCP credentials — it is not, and never was, that claim. See
+gate.WorkerPolicy.mcp_servers.
 """
 
 from __future__ import annotations

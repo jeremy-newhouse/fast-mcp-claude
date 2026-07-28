@@ -18,11 +18,12 @@ Scope of the A3 guarantee (ECA-135, reaffirmed 2026-07-28). Both halves above ar
 about ENV INHERITANCE, and both still hold exactly as written. They say nothing
 about credentials that reach a worker by another route: a lane's per-policy MCP
 grant (ECA-100) is handed to the CLI directly, and the CLI runs as the same uid as
-the lane. Until ECA-135 that meant the granted bearers were in the CLI's argv and
-readable by any lane on the machine; they are now in a 0600 file instead, readable
-by a lane that goes looking. Do not cite the A3 scrub as evidence that a worker
-cannot obtain its own MCP credentials — it is not, and never was, that claim. See
-gate.WorkerPolicy.mcp_servers.
+the lane. Until ECA-135 the granted bearers sat in the CLI's argv, readable by any
+lane on the machine; they are now in a turn-scoped 0600 file, still readable by any
+lane on the machine that goes looking, and durably in state.db (0644, ECA-136),
+readable by anyone at all. Do not cite the A3 scrub as evidence that a worker
+cannot obtain its own or another lane's MCP credentials — it is not, and never was,
+that claim. See gate.WorkerPolicy.mcp_servers.
 """
 
 from __future__ import annotations

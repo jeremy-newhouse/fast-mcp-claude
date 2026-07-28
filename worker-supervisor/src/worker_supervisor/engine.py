@@ -36,6 +36,10 @@ from .events import EventLog
 from .gate import QuestionBridge, WorkerPolicy, make_gate, make_question_hook
 from .registry import Registry, WORKER_GONE
 
+# A worker name is used verbatim as a filename (logs, capsules, and — since ECA-135 —
+# the lane's credential file). Leading char excludes '.', so no dotfiles and no '..'.
+_WORKER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
 # Nominal context window for pressure estimation (tokens). Context size is read
 # from the LAST AssistantMessage's per-request usage; ResultMessage.usage is the
 # SUM across the turn's API calls (a 7-call turn reported cache_read 322k > the
@@ -251,6 +255,7 @@ class Engine:
     async def spawn(
         self, name: str, repo: str, policy: WorkerPolicy | None = None
     ) -> dict[str, Any]:
+        await self._validate_worker_name(name)
         repo_path = Path(repo).expanduser().resolve(strict=True)
         if not repo_path.is_dir():
             raise ValueError(f"repo is not a directory: {repo}")
@@ -312,11 +317,12 @@ class Engine:
             raise ValueError(
                 f"worker {name!r} is {worker['status']}; kill it before remove"
             )
-        await self._reg.delete_worker(name)
-        # ECA-135: purge the lane's credential file with the rest of its artifacts.
-        # `kill` deliberately does NOT — a killed row keeps its policy (credentials
-        # included) in state.db, so unlinking there would buy nothing.
+        # ECA-135: belt-and-braces. _worker_loop already unlinks at every turn end, so
+        # this only catches a file left by a daemon that died mid-turn. Before
+        # delete_worker: a failure here (path is a directory, dir perms) must not
+        # strand a half-removed worker whose row is already gone.
         self._mcp_config_path(name).unlink(missing_ok=True)
+        await self._reg.delete_worker(name)
         for bookkeeping in (self._runners, self._kicks, self._current):
             bookkeeping.pop(name, None)
         self._events.emit(name, "worker_removed")
@@ -395,6 +401,13 @@ class Engine:
                     raise
                 finally:
                     self._current.pop(name, None)
+                    # ECA-135: the credential file lives exactly as long as the turn
+                    # that needs it. Argv's one virtue was being transient — a file
+                    # that outlived `kill` would have traded a turn-scoped exposure
+                    # for a permanent one, which is a worse deal, not a better one.
+                    # Here (not in _run_turn) because every one of that method's many
+                    # return paths and the kill-cancellation both land in this finally.
+                    self._mcp_config_path(name).unlink(missing_ok=True)
             await self._after_turn(name, turn["id"])
 
     async def _run_turn(self, name: str, turn_id: int) -> None:
@@ -444,7 +457,19 @@ class Engine:
 
         # ECA-135: written ONCE per turn, before the retry ladder — a retry reuses
         # the same file rather than rewriting the lane's credentials on each attempt.
-        mcp_arg = self._write_mcp_config(name, policy.mcp_servers)
+        # This is the first filesystem touch _run_turn makes before query(), so it is
+        # also the first thing here that can raise OUTSIDE the attempt loop's handlers.
+        # Nothing supervises a runner task, so an escape would kill the lane's loop and
+        # leave the turn `claimed` and the worker `running` forever, with no event and
+        # no capsule. Fail the TURN through the normal ladder instead.
+        try:
+            mcp_arg = self._write_mcp_config(name, policy.mcp_servers)
+        except OSError as e:
+            await self._fail_turn(
+                name, turn_id, TurnOutcome(), f"mcp config write failed: {e}",
+                options_snapshot, deque(), resume_from, policy,
+            )
+            return
 
         attempt = 0
         while True:
@@ -759,6 +784,36 @@ class Engine:
             stderr_tail=list(stderr_tail),
         )
 
+    async def _validate_worker_name(self, name: str) -> None:
+        """ECA-135: a worker name becomes a FILENAME, so it has to be one.
+
+        Names were never validated anywhere — not the CLI, not the control surface,
+        not the registry. That was survivable while every name-derived path was
+        create-or-append (`logs/<name>.jsonl`, capsules). It stopped being survivable
+        when this change started TRUNCATING and UNLINKING a name-derived path: review
+        demonstrated `spawn ../../.claude` overwriting the operator's real
+        `~/.claude.json` — which is where the deploy generator reads live credentials
+        from — and `remove` then deleting it. The caller is an orchestrator LLM driving
+        `workers spawn` over Bash, so the name is not reliably operator-authored text.
+
+        Case-folding is checked too, and for the same reason: APFS is case-insensitive
+        while the registry's TEXT PRIMARY KEY is not, so `Ultra1` and `ultra1` are two
+        distinct workers sharing one credential file — last writer wins, and a lane can
+        start with another lane's bearers. That is precisely the cross-lane leak this
+        task is about, so it must not be reintroduced by the fix for it.
+        """
+        if not _WORKER_NAME_RE.match(name) or ".." in name:
+            raise ValueError(
+                f"invalid worker name {name!r}: must match {_WORKER_NAME_RE.pattern} "
+                "and contain no '..' (the name is used as a filename)"
+            )
+        for existing in await self._reg.list_workers(include_gone=True):
+            if existing["name"] != name and existing["name"].casefold() == name.casefold():
+                raise ValueError(
+                    f"worker name {name!r} collides case-insensitively with "
+                    f"{existing['name']!r}; they would share one MCP config file"
+                )
+
     def _mcp_config_path(self, worker: str) -> Path:
         return self._cfg.mcp_config_dir / f"{worker}.json"
 
@@ -777,29 +832,55 @@ class Engine:
         The SDK's documented str/Path branch passes the value through as a file path
         instead, so no credential ever enters argv.
 
-        What this does NOT do: make the credentials unreachable. The PATH is still in
-        argv and the file is owned by the same uid as the lane, so a lane with
-        arbitrary command execution can still read it deliberately — one `cat` away.
-        It closes the ACCIDENTAL and CROSS-LANE surface (a stray `ps aux` while
-        debugging; an un-granted lane incidentally capturing a granted lane's secrets)
-        and leaves the deliberate one, which is a tool-ceiling / OS-isolation question,
-        not something the daemon can fix from inside the same uid. See the residual
-        recorded on gate.WorkerPolicy.mcp_servers.
+        SCOPE — what this does NOT do (be precise here; the vaguer version of this
+        paragraph was itself a review finding). It does not make the credentials
+        unreachable, and it establishes no boundary BETWEEN lanes: every lane runs as
+        the same uid, so the file is readable by any of them, not just its owner. What
+        changes is the shape of the exposure — from a whole-config blob sitting in the
+        process table, which a stray `ps aux` scoops up by accident, to a named file a
+        lane has to go open on purpose. Accident becomes intent; that is the entire
+        gain, and it is worth having, but "cross-lane" is NOT closed.
+        The file is also a WRITE target for any same-uid process, so a lane can in
+        principle swap another lane's config between this write and the CLI's read.
+        `_worker_loop` unlinks it as soon as the turn ends so the window stays
+        turn-scoped, matching the property argv had.
+
+        NOT ADDRESSED HERE, and larger: `state.db` stores every worker's policy —
+        credentials verbatim — and is 0644 in a 0755 directory. That copy is durable and
+        readable by OTHER uids, which argv never was. Tracked as ECA-136; until it is
+        fixed, this file's 0600 buys nothing against a non-uid-501 reader.
 
         Returns `{}` for an un-granted lane so its options are byte-for-byte what they
         were before this change (and no `--mcp-config` reaches its argv at all).
+
+        Raises OSError on any filesystem failure; the caller must fail the TURN rather
+        than let it escape (an escape kills the worker's runner loop and wedges the lane
+        silently — found in review before it ever shipped).
         """
         if not servers:
             return {}
         d = self._cfg.mcp_config_dir
+        if d.is_symlink():
+            # Following it would chmod 0700 and plant credentials in whatever it
+            # points at. Same-uid, so not a privilege boundary — but the daemon
+            # should not be the deputy that does it.
+            raise OSError(f"{d} is a symlink; refusing to write MCP config through it")
         d.mkdir(parents=True, exist_ok=True)
         d.chmod(0o700)  # explicit: mkdir's mode is umask-masked and skipped if it exists
         path = self._mcp_config_path(worker)
-        # O_CREAT's mode only applies to a NEW file; fchmod covers a pre-existing one
-        # (an older build wrote none, but a mode change must not depend on that).
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as fh:
+        # O_NOFOLLOW: a pre-planted symlink here would otherwise redirect the write
+        # (and the fchmod) onto an arbitrary path. O_CREAT's mode only applies to a
+        # NEW file, so fchmod covers a pre-existing one too.
+        fd = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            fh = os.fdopen(fd, "w")
+        except BaseException:
+            os.close(fd)  # fdopen never took ownership; don't leak the descriptor
+            raise
+        with fh:
             json.dump({"mcpServers": servers}, fh)
         return str(path)
 

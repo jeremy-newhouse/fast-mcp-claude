@@ -268,7 +268,9 @@ class Engine:
             for path in d.glob("*.json"):
                 path.unlink(missing_ok=True)
         except Exception as e:  # noqa: BLE001 — boot must survive a cleanup failure
-            self._events.emit(DAEMON_KEY, "mcp_config_sweep_failed", error=f"{type(e).__name__}: {e}")
+            self._events.emit(
+                DAEMON_KEY, "mcp_config_sweep_failed", error=f"{type(e).__name__}: {e}"
+            )
 
     async def stop(self) -> None:
         for task in [*self._runners.values(), *self._watchdogs]:
@@ -900,10 +902,13 @@ class Engine:
             # Reported under the DAEMON key, never the worker's: EventLog derives its
             # filename from that key, so emitting under a traversing name would trade a
             # traversal-unlink for a traversal-write. Caught by this method's own test.
-            # Since ECA-137 EventLog refuses such a key itself and re-keys the record
-            # here anyway, so this is now belt-and-braces — kept because passing the key
+            # ECA-137 made EventLog refuse such a key itself and re-key the record here
+            # anyway, so this is now belt-and-braces — kept because passing the key
             # explicitly yields a clean record instead of one stamped `log_key_refused`.
-            _tell(DAEMON_KEY, "mcp_config_purge_refused", lane=worker, error=f"{type(e).__name__}: {e}")
+            _tell(
+                DAEMON_KEY, "mcp_config_purge_refused",
+                lane=worker, error=f"{type(e).__name__}: {e}",
+            )
             return
         try:
             for path in paths:

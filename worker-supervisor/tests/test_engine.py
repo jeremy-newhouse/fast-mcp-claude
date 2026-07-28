@@ -1054,3 +1054,90 @@ async def test_purging_a_hostile_persisted_name_cannot_escape_the_directory(
     # ...and the REFUSAL must not itself escape: EventLog names its file after the key
     # it is given, so emitting under the hostile name would write outside the home.
     assert set(tmp_path.iterdir()) == before, "the refusal event escaped the directory"
+
+
+# --- ECA-135 round 4: findings the round-3 suite passed straight through --------
+
+
+async def test_a_hostile_persisted_name_cannot_plant_a_config_outside_the_home(
+    make_engine, registry, repo, tmp_path, cfg
+):
+    """Round 2 fixed the traversal UNLINK; this is the traversal WRITE, which replaced
+    it. `_write_mcp_config` derived its path directly, and the purge on the line above
+    validates but SWALLOWS the refusal by design — so it could never be what protects
+    this path. A row persisted before spawn-time validation existed would plant a
+    credential file outside the supervisor home, where neither the purge nor the boot
+    sweep can ever reach it."""
+    hostile = "../../escaped"
+    await registry.spawn_worker(  # bypasses Engine.spawn, as a legacy row does
+        hostile, str(repo), json.loads(granted_policy().to_json())
+    )
+    cfg.mcp_config_dir.mkdir(parents=True, exist_ok=True)
+
+    engine, calls = make_engine([[r("s1")]])
+    engine._ensure_runner(hostile)
+    turn = await terminal_turn(registry, await engine.prompt(hostile, "go"))
+
+    assert turn["state"] == "error"
+    assert "invalid worker name" in turn["error"]
+    assert calls == [], "the CLI must never have been spawned"
+
+    # No CREDENTIAL-bearing file anywhere outside the config dir. Asserted on content,
+    # not on filenames: this same error path does write a failure CAPSULE through the
+    # hostile name (a pre-existing traversal in capsule.py/events.py, filed separately),
+    # and that capsule carries only the redacted name-list, never a credential — so a
+    # filename-based assertion here would fail on something that is not this defect.
+    outside = cfg.mcp_config_dir.parent.parent
+    leaked = [
+        f for f in outside.rglob("*.json")
+        if cfg.mcp_config_dir not in f.parents and ECA135_SENTINEL in f.read_text()
+    ]
+    assert leaked == [], f"a credential was planted outside the config dir: {leaked}"
+
+
+async def test_purging_one_lane_leaves_a_prefix_named_lanes_config_alone(
+    make_engine, registry, repo, cfg
+):
+    """'-' is the field separator AND a legal name character, so a bare `<worker>-*.json`
+    glob also matches a lane whose name EXTENDS this one. Purging `ultra` would delete
+    `ultra-2`'s live in-flight config, and under strict_mcp_config that lane then runs
+    with zero MCP servers and no error at all — a cross-lane break introduced by the
+    cleanup that exists to prevent cross-lane leakage."""
+    engine, _ = make_engine([[r("s1")]])
+    cfg.mcp_config_dir.mkdir(parents=True, exist_ok=True)
+    mine = cfg.mcp_config_dir / "ultra-1-aaaaaaaaaaaaaaaa.json"
+    theirs = cfg.mcp_config_dir / "ultra-2-1-bbbbbbbbbbbbbbbb.json"
+    mine.write_text("{}")
+    theirs.write_text("{}")
+
+    engine._purge_mcp_config("ultra")
+
+    assert not mine.exists()
+    assert theirs.exists(), "purging 'ultra' deleted lane 'ultra-2's live config"
+
+
+async def test_the_purge_survives_a_failing_event_emit(
+    make_engine, registry, repo, cfg, monkeypatch
+):
+    """`emit` is itself an unguarded file open, so an emit from INSIDE a handler can
+    escape and re-create the wedge this method exists to prevent — the docstring's
+    'NEVER raises' is the load-bearing part of the contract."""
+    engine, _ = make_engine([[r("s1")]])
+    cfg.mcp_config_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        engine._events, "emit", lambda *a, **k: (_ for _ in ()).throw(OSError("logs gone"))
+    )
+
+    engine._purge_mcp_config("../../hostile")  # refusal path -> emit raises
+    engine._purge_mcp_config("w1")  # ordinary path
+
+
+def test_boot_refuses_a_second_daemon_before_touching_the_config_dir():
+    """The sweep deletes every file in the MCP config dir on the premise that no turn can
+    be in flight at boot — a premise the socket preflight is what actually enforces. With
+    the sweep first, a mistakenly-started second instance would delete the LIVE daemon's
+    in-flight credential files before discovering it should not have booted (the
+    2026-07-07 double-daemon incident, now with a destructive action ahead of the check).
+    """
+    source = Path("src/worker_supervisor/__main__.py").read_text()
+    assert source.index("preflight_socket_check") < source.index("await engine.start()")

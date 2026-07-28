@@ -51,17 +51,12 @@ async def _serve() -> None:
     kept = scrub_daemon_env()  # then harden the daemon env (AC-WS-9, Amendment A7)
     _log(f"daemon env scrubbed to minimal base: {', '.join(sorted(kept))}")
 
-    await engine.start()
-    presence = Presence(cfg, registry, events)
-    _log(f"mesh presence: {'enabled' if presence.enabled else 'disabled'}")
-
-    background = [
-        asyncio.create_task(presence.run(), name="presence"),
-        asyncio.create_task(_idle_sweep(engine), name="idle-sweep"),
-    ]
     server = ControlServer(cfg, engine, registry, events)
     # AC#5 (ECA-72): refuse to boot if a live daemon already holds the socket.
     # A second instance would steal it from pm2 silently (real incident 2026-07-07).
+    # BEFORE engine.start(): that arms runners and, since ECA-135, sweeps the MCP config
+    # directory — so a mistakenly-started second instance would delete the LIVE daemon's
+    # in-flight credential files before discovering it should not have booted.
     try:
         await server.preflight_socket_check()
     except SystemExit:
@@ -71,6 +66,15 @@ async def _serve() -> None:
             "stop the existing instance first."
         )
         raise
+
+    await engine.start()
+    presence = Presence(cfg, registry, events)
+    _log(f"mesh presence: {'enabled' if presence.enabled else 'disabled'}")
+
+    background = [
+        asyncio.create_task(presence.run(), name="presence"),
+        asyncio.create_task(_idle_sweep(engine), name="idle-sweep"),
+    ]
     server_task = asyncio.create_task(server.serve_forever(), name="control")
     _log(f"control socket: {cfg.socket_path}")
 

@@ -1055,6 +1055,11 @@ async def test_purging_a_hostile_persisted_name_cannot_escape_the_directory(
     # ...and the REFUSAL must not itself escape: EventLog names its file after the key
     # it is given, so emitting under the hostile name would write outside the home.
     assert set(tmp_path.iterdir()) == before, "the refusal event escaped the directory"
+    # ECA-137: pins that this caller passes the DAEMON KEY deliberately. Since EventLog
+    # now re-keys a refused key itself, emitting under `worker` here would land in the
+    # same file and satisfy every assertion above — mutation-testing found exactly that
+    # mutant surviving. An absent `log_key_refused` is what distinguishes the two.
+    assert "log_key_refused" not in refused[-1]
 
 
 # --- ECA-135 round 4: findings the round-3 suite passed straight through --------
@@ -1083,11 +1088,14 @@ async def test_a_hostile_persisted_name_cannot_plant_a_config_outside_the_home(
     assert "invalid worker name" in turn["error"]
     assert calls == [], "the CLI must never have been spawned"
 
-    # No CREDENTIAL-bearing file anywhere outside the config dir. Asserted on content,
-    # not on filenames: this same error path does write a failure CAPSULE through the
-    # hostile name (a pre-existing traversal in capsule.py/events.py, filed separately),
-    # and that capsule carries only the redacted name-list, never a credential — so a
-    # filename-based assertion here would fail on something that is not this defect.
+    # No CREDENTIAL-bearing file anywhere outside the config dir. Asserted on content
+    # rather than on filenames because when this test was written the same error path
+    # DID write a failure capsule through the hostile name — a separate pre-existing
+    # traversal in capsule.py/events.py, which a filename-based assertion here would
+    # have failed on without being this defect. ECA-137 has since closed that one, so
+    # nothing escapes on this path any more (proved by its own test below); the
+    # content-based assertion is kept because it is the narrower claim, and it is what
+    # this test is actually about.
     outside = cfg.mcp_config_dir.parent.parent
     leaked = [
         f for f in outside.rglob("*.json")
@@ -1165,3 +1173,67 @@ async def test_a_broken_config_dir_is_reported_not_silently_skipped(
 
     refused = [e for e in events.read("-") if e["event"] == "mcp_config_purge_refused"]
     assert refused and "not a directory" in refused[-1]["error"]
+
+
+# --- ECA-137: the two writers ECA-135 left, closed at path derivation ------------
+
+
+async def test_a_hostile_persisted_name_cannot_write_a_log_or_capsule_outside_the_home(
+    make_engine, registry, repo, tmp_path, cfg, events
+):
+    """The escape this task was filed for, end to end.
+
+    ECA-135 validated `Engine.spawn` and the MCP-config path, so no NEW row can carry a
+    hostile name — but `EventLog` and `write_capsule` still derived filenames from a
+    PERSISTED one, and a row written before that validator existed still reaches them.
+    Demonstrated at the time: an ECA-135 test produced a capsule at
+    `<home>/../../escaped-turn1-<ts>.json`.
+
+    Driven with an UNGRANTED policy on purpose. A granted lane fails inside
+    `_write_mcp_config`, whose ECA-135 guard would refuse the name before either of
+    these writers ran — so it could never exercise them. Ungranted, `_write_mcp_config`
+    returns `{}` before validating, the turn runs the full failure ladder, and every
+    event plus the failure capsule is written through the hostile name.
+
+    Asserts on the tree OUTSIDE the home rather than on an exception, because the defect
+    was a file appearing where it should not.
+    """
+    hostile = "../../escaped"
+    await registry.spawn_worker(  # bypasses Engine.spawn, as a legacy row does
+        hostile, str(repo), json.loads(WorkerPolicy().to_json())  # ungranted — see above
+    )
+
+    outside_before = {p for p in tmp_path.rglob("*") if cfg.home not in p.parents}
+    engine, _ = make_engine([RuntimeError("died"), RuntimeError("died again")])
+    engine._ensure_runner(hostile)
+    turn = await terminal_turn(registry, await engine.prompt(hostile, "go"))
+
+    assert turn["state"] == "error"  # the ladder ran; the capsule path was reached
+    outside_after = {p for p in tmp_path.rglob("*") if cfg.home not in p.parents}
+    assert outside_after == outside_before, "a log or capsule escaped the home"
+    assert not (tmp_path / "escaped.jsonl").exists()
+    assert list(tmp_path.glob("escaped-turn*.json")) == []
+
+    # Nothing was silently dropped: the lane's events were re-keyed to the daemon key,
+    # carrying the hostile name in the body as evidence.
+    refused = [e for e in events.read("-") if e.get("log_key_refused")]
+    assert refused, "the hostile lane's events vanished instead of being re-keyed"
+    assert {e["worker"] for e in refused} == {hostile}
+    assert any(e["event"] == "failure_capsule_error" for e in refused)
+
+
+async def test_a_legal_lane_still_gets_its_own_log_and_capsule(
+    make_engine, registry, repo, cfg, events
+):
+    """AC#3 at the engine level: the guard must be invisible to a real lane, and the
+    capsule must still land — a refusal that fired on well-formed names would make this
+    task a regression rather than a fix."""
+    engine, _ = make_engine([RuntimeError("died"), RuntimeError("died again")])
+    await engine.spawn("ultra-2", str(repo))
+    turn = await terminal_turn(registry, await engine.prompt("ultra-2", "go"))
+
+    assert turn["state"] == "error"
+    assert (cfg.logs_dir / "ultra-2.jsonl").exists()
+    assert not any(e.get("log_key_refused") for e in events.read("ultra-2"))
+    capsules = list(cfg.capsules_dir.glob("ultra-2-turn*.json"))
+    assert len(capsules) == 1, f"expected one capsule, got {capsules}"

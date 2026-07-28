@@ -49,7 +49,19 @@ class EventLog:
         return self._dir / f"{worker}.jsonl"
 
     def emit(self, worker: str, event: str, **fields: Any) -> dict[str, Any]:
-        """Append one record. Never raises for a bad key, and never drops the record.
+        """Append one record. A bad KEY never causes a raise, and never drops the record.
+
+        Precisely — the looser wording here was a self-review finding, so keep it exact:
+        a refused key is not a raise, but this method is NOT exception-free and was never
+        meant to be. Once re-keyed it does the same `os.open` + write as any legal key, so
+        every I/O failure still propagates: a symlinked or directory-shaped `-.jsonl`
+        (O_NOFOLLOW/EISDIR), an unwritable `logs/`, ENOSPC, or a field whose `str()` throws
+        under `json.dumps(default=str)`. Probed, not assumed. That surface is IDENTICAL to
+        the one a legal lane already has on its own log file, which is why the guard adds
+        no new wedge class — with one honest caveat: re-keying concentrates every refused
+        write onto `-.jsonl`, so a hostile-named lane now depends on THAT file's health
+        rather than on the traversal path it used to write. `Engine._purge_mcp_config`
+        wraps its emits for exactly this reason.
 
         ECA-137. `emit` is the one method here that must not propagate the refusal.
         It is called from 28 sites in the engine, several of them INSIDE failure

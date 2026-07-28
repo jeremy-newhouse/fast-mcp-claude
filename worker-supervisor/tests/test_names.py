@@ -217,6 +217,30 @@ def test_emit_never_raises_for_a_hostile_key(cfg):
     assert log.emit("../../escaped", "turn_error", error="x")["log_key_refused"] is True
 
 
+def test_emit_still_propagates_an_IO_failure_on_the_re_keyed_write(cfg, tmp_path):
+    """The BOUNDARY of the never-raises promise, pinned so nobody widens it into a
+    silent swallow.
+
+    A refused key is not a raise; a broken `-.jsonl` still is, exactly as a broken
+    `w1.jsonl` is for a legal lane. Asserted with the daemon log shaped as a DIRECTORY
+    because that is unambiguous — `O_NOFOLLOW` on a symlink and EACCES on a read-only
+    directory reach the same place. Swallowing this instead would hide a genuinely broken
+    log directory, which is the opposite of what the re-keying is for: keeping the
+    evidence that a hostile name reached a writer.
+    """
+    log = EventLog(cfg.logs_dir)
+    (cfg.logs_dir / f"{DAEMON_KEY}.jsonl").mkdir()
+
+    with pytest.raises(OSError):
+        log.emit("../../escaped", "turn_start")
+
+    # ...and a legal lane hits the identical surface on its own file, which is the point:
+    # the guard introduces no failure mode that did not already exist.
+    (cfg.logs_dir / "w1.jsonl").mkdir()
+    with pytest.raises(OSError):
+        log.emit("w1", "turn_start")
+
+
 def test_a_caller_field_cannot_mask_the_refusal_stamp(cfg):
     log = EventLog(cfg.logs_dir)
     record = log.emit("../../escaped", "turn_start", log_key_refused=False)

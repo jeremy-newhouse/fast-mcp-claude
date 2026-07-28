@@ -36,6 +36,16 @@ async def _call(verb: str, args: dict[str, Any], *, stream: bool = False) -> int
                     break
                 sys.stdout.write(line.decode())
                 sys.stdout.flush()
+                # ECA-139: a streaming verb can also carry ONE error object instead of
+                # records, and it must not exit 0. Before this, `attach` with a refused
+                # name printed nothing and exited 0 — indistinguishable from an idle
+                # lane, which is what let the defect sit unnoticed on two live hosts.
+                # Records never contain "ok"; only the error reply does.
+                try:
+                    if json.loads(line).get("ok") is False:
+                        code = 1
+                except (json.JSONDecodeError, AttributeError):
+                    pass  # a malformed or non-object line is still just output
         else:
             line = await reader.readline()
             resp = json.loads(line) if line else {"ok": False, "error": "no response"}

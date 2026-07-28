@@ -14,8 +14,11 @@ lowest-level writers can hold the same guard as the engine.
 
 Two predicates, not one, and the difference is load-bearing:
 
-* `require_safe_worker_name` — for a real lane. Unchanged from ECA-135, message and
-  all, because its wording is asserted by tests and read by operators.
+* `require_safe_worker_name` — for a real lane. Its MESSAGE is byte-identical to
+  ECA-135's, because operators read it and tests assert on it. Its BEHAVIOUR is not
+  quite unchanged, and saying "unchanged" was a review finding: a non-str argument used
+  to raise TypeError out of `re.fullmatch` and now raises ValueError. That is deliberate
+  and load-bearing (see `is_safe_worker_name`), not an accident of the move.
 * `require_safe_log_key` — for an EventLog key, which is a SUPERSET: the daemon owns
   two streams of its own, `RESERVED_LOG_KEYS`, and NEITHER satisfies the worker-name
   pattern (which requires an alphanumeric first character). Validating an event key
@@ -44,10 +47,16 @@ WORKER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # `_supervisor` is live on both supervisor hosts and was very nearly a regression here:
 # the first version of this guard admitted only DAEMON_KEY, which would have refused
 # `presence.py`'s three announce-loop emits, stopped appending to the existing
-# `logs/_supervisor.jsonl`, and made `workers events --name _supervisor` raise. The whole
-# 209-test suite stayed green through that, because nothing covered a presence emit — the
-# same shape as ECA-136's finding that no test proved the daemon ever CALLED harden_home.
-# Found by listing the live logs/ directories, not by reasoning about the code.
+# `logs/_supervisor.jsonl`, and made `workers events _supervisor` raise. The ENTIRE suite
+# stayed green through that (no count given on purpose — three different numbers were
+# quoted for the same moment in review), because nothing covered a presence emit: the same
+# shape as ECA-136's finding that no test proved the daemon ever CALLED harden_home. Found
+# by listing the live logs/ directories, not by reasoning about the code.
+#
+# The two keys are NOT symmetric on disk, which review caught being overstated elsewhere:
+# `_supervisor.jsonl` exists on both hosts and is written every announce beat, while
+# `-.jsonl` exists on NEITHER — `mcp_config_purge_refused`/`mcp_config_sweep_failed` have
+# never fired in production, so the first refused emit will create it.
 DAEMON_KEY = "-"
 SUPERVISOR_STREAM = "_supervisor"
 RESERVED_LOG_KEYS = frozenset({DAEMON_KEY, SUPERVISOR_STREAM})

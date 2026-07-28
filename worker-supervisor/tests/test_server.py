@@ -332,3 +332,124 @@ def test_redact_worker_row_handles_every_policy_shape():
     for not_an_object in ("[1, 2]", '"a string"', "123", "true", "null"):
         assert redact_worker_row({"name": "w", "policy": not_an_object})["policy"] is None
     assert redact_worker_row({"name": "w", "policy": 123})["policy"] is None
+
+
+# --- ECA-139: the `attach` verb's own error path ---------------------------------
+#
+# The gap that let ECA-137 ship a live regression: every test above reaches the control
+# surface through `_dispatch`, and `attach` is dispatched in `_handle` BEFORE the
+# try/except that wraps `_dispatch` — so no existing test could observe it. These go over
+# a REAL unix socket through `_handle`, which is the only way to see what a client gets.
+
+
+async def _serve(control, sock_path: Path):
+    """Run the real _handle over a real socket; yields nothing, cancel to stop."""
+    server = await asyncio.start_unix_server(control._handle, path=str(sock_path))
+    return server
+
+
+async def _round_trip(sock_path: Path, verb: str, args: dict, *, limit: int = 1):
+    """Send one request, read up to `limit` lines, return them decoded."""
+    reader, writer = await asyncio.open_unix_connection(str(sock_path))
+    writer.write((json.dumps({"verb": verb, "args": args}) + "\n").encode())
+    await writer.drain()
+    lines = []
+    try:
+        for _ in range(limit):
+            line = await asyncio.wait_for(reader.readline(), timeout=3.0)
+            if not line:
+                break
+            lines.append(line.decode())
+    finally:
+        writer.close()
+    return lines
+
+
+@pytest.fixture
+def sock():
+    d = Path(tempfile.mkdtemp(dir="/tmp"))  # macOS sun_path is capped at 104 bytes
+    yield d / "s.sock"
+    shutil.rmtree(d, ignore_errors=True)
+
+
+async def test_attach_with_a_refused_name_replies_with_an_error_not_a_silent_eof(
+    control, sock
+):
+    """ECA-139. `EventLog.follow` raises ValueError for a refused key (ECA-137), and
+    `_attach` caught only three connection exceptions — so the raise escaped into
+    asyncio's client_connected_cb, the client saw EOF with NO error line and exited 0,
+    and the daemon logged a traceback on every attempt.
+
+    Asserts the CLIENT-VISIBLE bytes, because that is what was wrong: the guard worked
+    perfectly and the operator could not tell.
+    """
+    server = await _serve(control, sock)
+    try:
+        lines = await _round_trip(sock, "attach", {"name": "../../escaped"})
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert lines, "attach returned a silent EOF — the ECA-139 regression"
+    reply = json.loads(lines[0])
+    assert reply["ok"] is False
+    assert "invalid event log key" in reply["error"]
+
+
+async def test_attach_error_does_not_escape_into_the_asyncio_callback(control, sock):
+    """The other half, and the reason a reply alone is not enough: an unhandled exception
+    in `client_connected_cb` is what put a five-frame traceback in the pm2 log on every
+    attempt — which in this fleet reads as 'the supervisor is broken' and invites a
+    restart that tears down in-flight lane turns.
+    """
+    caught: list[BaseException] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, ctx: caught.append(ctx.get("exception")))
+
+    server = await _serve(control, sock)
+    try:
+        await _round_trip(sock, "attach", {"name": "../../escaped"})
+        await asyncio.sleep(0.05)  # let any stray callback fire
+    finally:
+        server.close()
+        await server.wait_closed()
+        loop.set_exception_handler(previous)
+
+    assert [e for e in caught if isinstance(e, ValueError)] == []
+
+
+async def test_attach_on_a_legal_name_still_streams_records(control, sock, repo):
+    """AC#3: the fix must not turn a working tail into an error. Emits AFTER the client
+    attaches, because `follow` deliberately starts at end-of-file."""
+    await _spawn_probe(control, repo)
+    server = await _serve(control, sock)
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock))
+        writer.write((json.dumps({"verb": "attach", "args": {"name": "probe"}}) + "\n").encode())
+        await writer.drain()
+        await asyncio.sleep(0.1)  # let follow() reach its poll loop
+        control._events.emit("probe", "eca139_probe_event", n=1)
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        writer.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    record = json.loads(line)
+    assert record["event"] == "eca139_probe_event"
+    assert "ok" not in record, "a record must be distinguishable from an error reply"
+
+
+async def test_the_events_verb_still_returns_a_clean_json_error(control, sock):
+    """Pins the contrast that made the regression diagnosable: `events` goes through
+    `_dispatch` and was always fine; only `attach` bypassed the wrapper."""
+    server = await _serve(control, sock)
+    try:
+        lines = await _round_trip(sock, "events", {"name": "../../escaped"})
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    reply = json.loads(lines[0])
+    assert reply["ok"] is False and "invalid event log key" in reply["error"]

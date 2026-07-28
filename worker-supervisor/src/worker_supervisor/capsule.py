@@ -40,7 +40,11 @@ def write_capsule(
     `failure_capsule_error`.
     """
     capsules_dir.mkdir(parents=True, exist_ok=True)
-    capsules_dir.chmod(0o700)  # explicit: umask-masked, and skipped if it exists
+    # Explicit: umask-masked, and not applied at all if the directory exists. Not
+    # through a symlink though — Path.chmod follows one, and hardening.harden_home
+    # deliberately refuses to chmod a link's target; these two must not disagree.
+    if not capsules_dir.is_symlink():
+        capsules_dir.chmod(0o700)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = capsules_dir / f"{worker}-turn{turn.get('id')}-{ts}.json"
     payload = {

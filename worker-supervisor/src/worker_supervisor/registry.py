@@ -113,19 +113,17 @@ class Registry:
     async def connect(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self._path)
-        # ECA-136: this file holds every worker's policy — granted MCP credentials
+        # ECA-136: state.db holds every worker's policy — granted MCP credentials
         # verbatim — and aiosqlite.connect() just created it at the umask's 0644.
-        # Placed on the very next line to keep the window where it exists world-
-        # readable as short as possible; that window is why hardening.harden_home()
-        # runs first and is the real guarantee for an existing install.
+        # Tightening happens in _tighten_db_files() below rather than here.
         #
-        # The -wal/-shm sidecars need no chmod of their own on a FRESH database:
-        # SQLite gives a newly created sidecar the mode of the main db file rather
-        # than a umask-derived one (verified in both directions), and the reclaim
-        # below recreates them after this chmod anyway. An ALREADY-EXISTING loose
-        # sidecar is NOT retroactively fixed by any of that — harden_home() is what
-        # covers it, which is the other reason it has to run before this method.
-        self._path.chmod(0o600)
+        # There WAS a `self._path.chmod(0o600)` on this line, to narrow the window
+        # where the file exists world-readable. It was removed: it was redundant
+        # with _tighten_db_files() (no mutation of it could be made to fail a test,
+        # which is how it got a second look), and worse, `Path.chmod` FOLLOWS
+        # symlinks — so with a symlinked state.db it chmod'd the link's target,
+        # which is precisely the thing every other path in this change refuses to
+        # do. The window it closed is bounded by the home being 0700 anyway.
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
         # ECA-136: without this, a deleted worker's policy survives verbatim in
@@ -140,23 +138,44 @@ class Registry:
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
+        # The first write is what creates -wal/-shm, so they only exist now. Chmod
+        # them EXPLICITLY rather than relying on SQLite copying the main db's mode:
+        # that inheritance is real, but it holds only for a sidecar created AFTER the
+        # db was already tightened, and review showed the reclaim does NOT recreate
+        # them (inodes are unchanged across it), so an earlier version's reasoning —
+        # 'the reclaim recreates them anyway' — was simply false. Three explicit
+        # chmods cost nothing and depend on no ordering at all.
+        self._tighten_db_files()
         await self._reclaim_freed_pages()
 
-    async def _checkpoint_truncate(self) -> None:
-        """wal_checkpoint RETURNS A ROW, and an unconsumed cursor leaves a statement
-        in progress on a connection this daemon then holds open for its whole uptime.
+    def _tighten_db_files(self) -> None:
+        """0600 on state.db and both sidecars, whichever currently exist."""
+        p = self._path
+        for f in (p, p.parent / f"{p.name}-wal", p.parent / f"{p.name}-shm"):
+            if f.exists() and not f.is_symlink():
+                f.chmod(0o600)
 
-        Consuming it is DEFENSIVE, and honestly so: with the current statement order
-        (VACUUM first, this last) nothing follows that would trip over the open
-        statement, so no test in the suite fails if the `async with` is dropped —
-        mutation testing confirms that survivor rather than hiding it. It is kept
-        because it was load-bearing until very recently and failed loudly when it
-        was: while a checkpoint still ran BEFORE the VACUUM, the unconsumed cursor
-        made VACUUM raise 'cannot VACUUM - SQL statements in progress', which
-        surfaced as the whole daemon hanging at boot rather than as an error.
+    async def _checkpoint_truncate(self, *, strict: bool = True) -> None:
+        """Move the WAL's pages into the main db and truncate it to zero.
+
+        This is what makes a delete actually take effect on disk: see delete_worker.
+
+        The cursor is consumed because wal_checkpoint RETURNS A ROW, and an
+        unconsumed one leaves a statement in progress on a connection this daemon
+        holds open for its whole uptime. That was load-bearing until recently and
+        failed loudly when it was: while a checkpoint still ran BEFORE the VACUUM,
+        the unconsumed cursor made VACUUM raise 'cannot VACUUM - SQL statements in
+        progress', which surfaced as the daemon hanging at boot rather than erroring.
+
+        strict=False swallows a checkpoint failure (a busy WAL, say). Use it where
+        the checkpoint is hygiene for an operation whose OWN result must still stand.
         """
-        async with self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)") as cur:
-            await cur.fetchall()
+        try:
+            async with self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)") as cur:
+                await cur.fetchall()
+        except sqlite3.Error:
+            if strict:
+                raise
 
     async def _reclaim_freed_pages(self) -> None:
         """One-shot: scrub credentials already sitting in freed pages (ECA-136).
@@ -269,6 +288,14 @@ class Registry:
         await self.db.execute("DELETE FROM epochs WHERE worker = ?", (name,))
         await self.db.execute("DELETE FROM workers WHERE name = ?", (name,))
         await self.db.commit()
+        # ECA-136: secure_delete zeroes the freed cell in the NEW page image, which in
+        # WAL mode is written to state.db-wal — the PRE-delete image, credentials and
+        # all, stays in that file until a checkpoint moves it. This daemon holds its
+        # connection open for its entire uptime, so nothing would checkpoint it for
+        # hours: measured 900 sentinel occurrences still in the -wal AFTER deleting
+        # every worker. Revoking a grant has to actually revoke it, so checkpoint here.
+        # Non-fatal: a busy checkpoint must not fail the removal the caller asked for.
+        await self._checkpoint_truncate(strict=False)
         return True
 
     # -- epochs ---------------------------------------------------------------

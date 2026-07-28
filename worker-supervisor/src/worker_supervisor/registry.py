@@ -12,6 +12,7 @@ Discipline (lifted from eCA state.py / jobs.py, generalized):
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -104,15 +105,99 @@ class Registry:
     def __init__(self, db_path: Path) -> None:
         self._path = db_path
         self._db: aiosqlite.Connection | None = None
+        # ECA-136: set when the one-shot freed-page reclaim failed. Non-fatal by
+        # design, but the caller must LOG it — a silent failure would leave old
+        # credentials in the file while the boot looked clean.
+        self.reclaim_error: str | None = None
 
     async def connect(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self._path)
+        # ECA-136: this file holds every worker's policy — granted MCP credentials
+        # verbatim — and aiosqlite.connect() just created it at the umask's 0644.
+        # Placed on the very next line to keep the window where it exists world-
+        # readable as short as possible; that window is why hardening.harden_home()
+        # runs first and is the real guarantee for an existing install.
+        #
+        # The -wal/-shm sidecars need no chmod of their own on a FRESH database:
+        # SQLite gives a newly created sidecar the mode of the main db file rather
+        # than a umask-derived one (verified in both directions), and the reclaim
+        # below recreates them after this chmod anyway. An ALREADY-EXISTING loose
+        # sidecar is NOT retroactively fixed by any of that — harden_home() is what
+        # covers it, which is the other reason it has to run before this method.
+        self._path.chmod(0o600)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
+        # ECA-136: without this, a deleted worker's policy survives verbatim in
+        # freed pages — confirmed on both live hosts, where credential-shaped bytes
+        # for revoked grants are recoverable by `grep` alone with no SQL access.
+        # ON, not FAST: FAST deliberately leaves freelist pages unzeroed. The
+        # setting lives on the CONNECTION and is never persisted in the file, so it
+        # must be re-issued every boot. FOOTGUN: verifying this with the system
+        # /usr/bin/sqlite3 gives a falsely reassuring answer — that build defaults
+        # secure_delete to 2 (FAST) while the daemon's own venv sqlite defaults to 0.
+        await self._db.execute("PRAGMA secure_delete=ON")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
+        await self._reclaim_freed_pages()
+
+    async def _checkpoint_truncate(self) -> None:
+        """wal_checkpoint RETURNS A ROW, and an unconsumed cursor leaves a statement
+        in progress on a connection this daemon then holds open for its whole uptime.
+
+        Consuming it is DEFENSIVE, and honestly so: with the current statement order
+        (VACUUM first, this last) nothing follows that would trip over the open
+        statement, so no test in the suite fails if the `async with` is dropped —
+        mutation testing confirms that survivor rather than hiding it. It is kept
+        because it was load-bearing until very recently and failed loudly when it
+        was: while a checkpoint still ran BEFORE the VACUUM, the unconsumed cursor
+        made VACUUM raise 'cannot VACUUM - SQL statements in progress', which
+        surfaced as the whole daemon hanging at boot rather than as an error.
+        """
+        async with self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)") as cur:
+            await cur.fetchall()
+
+    async def _reclaim_freed_pages(self) -> None:
+        """One-shot: scrub credentials already sitting in freed pages (ECA-136).
+
+        secure_delete only zeroes pages freed AFTER it is set, so it does nothing
+        about what a live install already carries. This runs once, guarded by
+        user_version, and is the half of the fix that reaches existing data.
+
+        VACUUM, then checkpoint — and the checkpoint is the part that is easy to
+        drop. VACUUM's rebuilt output lands in the WAL first, so after VACUUM alone
+        the logical database is clean while the .db file on disk still holds every
+        old page, for as long as the connection stays open. For this daemon that is
+        its entire uptime. (A CLOSING connection checkpoints anyway, which is why a
+        test asserting after close() passes with the checkpoint deleted — assert
+        while the connection is open, as test_hardening.py does.)
+
+        There is deliberately NO checkpoint BEFORE the VACUUM. One was written and
+        then removed: it changes nothing, including in the case it looks like it
+        should cover — a SIGKILL'd daemon leaving a 160KB populated -wal at boot
+        still reclaims to zero without it (measured, both ways). Don't add it back.
+
+        VACUUM preserves the file's inode, mode and user_version, so the 0600 set
+        in connect() survives.
+
+        Never fatal. This is a one-shot remediation, not a boot requirement: a
+        failure here records itself in `reclaim_error` for the caller to log and
+        leaves user_version at 0 so the NEXT boot retries, rather than refusing to
+        start a daemon whose lanes are otherwise fine. VACUUM is atomic, so a
+        failure part-way cannot leave a half-rebuilt file.
+        """
+        async with self._db.execute("PRAGMA user_version") as cur:
+            row = await cur.fetchone()
+        if row is not None and row[0]:
+            return
+        try:
+            await self._db.execute("VACUUM")
+            await self._checkpoint_truncate()
+            await self._db.execute("PRAGMA user_version=1")
+            await self._db.commit()
+        except sqlite3.Error as e:
+            self.reclaim_error = f"{type(e).__name__}: {e}"
 
     async def close(self) -> None:
         if self._db is not None:

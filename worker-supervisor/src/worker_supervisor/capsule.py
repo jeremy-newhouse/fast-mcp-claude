@@ -28,8 +28,14 @@ def write_capsule(
     stderr_tail: list[str],
     resume_chain: list[str | None],
 ) -> Path:
-    """Write one capsule file; returns its path. Never raises past logging needs —
-    callers treat capsule failure as non-fatal (the registry row still records why).
+    """Write one capsule file; returns its path.
+
+    Raises ValueError for an unsafe `worker` (ECA-137) and OSError for a filesystem
+    failure. Neither is fatal to a turn: callers treat capsule failure as non-fatal (the
+    registry row still records why the turn failed). The summary line here used to read
+    "never raises past logging needs", which stopped being true the moment the name was
+    validated — corrected rather than left to mislead the next reader into removing a
+    caller's handler.
 
     ECA-137: the filename is derived from `worker`, so the name is validated FIRST,
     before any directory is created or any file opened. Raising is the right refusal

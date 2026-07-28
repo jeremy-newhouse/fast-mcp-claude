@@ -501,7 +501,7 @@ class Engine:
         # no capsule. Fail the TURN through the normal ladder instead.
         try:
             mcp_arg = self._write_mcp_config(name, turn_id, policy.mcp_servers)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             await self._fail_turn(
                 name, turn_id, TurnOutcome(), f"mcp config write failed: {e}",
                 options_snapshot, deque(), resume_from, policy,
@@ -861,6 +861,12 @@ class Engine:
         before it existed never passed through.
         """
         _require_safe_worker_name(worker)  # no glob metacharacters survive this charset
+        # '-' is the field separator AND a legal name character, so a bare
+        # `<worker>-*.json` glob matches a DIFFERENT lane whose name extends this one:
+        # purging `ultra` would delete `ultra-2`'s live, in-flight config, and with
+        # strict_mcp_config that lane then runs with zero servers and no error. Match
+        # the full shape instead of trusting the prefix.
+        mine = re.compile(rf"{re.escape(worker)}-\d+-[0-9a-f]{{16}}\.json")
         d = self._cfg.mcp_config_dir
         if d.is_symlink():
             # The WRITE refuses a symlinked dir; if the purge did not, the guard would
@@ -868,7 +874,7 @@ class Engine:
             # DELETING whatever is already there. A confused-deputy unlink is strictly
             # worse than the truncate the write guard exists to prevent.
             raise OSError(f"{d} is a symlink; refusing to purge MCP configs through it")
-        return sorted(d.glob(f"{worker}-*.json"))
+        return sorted(p for p in d.glob(f"{worker}-*.json") if mine.fullmatch(p.name))
 
     def _purge_mcp_config(self, worker: str) -> None:
         """Remove this lane's config file(s). NEVER raises.
@@ -880,23 +886,28 @@ class Engine:
         `unlink(missing_ok=True)` swallows only FileNotFoundError, so ENOTDIR/EACCES/
         EPERM (and an invalid persisted name) still escape unless caught here.
         """
+        def _tell(key: str, event: str, **fields: Any) -> None:
+            # emit() is itself an unguarded file open, so an emit from inside a handler
+            # can escape and re-create the very wedge this method exists to prevent.
+            try:
+                self._events.emit(key, event, **fields)
+            except Exception:  # noqa: BLE001 — reporting a cleanup failure cannot fail loudly
+                pass
+
         try:
             paths = self._mcp_config_paths(worker)
         except Exception as e:  # noqa: BLE001 — invalid persisted name, or a symlinked dir
-            # Emitted under the DAEMON key, never the worker's: EventLog derives its
+            # Reported under the DAEMON key, never the worker's: EventLog derives its
             # filename from that key, so emitting under a traversing name would trade a
             # traversal-unlink for a traversal-write. Caught by this method's own test.
-            self._events.emit(
-                "-", "mcp_config_purge_refused",
-                lane=worker, error=f"{type(e).__name__}: {e}",
-            )
+            _tell("-", "mcp_config_purge_refused", lane=worker, error=f"{type(e).__name__}: {e}")
             return
         try:
             for path in paths:
                 path.unlink(missing_ok=True)
         except Exception as e:  # noqa: BLE001 — a cleanup failure must never wedge a lane
             # `worker` is known-valid here (it survived _mcp_config_paths).
-            self._events.emit(worker, "mcp_config_purge_failed", error=f"{type(e).__name__}: {e}")
+            _tell(worker, "mcp_config_purge_failed", error=f"{type(e).__name__}: {e}")
 
     def _write_mcp_config(
         self, worker: str, turn_id: int, servers: dict[str, Any]
@@ -944,6 +955,12 @@ class Engine:
         """
         if not servers:
             return {}
+        # The purge below validates and then SWALLOWS the refusal by design, so it
+        # cannot be what protects this path: without an explicit check here, a name
+        # persisted before spawn-time validation existed would plant a credential file
+        # OUTSIDE the supervisor home, where neither the purge nor the boot sweep can
+        # ever reach it. Round 2 fixed the traversal unlink; this is the traversal write.
+        _require_safe_worker_name(worker)
         self._purge_mcp_config(worker)  # a retry/restart leftover must not accumulate
         d = self._cfg.mcp_config_dir
         if d.is_symlink():

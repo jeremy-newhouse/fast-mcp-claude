@@ -268,6 +268,13 @@ class Engine:
         indefinitely — the permanent exposure this fix exists to avoid. No turn can be
         in flight at boot (one daemon per socket), so everything here is an orphan.
         Never raises: a boot that dies here would take the whole daemon down.
+
+        Honest limit on that premise: the socket preflight this now runs behind keys on
+        the SOCKET, and SUPERVISOR_SOCKET exists so a deep SUPERVISOR_HOME can use a
+        short one — so two daemons sharing a HOME with different socket overrides both
+        pass it, and the second would sweep the first's in-flight files. That needs a
+        deliberate misconfiguration; the honest fix is an flock on `home`, not on the
+        socket. Recorded rather than silently assumed away.
         """
         try:
             d = self._cfg.mcp_config_dir
@@ -868,6 +875,11 @@ class Engine:
         # the full shape instead of trusting the prefix.
         mine = re.compile(rf"{re.escape(worker)}-\d+-[0-9a-f]{{16}}\.json")
         d = self._cfg.mcp_config_dir
+        if d.exists() and not d.is_dir():
+            # Path.glob swallows ENOTDIR and returns nothing, so without this the purge
+            # would report success on a broken config dir and an un-granted lane would
+            # give no signal at all. (A MISSING dir is normal and yields [] correctly.)
+            raise OSError(f"{d} exists but is not a directory")
         if d.is_symlink():
             # The WRITE refuses a symlinked dir; if the purge did not, the guard would
             # be worse than useless — refusing to create a file there while happily

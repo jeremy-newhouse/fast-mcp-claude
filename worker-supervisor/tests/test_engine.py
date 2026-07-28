@@ -848,9 +848,10 @@ async def test_mcp_config_write_failure_fails_the_turn_instead_of_wedging_the_la
     assert (await registry.get_worker("w1"))["status"] == "idle"
     assert [e for e in events.read("w1") if e["event"] == "turn_error"]
     assert list(cfg.capsules_dir.glob("w1-turn*.json")), "failure capsule missing"
-    # Every assertion above is satisfied BEFORE the loop's finally runs, so without
-    # this one the test passes with the lane's runner dead — which is precisely how
-    # the first fix for this bug reintroduced it one line lower.
+    # NB: this is a cheap smoke check, NOT the guard against the wedge — terminal_turn
+    # returns before the loop's finally, so it can pass with the runner already dying.
+    # test_a_failing_turn_end_purge_cannot_kill_the_worker_loop is the one that bites
+    # (verified by mutation); an earlier version of this comment claimed otherwise.
     assert not engine._runners["w1"].done(), "the runner loop died"
 
 
@@ -1138,6 +1139,29 @@ def test_boot_refuses_a_second_daemon_before_touching_the_config_dir():
     the sweep first, a mistakenly-started second instance would delete the LIVE daemon's
     in-flight credential files before discovering it should not have booted (the
     2026-07-07 double-daemon incident, now with a destructive action ahead of the check).
+
+    Scope of what the ordering buys: the preflight keys on the SOCKET, so two daemons
+    sharing a HOME with different SUPERVISOR_SOCKET overrides both pass it. See
+    _sweep_orphan_mcp_configs — the premise is one daemon per HOME, and this check only
+    delivers one per socket.
     """
-    source = Path("src/worker_supervisor/__main__.py").read_text()
+    import worker_supervisor.__main__ as daemon_main
+
+    source = Path(daemon_main.__file__).read_text()  # not a CWD-relative path
     assert source.index("preflight_socket_check") < source.index("await engine.start()")
+
+
+async def test_a_broken_config_dir_is_reported_not_silently_skipped(
+    make_engine, cfg, events
+):
+    """`Path.glob` swallows ENOTDIR and returns nothing, so a config dir that exists as a
+    FILE looked like 'nothing to purge' and emitted no diagnostic at all. A granted lane
+    still surfaces it through its turn error; an un-granted lane gave zero signal."""
+    engine, _ = make_engine([[r("s1")]])
+    cfg.mcp_config_dir.parent.mkdir(parents=True, exist_ok=True)
+    cfg.mcp_config_dir.write_text("not a directory")
+
+    engine._purge_mcp_config("w1")  # must not raise
+
+    refused = [e for e in events.read("-") if e["event"] == "mcp_config_purge_refused"]
+    assert refused and "not a directory" in refused[-1]["error"]

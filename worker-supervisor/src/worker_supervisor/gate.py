@@ -61,8 +61,10 @@ class WorkerPolicy:
     # arbitrary command execution can read. Until ECA-135 the whole config sat in
     # the CLI's argv, one `ps` away; it is now a turn-scoped 0600 file, one `cat`
     # away. Say it plainly: THERE IS NO LANE-TO-LANE BOUNDARY. Same uid means every
-    # lane can read every other lane's file, and `state.db` (0644, ECA-136) holds
-    # the same credentials durably for anyone on the box. ECA-135 changed the SHAPE
+    # lane can read every other lane's file, and `state.db` holds the same
+    # credentials durably — 0600 since ECA-136, which took that copy away from
+    # OTHER uids but not from any lane, since every lane is this uid. ECA-135
+    # changed the SHAPE
     # of the exposure — accidental capture (`ps aux` in a debugging session, which
     # scoops up every concurrent lane's config at once) became deliberate opening
     # of a named file — and shortened its life to the turn. It did not contain it.

@@ -954,9 +954,13 @@ class Engine:
         until the boot sweep in `start()` clears it.
 
         NOT ADDRESSED HERE, and larger: `state.db` stores every worker's policy —
-        credentials verbatim — and is 0644 in a 0755 directory. That copy is durable and
-        readable by OTHER uids, which argv never was. Tracked as ECA-136; until it is
-        fixed, this file's 0600 buys nothing against a non-uid-501 reader.
+        credentials verbatim — and that copy is durable in a way argv never was. It
+        was 0644 in a 0755 directory, which made this file's 0600 buy nothing against
+        a reader of another uid. FIXED in ECA-136: the whole supervisor home is now
+        0700 with 0600 files, swept at boot (`hardening.harden_home`), and deletes are
+        zeroed (`PRAGMA secure_delete`) with a one-shot VACUUM for pages freed before
+        that. Still true, and the reason the paragraph above stands: every lane runs
+        as THIS uid, so none of that is a lane-to-lane boundary.
 
         Returns `{}` for an un-granted lane so its options are byte-for-byte what they
         were before this change (and no `--mcp-config` reaches its argv at all).

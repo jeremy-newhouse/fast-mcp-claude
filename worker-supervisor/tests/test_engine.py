@@ -42,12 +42,49 @@ def r(session_id: str, *, cost: float = 0.01, usage: dict | None = None,
     )
 
 
+def r_api_error(
+    session_id: str = "sERR",
+    *,
+    status: int | None = 429,
+    errors: list[str] | None = None,
+    text: str = "You've hit your monthly spend limit",
+) -> ResultMessage:
+    """The ECA-143 result frame: is_error with subtype "success".
+
+    Not a contrived combination — the SDK documents `api_error_status` as populated
+    exactly when `is_error` is True and `subtype` == "success", and this is the
+    frame a live spend-capped lane on mbpm2 produced (429, zero tokens, 354ms).
+    """
+    return ResultMessage(
+        subtype="success",
+        duration_ms=354,
+        duration_api_ms=0,
+        is_error=True,
+        num_turns=1,
+        session_id=session_id,
+        total_cost_usd=0.0,
+        usage={"input_tokens": 0, "output_tokens": 0},
+        result=text,
+        errors=errors,
+        api_error_status=status,
+    )
+
+
 def a(*tools: str, usage: dict | None = None) -> AssistantMessage:
     return AssistantMessage(
         content=[ToolUseBlock(id=f"t-{t}", name=t, input={}) for t in tools],
         model="test-model",
         usage=usage,
     )
+
+
+class Hang:
+    """Script sentinel: the stream stalls here and never completes.
+
+    Placed AFTER a result frame it expresses the shape the SDK explicitly supports
+    (a result arrives, stdin stays open for in-flight work) — which is how a turn
+    can hit the wall clock with a ResultMessage already observed.
+    """
 
 
 def make_fake_query(script: list[Any], calls: list[Any]):
@@ -62,6 +99,15 @@ def make_fake_query(script: list[Any], calls: list[Any]):
         if options.stderr is not None:
             options.stderr("mock cli stderr line")
         for msg in item:
+            # An Exception INSIDE the message list means yield-then-raise, which is
+            # the real ECA-143 shape: the CLI emits a result frame with
+            # is_error=True and only THEN exits non-zero, so the SDK surfaces an
+            # exception for a turn whose result was already observed. A script that
+            # can only raise INSTEAD of yielding cannot express that at all.
+            if isinstance(msg, Exception):
+                raise msg
+            if isinstance(msg, Hang):
+                await asyncio.sleep(3600)  # the wall-clock timeout owns this turn
             yield msg
 
     return fake_query
@@ -154,6 +200,120 @@ async def test_second_failure_is_terminal_with_capsule(make_engine, registry, re
     assert epoch["seq"] == 1 and epoch["ended_at"] is None  # keep-on-failure
 
 
+async def test_api_error_failure_keeps_the_clis_own_account_of_it(
+    make_engine, registry, repo, cfg, events
+):
+    """ECA-143: the failure path must persist what the CLI reported, not less.
+
+    Live shape being reproduced: a lane turn on mbpm2 failed twice, `stderr_tail`
+    was `[]`, and the only recorded reason was the SDK's own string "Claude Code
+    returned an error result: success" — which names no cause and contradicts
+    itself. The CLI had reported HTTP 429 (a monthly spend cap) and every field
+    carrying that was dropped by `_fail_turn`. The give-away was a `duration_ms`
+    and a `usage` blob in the capsule beside `result_text: null`: a ResultMessage
+    had plainly been observed.
+    """
+    boom = ProcessError("cli exited 1", exit_code=1)
+    engine, _ = make_engine([[r_api_error(), boom], [r_api_error(), boom]])
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "spend-capped")
+    turn = await terminal_turn(registry, tid)
+
+    assert turn["state"] == "error"
+    # The three fields the success path kept and this one silently discarded.
+    assert turn["result_text"] == "You've hit your monthly spend limit"
+    assert turn["is_error"] == 1
+    assert turn["num_turns"] == 1
+
+    capsule = json.loads(
+        sorted(cfg.capsules_dir.glob("w1-turn*.json"))[-1].read_text(encoding="utf-8")
+    )
+    diag = capsule["result_diagnostics"]
+    assert diag["api_error_status"] == 429  # the field that makes the failure a diagnosis
+    assert diag["subtype"] == "success" and diag["is_error"] is True
+    assert diag["saw_result"] is True
+
+    # `workers events` is read before any capsule is opened, so the status has to
+    # be visible there too — on the retry AND on the terminal error.
+    rows = events.read("w1")
+    for event in ("turn_retry", "turn_error"):
+        matching = [e for e in rows if e["event"] == event]
+        assert matching, f"no {event} event"
+        assert matching[-1]["api_error_status"] == 429, event
+
+
+async def test_failure_with_no_result_frame_says_so_rather_than_inventing_a_status(
+    make_engine, registry, repo, cfg, events
+):
+    """ECA-143: absence is evidence, and must not be reported as a status.
+
+    A crash before any result frame is a DIFFERENT failure than an API error, and
+    the capsule has to let an operator tell them apart: `saw_result: false` and a
+    null status. The event carries no `api_error_status` KEY at all rather than a
+    null one — the event log is append-only and read by eye.
+    """
+    engine, _ = make_engine([RuntimeError("boom 1"), RuntimeError("boom 2"), [r("sX")]])
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "no result frame")
+    turn = await terminal_turn(registry, tid)
+    assert turn["state"] == "error"
+
+    capsule = json.loads(
+        sorted(cfg.capsules_dir.glob("w1-turn*.json"))[-1].read_text(encoding="utf-8")
+    )
+    diag = capsule["result_diagnostics"]
+    assert diag is not None, "the key must exist, or the reader assumes an old capsule"
+    assert diag["saw_result"] is False
+    assert diag["api_error_status"] is None and diag["subtype"] is None
+
+    errored = [e for e in events.read("w1") if e["event"] == "turn_error"]
+    assert errored and "api_error_status" not in errored[-1]
+
+
+async def test_timeout_path_keeps_the_result_it_had_observed(
+    make_engine, registry, repo, cfg
+):
+    """ECA-143: the wall-clock path dropped the same three fields as the error path.
+
+    A turn that reached the wall clock AFTER a result frame is the case where that
+    loss hurts most: the reason it then stalled is often in the result the CLI had
+    already sent, and 'wall clock exceeded (Ns)' says nothing about it.
+    """
+    engine, _ = make_engine([[r_api_error(), Hang()]])
+    await engine.spawn("w1", str(repo), WorkerPolicy(limits={"wall_clock_s": 1}))
+    tid = await engine.prompt("w1", "stalls after the result")
+    turn = await terminal_turn(registry, tid, timeout=15.0)
+
+    assert turn["state"] == "timeout"
+    assert turn["result_text"] == "You've hit your monthly spend limit"
+    assert turn["is_error"] == 1 and turn["num_turns"] == 1
+    capsule = json.loads(
+        sorted(cfg.capsules_dir.glob(f"w1-turn{tid}-*.json"))[-1].read_text(encoding="utf-8")
+    )
+    assert capsule["result_diagnostics"]["api_error_status"] == 429
+
+
+async def test_capsule_bounds_the_clis_error_list(make_engine, registry, repo, cfg):
+    """ECA-143: `errors` is the one diagnostics field that can carry text, so it is
+    bounded. A capsule too large to open is not evidence."""
+    boom = ProcessError("cli exited 1", exit_code=1)
+    flood = [f"{i}:" + "x" * 2000 for i in range(50)]
+    engine, _ = make_engine(
+        [[r_api_error(errors=flood), boom], [r_api_error(errors=flood), boom]]
+    )
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "flood")
+    await terminal_turn(registry, tid)
+
+    capsule = json.loads(
+        sorted(cfg.capsules_dir.glob("w1-turn*.json"))[-1].read_text(encoding="utf-8")
+    )
+    errors = capsule["result_diagnostics"]["errors"]
+    assert len(errors) == 10
+    assert all(len(e) == 500 for e in errors)
+    assert errors[0].startswith("0:")  # bounded from the FRONT: the first error caused the rest
+
+
 async def test_turn_mcp_diagnostics_emitted_on_failure_ladder_too(
     make_engine, registry, repo, events
 ):
@@ -175,7 +335,9 @@ async def test_turn_mcp_diagnostics_emitted_on_failure_ladder_too(
     assert diag[0]["granted"] == ["context7"]
 
 
-async def test_resume_failure_rolls_epoch_and_enqueues_restore(make_engine, registry, repo):
+async def test_resume_failure_rolls_epoch_and_enqueues_restore(
+    make_engine, registry, repo, cfg
+):
     """G7: ProcessError on a resumed chain -> epoch ends, restore turn grounds the next."""
     engine, calls = make_engine(
         [[r("s1")], ProcessError("resume rejected", exit_code=1), [r("s3")]]
@@ -186,6 +348,12 @@ async def test_resume_failure_rolls_epoch_and_enqueues_restore(make_engine, regi
     t2 = await engine.prompt("w1", "two")
     turn2 = await terminal_turn(registry, t2)
     assert turn2["state"] == "error" and "resume failed" in turn2["error"]
+    # ECA-143: this capsule carries the diagnostics block too. Here the CLI died
+    # before any result frame, so the honest content is "there was none".
+    capsule = json.loads(
+        sorted(cfg.capsules_dir.glob(f"w1-turn{t2}-*.json"))[-1].read_text(encoding="utf-8")
+    )
+    assert capsule["result_diagnostics"]["saw_result"] is False
 
     async def _restore_done():
         rows = await registry.history("w1", limit=10)

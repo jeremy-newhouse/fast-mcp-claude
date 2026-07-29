@@ -1,7 +1,15 @@
 """Failure capsules (Amendment A6): a failed turn leaves a self-contained,
 portable evidence bundle beside the worker log — prompt, options snapshot,
-last-N events, stderr tail, session id + resume chain. Autonomous work must be
-reviewable, not ephemeral. The failed epoch is kept, never auto-cycled over.
+last-N events, stderr tail, session id + resume chain, and the CLI's own result
+diagnostics. Autonomous work must be reviewable, not ephemeral. The failed epoch
+is kept, never auto-cycled over.
+
+ECA-143 added `result_diagnostics` because "self-contained" was not true for the
+failure mode that has no stderr and no meaningful exception: an API error. The
+CLI reported HTTP 429 (a spend cap) and the capsule showed `stderr_tail: []`
+beside the string "Claude Code returned an error result: success" — so the only
+way to learn why a lane died was to go read Claude Code's own session transcript
+on that host. A capsule that sends you elsewhere is not an evidence bundle.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ def write_capsule(
     events_tail: list[dict[str, Any]],
     stderr_tail: list[str],
     resume_chain: list[str | None],
+    result_diagnostics: dict[str, Any] | None = None,
 ) -> Path:
     """Write one capsule file; returns its path.
 
@@ -86,6 +95,12 @@ def write_capsule(
         "events_tail": events_tail[-LAST_N_EVENTS:],
         "stderr_tail": stderr_tail,
         "resume_chain": resume_chain,
+        # ECA-143: the CLI's own account of the result. Always present as a key —
+        # `null` says "the caller had nothing", which is itself evidence, whereas an
+        # absent key reads as an old capsule and sends the reader to the CC
+        # transcript. That round trip is what made the motivating failure a
+        # two-hour investigation.
+        "result_diagnostics": result_diagnostics,
     }
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:

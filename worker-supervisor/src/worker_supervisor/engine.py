@@ -67,6 +67,12 @@ CONTEXT_WINDOW_TOKENS = 200_000
 LIFECYCLE_KINDS = frozenset({"cycle_handover", "restore", "retire_handover"})
 LIFECYCLE_BUDGET_RESERVE_USD = 5.0
 
+# ECA-143: the CLI's own `errors` list, bounded before it reaches a capsule. A
+# diagnostic is worth nothing if one pathological entry makes the evidence bundle
+# unreadable, and the point of the capsule is that a human can open it.
+MAX_ERROR_ITEMS = 10
+ERROR_ITEM_CHARS = 500
+
 # Lifecycle prompts embed the ABSOLUTE handover dir: a weak model given a bare
 # ".claude/handovers/" resolved it against $HOME, missed the repo's handover,
 # and restored as a fresh start (proven live on haiku).
@@ -211,6 +217,61 @@ class TurnOutcome:
     tools: list[str] = field(default_factory=list)
     saw_result: bool = False
     mcp_init: list[dict[str, Any]] | None = None
+    # ECA-143: result metadata the CLI reports alongside is_error. None of it has a
+    # `turns` column, so it reaches an operator through the failure capsule (and
+    # api_error_status through the turn_error/turn_retry events) rather than the row.
+    subtype: str | None = None
+    api_error_status: int | None = None
+    errors: list[str] | None = None
+    terminal_reason: str | None = None
+    stop_reason: str | None = None
+
+    def diagnostics(self) -> dict[str, Any]:
+        """The result-frame metadata a failure capsule carries (ECA-143).
+
+        Motivating failure: a lane turn on mbpm2 died twice with
+        `stderr_tail: []` and the single exception string "Claude Code returned
+        an error result: success" — self-contradictory and unactionable. The CLI
+        had in fact reported the reason (HTTP 429, monthly spend cap) and every
+        field naming it was dropped on the floor. `api_error_status` is the one
+        that turns that string into a diagnosis; the SDK documents it as set
+        exactly when `is_error` is True and `subtype` == "success", which IS this
+        failure mode.
+
+        `errors` is the CLI's own error list and so is the only field here that
+        can carry model/API text; it is bounded rather than excluded, because it
+        is also the most directly diagnostic. That is not a new exposure class —
+        a capsule already carries the turn's prompt and raw subprocess stderr,
+        which is why ECA-136 writes it 0600 in a 0700 directory.
+        """
+        errors = self.errors
+        if errors:
+            errors = [str(e)[:ERROR_ITEM_CHARS] for e in errors[:MAX_ERROR_ITEMS]]
+        return {
+            "subtype": self.subtype,
+            "is_error": self.is_error,
+            "api_error_status": self.api_error_status,
+            "errors": errors or None,
+            "terminal_reason": self.terminal_reason,
+            "stop_reason": self.stop_reason,
+            "saw_result": self.saw_result,
+            "num_turns": self.num_turns,
+        }
+
+
+def _status_field(outcome: TurnOutcome) -> dict[str, int]:
+    """ECA-143: `api_error_status` as an event field, or nothing.
+
+    `workers events` is the first thing an operator reads, and for this failure
+    mode it said only "Claude Code returned an error result: success". The HTTP
+    status is what makes that actionable, and the SDK certifies it as metadata
+    ("safe to log (no message content)"), so it can go somewhere less protected
+    than a capsule. Absent rather than null when the CLI reported none: the event
+    log is append-only and read by eye.
+    """
+    if outcome.api_error_status is None:
+        return {}
+    return {"api_error_status": outcome.api_error_status}
 
 
 def context_pressure_pct(usage: dict[str, Any] | None) -> int | None:
@@ -638,12 +699,18 @@ class Engine:
                 await self._reg.finish_turn(
                     turn_id, "timeout",
                     session_id=outcome.session_id,
+                    result_text=outcome.result_text,  # ECA-143: was dropped here too
+                    is_error=outcome.is_error,
+                    num_turns=outcome.num_turns,
                     error=f"wall clock exceeded ({limits.wall_clock_s}s)",
                     tools=outcome.tools,
                 )
-                self._events.emit(name, "turn_timeout", turn_id=turn_id)
+                self._events.emit(
+                    name, "turn_timeout", turn_id=turn_id, **_status_field(outcome)
+                )
                 await self._finish_failure_capsule(
-                    name, turn_id, "timeout", options_snapshot, list(stderr_tail), [resume_from]
+                    name, turn_id, "timeout", options_snapshot, list(stderr_tail),
+                    [resume_from], diagnostics=outcome.diagnostics(),
                 )
                 self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
                 await self._reg.set_worker_status(name, "idle", active=True)
@@ -654,14 +721,19 @@ class Engine:
                     # open the next one grounded on the handover file.
                     await self._reg.finish_turn(
                         turn_id, "error",
+                        result_text=outcome.result_text,  # ECA-143
+                        is_error=outcome.is_error,
+                        num_turns=outcome.num_turns,
                         error=f"resume failed: {e} (exit={e.exit_code})",
                     )
                     self._events.emit(
-                        name, "resume_failed", turn_id=turn_id, resume=resume_from
+                        name, "resume_failed", turn_id=turn_id, resume=resume_from,
+                        **_status_field(outcome),
                     )
                     await self._finish_failure_capsule(
                         name, turn_id, "resume_failed", options_snapshot,
                         list(stderr_tail), [resume_from],
+                        diagnostics=outcome.diagnostics(),
                     )
                     self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
                     await self._reg.roll_epoch(name, "resume_failed")
@@ -672,7 +744,10 @@ class Engine:
                     self._kick(name)
                     return
                 if attempt == 1:
-                    self._events.emit(name, "turn_retry", turn_id=turn_id, error=str(e))
+                    self._events.emit(
+                        name, "turn_retry", turn_id=turn_id, error=str(e),
+                        **_status_field(outcome),
+                    )
                     continue
                 await self._fail_turn(
                     name, turn_id, outcome, f"ProcessError: {e}", options_snapshot,
@@ -683,7 +758,10 @@ class Engine:
                 raise  # kill() owns the record
             except Exception as e:  # noqa: BLE001 — G2: mid-stream death is a BARE Exception
                 if attempt == 1:
-                    self._events.emit(name, "turn_retry", turn_id=turn_id, error=str(e))
+                    self._events.emit(
+                        name, "turn_retry", turn_id=turn_id, error=str(e),
+                        **_status_field(outcome),
+                    )
                     continue
                 await self._fail_turn(
                     name, turn_id, outcome, f"{type(e).__name__}: {e}", options_snapshot,
@@ -701,6 +779,7 @@ class Engine:
                 turn_id, "question_timeout",
                 session_id=outcome.session_id,
                 result_text=outcome.result_text,
+                is_error=outcome.is_error,  # ECA-143: the only field this path dropped
                 cost_usd=outcome.cost_usd,
                 duration_ms=outcome.duration_ms,
                 num_turns=outcome.num_turns,
@@ -708,10 +787,13 @@ class Engine:
                 tools=outcome.tools,
                 error="question timed out unanswered",
             )
-            self._events.emit(name, "turn_question_timeout", turn_id=turn_id)
+            self._events.emit(
+                name, "turn_question_timeout", turn_id=turn_id, **_status_field(outcome)
+            )
             await self._finish_failure_capsule(
                 name, turn_id, "question_timeout", options_snapshot,
                 list(stderr_tail), [resume_from, outcome.session_id],
+                diagnostics=outcome.diagnostics(),
             )
             self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
             await self._reg.set_worker_status(name, "idle", active=True)
@@ -743,6 +825,7 @@ class Engine:
             session_id=outcome.session_id, cost_usd=outcome.cost_usd,
             duration_ms=outcome.duration_ms, num_turns=outcome.num_turns,
             context_pct=context_pressure_pct(outcome.usage),
+            **_status_field(outcome),  # ECA-143: state="error" without an exception
         )
         self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
         if outcome.session_id:
@@ -757,6 +840,7 @@ class Engine:
             await self._finish_failure_capsule(
                 name, turn_id, "result_error", options_snapshot,
                 list(stderr_tail), [resume_from, outcome.session_id],
+                diagnostics=outcome.diagnostics(),
             )
         await self._reg.set_worker_status(name, "idle", active=True)
 
@@ -821,20 +905,34 @@ class Engine:
         policy: WorkerPolicy,
     ) -> None:
         """Terminal error after the retry: record, capsule, keep the epoch
-        (keep-on-failure, Amendment A6) — the orchestrator decides what's next."""
+        (keep-on-failure, Amendment A6) — the orchestrator decides what's next.
+
+        ECA-143: this used to persist cost/duration/usage/tools and DROP
+        result_text, is_error and num_turns — the three fields that say what the
+        CLI reported. The tell in the live capsule was a `duration_ms` and a
+        `usage` blob (so a ResultMessage plainly HAD been observed) sitting beside
+        `result_text: null`. A failure path must persist at least as much as the
+        success path, not less.
+        """
         await self._reg.finish_turn(
             turn_id, "error",
             session_id=outcome.session_id,
+            result_text=outcome.result_text,
+            is_error=outcome.is_error,
             cost_usd=outcome.cost_usd,
             duration_ms=outcome.duration_ms,
+            num_turns=outcome.num_turns,
             usage=outcome.usage,
             tools=outcome.tools,
             error=error,
         )
-        self._events.emit(name, "turn_error", turn_id=turn_id, error=error)
+        self._events.emit(
+            name, "turn_error", turn_id=turn_id, error=error,
+            **_status_field(outcome),
+        )
         await self._finish_failure_capsule(
             name, turn_id, "error", options_snapshot, list(stderr_tail),
-            [resume_from, outcome.session_id],
+            [resume_from, outcome.session_id], diagnostics=outcome.diagnostics(),
         )
         self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
         await self._reg.set_worker_status(name, "idle", active=True)
@@ -1067,6 +1165,7 @@ class Engine:
         options_snapshot: dict[str, Any],
         stderr_tail: list[str],
         resume_chain: list[str | None],
+        diagnostics: dict[str, Any] | None = None,
     ) -> None:
         try:
             turn = await self._reg.get_turn(turn_id)
@@ -1079,6 +1178,7 @@ class Engine:
                 events_tail=self._events.read(name, limit=50),
                 stderr_tail=stderr_tail,
                 resume_chain=[s for s in resume_chain],
+                result_diagnostics=diagnostics,
             )
             self._events.emit(name, "failure_capsule", turn_id=turn_id, path=str(path))
         except Exception as e:  # noqa: BLE001 — capsule failure is never fatal
@@ -1099,6 +1199,14 @@ class Engine:
             outcome.cost_usd = msg.total_cost_usd
             outcome.duration_ms = msg.duration_ms
             outcome.num_turns = msg.num_turns
+            # ECA-143: the SDK pin is exact (claude-agent-sdk==0.2.128), so these
+            # are plain attribute reads — a getattr default would silently turn a
+            # future SDK rename into "no diagnostics" again, which is the bug.
+            outcome.subtype = msg.subtype
+            outcome.api_error_status = msg.api_error_status
+            outcome.errors = list(msg.errors) if msg.errors else None
+            outcome.terminal_reason = msg.terminal_reason
+            outcome.stop_reason = msg.stop_reason
             if outcome.usage is None:  # cumulative fallback; see CONTEXT_WINDOW_TOKENS
                 outcome.usage = msg.usage
         elif isinstance(msg, AssistantMessage):

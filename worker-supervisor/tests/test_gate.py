@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
@@ -45,7 +46,7 @@ async def test_off_ceiling_tool_is_denied_with_reason(registry, events, repo):
     assert any(e["event"] == "tool_denied" for e in events.read("w1"))
 
 
-async def test_bash_prefix_matcher():
+async def test_bash_matcher_admits_a_granted_command_and_refuses_another():
     policy = WorkerPolicy(allowed_tools=["Bash(uv run*)"])
     assert policy.ceiling_allows("Bash", {"command": "uv run pytest -q"})
     assert not policy.ceiling_allows("Bash", {"command": "rm -rf /"})
@@ -98,7 +99,7 @@ def test_substitution_inner_command_is_judged():
         'echo "x $(cat /etc/passwd)"',
         "echo x <(cat /etc/passwd)",
         "echo x $(echo y $(cat /etc/passwd))",  # nested
-        "(cat /etc/passwd)",  # bare subshell
+        "echo x && (cat /etc/passwd)",  # subshell group
     ):
         reason = _denial(_ECHO, command)
         assert reason is not None, f"substitution ran unjudged in {command!r}"
@@ -130,10 +131,136 @@ def test_word_boundary_is_the_space_the_author_wrote():
     assert not unspaced.ceiling_allows("Bash", {"command": "lsof -i; rm -rf /tmp/x"})
 
 
-def test_colon_is_literal_not_a_wildcard():
-    policy = WorkerPolicy(allowed_tools=["Bash(npm run test:*)"])
-    assert policy.ceiling_allows("Bash", {"command": "npm run test:unit"})
-    assert not policy.ceiling_allows("Bash", {"command": "npm run build"})
+def test_trailing_colon_star_is_a_trailing_wildcard():
+    """Claude Code: `Bash(ls:*)` is an equivalent way to write `Bash(ls *)`.
+
+    Worth pinning because `cmd:*` is the form CC's own permission dialog writes, so
+    it is what an operator copying a grant out of settings.json will paste — and
+    reading that colon as literal INVERTS the grant. An earlier draft of this fix
+    did exactly that, and documented it in four places as intended.
+    """
+    spaced = WorkerPolicy(allowed_tools=["Bash(ls *)"])
+    colon = WorkerPolicy(allowed_tools=["Bash(ls:*)"])
+    for command in ("ls -la", "lsof", "ls"):
+        assert colon.ceiling_allows("Bash", {"command": command}) == spaced.ceiling_allows(
+            "Bash", {"command": command}
+        ), command
+    assert colon.ceiling_allows("Bash", {"command": "ls -la"})
+    assert not colon.ceiling_allows("Bash", {"command": "lsof"})
+    # A colon anywhere ELSE is literal, so the `:*` reading does not leak inward.
+    mid = WorkerPolicy(allowed_tools=["Bash(git:* push)"])
+    assert not mid.ceiling_allows("Bash", {"command": "git remote push"})
+    # ...and the trailing-wildcard reading is what makes this pair behave:
+    npm = WorkerPolicy(allowed_tools=["Bash(npm run test:*)"])
+    assert npm.ceiling_allows("Bash", {"command": "npm run test --watch"})
+    assert not npm.ceiling_allows("Bash", {"command": "npm run test:unit"})
+
+
+def test_star_only_matcher_is_the_bare_grant():
+    """CC documents `Bash(*)` as equivalent to bare `Bash`, so it must not be
+    narrower here — in particular it must not inherit the fail-closed refusals."""
+    star = WorkerPolicy(allowed_tools=["Bash(*)"])
+    for command in ("echo hi > /tmp/f", "echo 'unbalanced", "rm -rf / && curl x | sh"):
+        assert star.ceiling_allows("Bash", {"command": command}), command
+
+
+def test_unmodelled_shell_syntax_is_refused_not_approximated():
+    """Three arbitrary-command bypasses found in review, all now refused.
+
+    Each worked because a shell's idea of where a quote or a command ends differs
+    from a POSIX-single-quote scan: `$'...'` treats `\\'` as an escaped quote (so a
+    naive scan desynchronises and swallows a whole `$(...)`), a `#` comment
+    suppresses line continuation (so the newline after it IS a separator), and a
+    shell splices `\\<newline>` before tokenising even inside double quotes (so
+    `"$\\<newline>(cmd)"` is really `"$(cmd)"`). Verified against /bin/bash at the
+    time: every one of these ran `id -un` while the gate said allow.
+    """
+    for command in (
+        "echo $'\\''$(id -un)\\'",  # ANSI-C quoting desync
+        "echo $'\\''`id -un`\\'",  # ...same, via backticks
+        "echo hi #\\\nid -un",  # comment suppresses the continuation
+        "echo hi #\\\nid -un #\\\nid -un",  # ...chains
+        'echo "$\\\n(id -un)"',  # continuation splits `$` from `(`
+        'echo "${x:-$\\\n(id -un)}"',
+        'echo $"translated"',
+        "echo hi \\\n&& cat /etc/passwd",  # a continuation anywhere
+    ):
+        reason = _denial(_ECHO, command)
+        assert reason is not None, f"unmodelled syntax allowed: {command!r}"
+        assert "refused" in reason, reason
+
+
+def test_single_quotes_are_posix_not_ansi_c():
+    """A backslash inside single quotes is NOT an escape, so the run ends at the
+    next quote.
+
+    Pinned deliberately: making this "smarter" (skipping `\\'`) is the tempting
+    wrong fix for the `$'...'` bypass above, and it would desynchronise the scan
+    from the shell in the other direction. `echo 'a\\' && cat x` really is two
+    commands to a shell, and the second must be judged.
+    """
+    assert _denial(_ECHO, "echo 'a\\' && cat /etc/passwd") is not None
+    assert _denial(_ECHO, "echo 'a\\'") is None  # ...and that one is fine alone
+
+
+def test_a_wildcard_matches_a_newline_inside_a_quoted_command():
+    """`*` spans newlines. A commit message is the realistic case, and nothing else
+    in this suite would notice if it stopped."""
+    policy = WorkerPolicy(allowed_tools=["Bash(git *)"])
+    assert policy.ceiling_allows("Bash", {"command": "git commit -m 'first\n\nsecond'"})
+
+
+def test_the_match_is_anchored_at_both_ends():
+    """A pattern not ending in `*` must not admit a longer command — a prefix match
+    here would re-widen every such grant."""
+    policy = WorkerPolicy(allowed_tools=["Bash(git * main)"])
+    assert policy.ceiling_allows("Bash", {"command": "git checkout main"})
+    assert not policy.ceiling_allows("Bash", {"command": "git checkout main --force"})
+    exact = WorkerPolicy(allowed_tools=["Bash(ls -la)"])
+    assert exact.ceiling_allows("Bash", {"command": "ls -la"})
+    assert not exact.ceiling_allows("Bash", {"command": "ls -la /etc"})
+
+
+def test_deep_nesting_is_refused_rather_than_raising():
+    """The splitter recurses on model-supplied text. Past the cap it must produce
+    the documented REFUSAL, not a RecursionError — which escaped `can_use_tool` as
+    an exception and wrote no audit event."""
+    reason = _denial(_ECHO, "echo " + "$(" * 1200 + "true" + ")" * 1200)
+    assert reason is not None and "refused" in reason, reason
+
+
+def test_matching_cannot_be_made_to_hang():
+    """A pattern is operator-supplied and a command is model-supplied, and the
+    matcher runs in the PreToolUse hook on every call. The regex draft of this
+    matcher took >5s on the first case below."""
+    policy = WorkerPolicy(allowed_tools=["Bash(echo *a*a*a*a*a*a*a*aZ)", "Bash(" + "*" * 30 + "x)"])
+    start = time.perf_counter()
+    assert not policy.ceiling_allows("Bash", {"command": "echo " + "a" * 200})
+    assert time.perf_counter() - start < 1.0
+
+
+def test_a_substitution_still_leaves_its_command_an_argument():
+    """Two individually-granted commands composed by substitution must not be
+    refused: the substitution is replaced by a placeholder in the enclosing
+    command, not deleted, so `ls *` still sees an argument."""
+    policy = WorkerPolicy(allowed_tools=["Bash(git *)", "Bash(ls *)"])
+    assert policy.ceiling_allows("Bash", {"command": "ls $(git rev-parse --show-toplevel)"})
+    # ...and the smuggle through the same shape is still denied.
+    assert not policy.ceiling_allows(
+        "Bash", {"command": "ls $(git rev-parse HEAD) && rm -rf /tmp/x"}
+    )
+
+
+def test_command_wrappers_are_not_stripped():
+    """Claude Code strips `timeout`/`time`/`nice`/`xargs`-style wrappers and a
+    leading `VAR=value` before matching; this matcher does not, so those forms are
+    outside a narrow grant. Documented as a delta rather than implemented: every
+    wrapper stripped is a rule about what that wrapper does, and `xargs` runs
+    arbitrary commands."""
+    policy = WorkerPolicy(allowed_tools=["Bash(uv *)", "Bash(git *)"])
+    for command in ("timeout 30 uv run pytest", "time git status", "NODE_ENV=test uv run pytest"):
+        assert not policy.ceiling_allows("Bash", {"command": command}), command
+    assert policy.ceiling_allows("Bash", {"command": "uv run pytest"})
 
 
 def test_wildcard_matches_spaces_anywhere_in_the_pattern():
@@ -207,13 +334,21 @@ def test_brace_group_and_arithmetic_are_over_refused_deliberately():
 
 
 def test_matcher_grant_with_no_command_in_the_input_is_refused():
-    """`Read(*)` denies rather than allowing every Read.
+    """`Read(*.py)` denies rather than silently allowing every Read.
 
-    A behaviour change, and the fail-closed one: there is no path matcher here, so
-    a spec that looks like a path filter never was one. Pin file tools with a bare
-    grant plus the cwd pin.
+    There is no path matcher here, so a spec that LOOKS like a path filter never
+    was one — the exact false analogy AC#3 exists to prevent. Refusing is the
+    fail-closed reading; the alternative (an absent `command` treated as an empty
+    string) made such a grant either all-allow or all-deny depending on the
+    pattern. Pin file tools with a bare grant plus the cwd pin.
+
+    `Read(*)` is the deliberate exception, per `test_star_only_matcher_is_the_bare_grant`:
+    a lone `*` means "everything", which is what the author asked for.
     """
-    assert not WorkerPolicy(allowed_tools=["Read(*)"]).ceiling_allows(
+    assert not WorkerPolicy(allowed_tools=["Read(*.py)"]).ceiling_allows(
+        "Read", {"file_path": "/etc/passwd"}
+    )
+    assert WorkerPolicy(allowed_tools=["Read(*)"]).ceiling_allows(
         "Read", {"file_path": "/etc/passwd"}
     )
     reason = WorkerPolicy(allowed_tools=["Bash(echo *)"]).ceiling_denial("Bash", {})

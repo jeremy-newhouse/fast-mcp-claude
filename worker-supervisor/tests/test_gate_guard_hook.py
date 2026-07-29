@@ -19,30 +19,42 @@ change that stops executing for some unrelated reason still fails loudly.
 
 What the resolve-and-contain check does and does not buy. It catches a hook FILE that is
 a symlink out of the hooks directory, and it is indifferent to a symlinked `.claude` or
-`hooks` directory (both sides are resolved). It does NOT catch a HARD link, which shares
-an inode and has no "target" to resolve — the same limit ECA-135 recorded for `O_NOFOLLOW`.
-Planting either requires write access to the operator's repo, which a lane with `Write`
-already has under its own root, and such a lane can equally just overwrite a legitimate
-hook's CONTENTS. So the containment check is about the control-socket string, not about
-containing the lane; nothing here should be read as a lane-to-lane boundary, which this
-daemon does not have (see `WorkerPolicy.mcp_servers`).
+`hooks` directory (both sides are resolved). Two things it does NOT catch, stated rather
+than implied away: a HARD link, which shares an inode and has no "target" to resolve — the
+limit ECA-135 recorded for `O_NOFOLLOW` — and the TOCTOU window between the check and the
+exec, in which the file can be swapped for an out-of-tree symlink. Planting either needs
+write access to the operator's repo, which a lane with `Write` already has under its own
+root, and such a lane can equally just overwrite a legitimate hook's CONTENTS. So the
+containment check is about the control-socket string, not about containing the lane;
+nothing here should be read as a lane-to-lane boundary, which this daemon does not have
+(see `WorkerPolicy.mcp_servers`).
 
 Falsification, measured rather than reasoned: with `is_safe_hook_script` stubbed to
-`return True` and the resolve-and-contain block deleted, **8 of the 12 tests here fail and
-4 pass**. Those 4 are exactly the positive and unchanged-behaviour cases, which SHOULD
-survive a removed guard — a legitimate hook still runs, one under a symlinked hooks
-directory still runs, a leading-underscore name still runs, and a missing hook still fails
-open. Re-measure this pair if you add tests rather than adjusting it by arithmetic; a
-first draft of this paragraph said 7/5 and put the predicate-divergence test among the
-survivors, which the run disproved (stubbing the predicate breaks its hostile-input half).
+`return True` and the containment result forced True, **8 of the 14 tests here fail and 6
+pass**. The 6 are exactly the cases that SHOULD survive a removed guard, named so the
+claim is auditable — `test_legitimate_hook_still_runs`,
+`test_leading_underscore_hook_still_runs`, `test_symlinked_hooks_directory_is_still_allowed`,
+`test_missing_hook_still_fails_open_unchanged`,
+`test_unreadable_hooks_directory_denies_instead_of_raising`, `test_refusal_reason_is_bounded`.
+Re-measure this pair if you add tests rather than adjusting it by arithmetic; a first draft
+said 7/5 and put the predicate-divergence test among the survivors, which the run disproved.
 
-Mutation coverage of the two guards, run separately: **10 mutations, 10 killed, 0
-survived** — including moving the check to AFTER the join, comparing containment against
-an UNresolved hooks_dir, `fullmatch` -> `match`, dropping the isinstance clause, and
-restoring `WORKER_NAME_RE`'s leading character class. One honest caveat about the tenth:
-dropping `".." not in script` is killed only by the explicit policy assertion below, not
-by any traversal test, because the charset already rejects every separator. It is
-belt-and-braces kept for symmetry with its two siblings, not a second line of defence.
+Mutation coverage of the guards: **15 mutations, 14 killed, 1 survived**, each one named in
+the harness rather than counted anonymously (a review finding on the first round — an
+unnamed score is unauditable). Killed include moving the name check to AFTER the join,
+comparing containment against an UNresolved `hooks_dir`, `fullmatch` -> `match`, dropping
+the isinstance clause, restoring `WORKER_NAME_RE`'s leading class, putting the `exists()`
+probe back outside the try, making the OSError path fail open, keying the refusal event on
+`script`, and disabling the clip. Two honest caveats:
+
+* The survivor is `resolve(strict=True)` -> `strict=False`, and it is an EQUIVALENT mutant,
+  not a coverage hole: `exists()` has already established that the path resolves, so the
+  flag cannot change the outcome. It stays as defence in depth for a future edit that
+  removes the existence check, and is recorded here so the score is not read as 14/15 luck.
+* Dropping `".." not in script` is killed only by the explicit policy assertion in
+  `test_hook_and_worker_predicates_diverge_on_exactly_one_real_name`, not by any traversal
+  test, because the charset already rejects every separator. It is belt-and-braces kept for
+  symmetry with its two siblings in `names.py`, not a second line of defence.
 """
 
 from __future__ import annotations
@@ -246,12 +258,16 @@ async def test_gate_denies_refusal_without_claiming_the_hook_ran(registry, event
     assert denials and denials[-1]["reason"].startswith("guard:refused:")
 
 
-async def test_refusal_writes_no_file_named_after_the_script(registry, events, repo, tmp_path):
+async def test_refusal_is_written_only_under_the_worker_key(registry, events, cfg, repo, tmp_path):
     """AC#2's second half: the refusal itself must not become the traversal.
 
-    `script` reaches the refusal path as message text and as an event record BODY only.
-    The event is keyed on the worker name, which ECA-137 validates inside `EventLog.path`,
-    so a hostile script value cannot steer where the refusal is written.
+    The assertion is on the log DIRECTORY's contents, not on the absence of the traversal
+    target. An earlier version asserted `not target.exists()`, and review was right to
+    call it unfalsifiable: nothing writes a `script`-derived path in either the fixed or
+    the unfixed code, so that file could never have appeared and the assertion could never
+    fail. What IS falsifiable is where the refusal record lands — key the event on
+    `script` instead of on `worker` and this fails, because ECA-137's `EventLog.path`
+    guard re-keys the hostile name to the daemon stream and a second file appears.
     """
     _hooks(repo)
     target = tmp_path / "REFUSAL-LANDED-HERE"
@@ -262,5 +278,38 @@ async def test_refusal_writes_no_file_named_after_the_script(registry, events, r
     res = await gate("Bash", {"command": "echo hi"}, None)
 
     assert isinstance(res, PermissionResultDeny)
-    assert not target.exists(), "the refusal wrote through the very path it refused"
-    assert list(events.read("w1")), "the refusal was silent"
+    assert [e["event"] for e in events.read("w1")] == ["tool_denied"], "the refusal was silent"
+    assert sorted(p.name for p in cfg.logs_dir.iterdir()) == ["w1.jsonl"]
+
+
+async def test_unreadable_hooks_directory_denies_instead_of_raising(registry, events, repo):
+    """An OSError from the filesystem probe must not escape into the permission callback.
+
+    `Path.exists()` re-raises anything outside (ENOENT, ENOTDIR, EBADF, ELOOP), so a
+    hooks directory at mode 000 raised PermissionError out of `can_use_tool` — the one
+    place ECA-135 established must never raise, because the escape kills the lane's runner
+    loop. Denying rather than failing open is the deliberate half: a configured guard we
+    cannot even evaluate is exactly the silent fail-open AC#2 names.
+    """
+    hooks = _hooks(repo)
+    (hooks / "ok.sh").write_text("#!/usr/bin/env bash\necho '{}'\n")
+    hooks.chmod(0o000)
+    try:
+        decision, reason = await _run_guard_hook(repo, "ok.sh", "Bash", {"command": "echo"})
+        assert decision == "refused", decision
+        assert "could not be checked" in reason
+        policy = WorkerPolicy(allowed_tools=["Bash"], guard_hooks={"Bash": "ok.sh"})
+        gate = _gate(repo, policy, QuestionBridge(registry, events), events)
+        res = await gate("Bash", {"command": "echo hi"}, None)
+        assert isinstance(res, PermissionResultDeny)
+    finally:
+        hooks.chmod(0o755)
+
+
+async def test_refusal_reason_is_bounded(repo):
+    """A 1MB policy value must not become a 1MB event record and a 1MB model message."""
+    _hooks(repo)
+    decision, reason = await _run_guard_hook(repo, "../" * 300_000, "Bash", {"command": "e"})
+    assert decision == "refused"
+    assert len(reason) < 500, len(reason)
+    assert "chars]" in reason, "the clip left no trace that it clipped"

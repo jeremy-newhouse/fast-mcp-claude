@@ -305,6 +305,18 @@ def make_question_hook(
     return on_ask_user_question
 
 
+def _clip(value: object, limit: int = 120) -> str:
+    """`repr` of an untrusted value, bounded — for messages and event records.
+
+    The refused `script` is echoed twice per denied call: into the `tool_denied` record
+    and into the message the model reads. Unbounded, a 1MB policy value becomes a 1MB
+    reason in both (measured in review, not imagined). `repr` first, so control characters
+    and newlines are escaped rather than embedded, then clip.
+    """
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + f"…[+{len(text) - limit} chars]"
+
+
 async def _run_guard_hook(
     repo_root: Path, script: object, tool_name: str, tool_input: dict[str, Any]
 ) -> tuple[str, str]:
@@ -338,31 +350,55 @@ async def _run_guard_hook(
     # the mistake ECA-135 made at `Engine.spawn` and ECA-137 had to correct.
     if not is_safe_hook_script(script):
         return "refused", (
-            f"guard-hook script {script!r} is not a plain filename component: it must "
-            f"match {HOOK_SCRIPT_RE.pattern} and contain no '..' (the value is joined "
-            "under <repo>/.claude/hooks/ and executed)"
+            f"guard-hook script {_clip(script)} is not a plain filename component: it "
+            f"must match {HOOK_SCRIPT_RE.pattern} and contain no '..' (the value is "
+            "joined under <repo>/.claude/hooks/ and executed)"
         )
     hook_path = hooks_dir / script
-    if not hook_path.exists():
-        # Deliberately UNCHANGED, and deliberately not "deny" (ECA-140). A well-formed
-        # hook that is absent is a deployment mismatch, not an attack: the same caller
-        # that named the hook could have named none, so failing open crosses no boundary
-        # the caller was not already on the safe side of. Denying instead would also turn
-        # one stale policy row into a lane that cannot use the tool at all, and reporting
-        # it would emit an event per tool call for as long as the mismatch lasts. The
-        # REFUSAL path above is the one AC#2 is about, and that one denies loudly.
-        return "none", f"guard hook missing: {script}"
-    # A plain filename component cannot escape `hooks_dir` lexically — but a SYMLINK at
-    # that name can, and AC#3 asserts on the directory rather than on the string. Resolve
-    # both sides so a symlinked `.claude` or `hooks` is still contained; only a hook FILE
-    # pointing out is refused. Nothing on either supervisor host is affected: no hook file
-    # and no hooks directory anywhere under ~/repos is a symlink (checked, not assumed).
+    # ONE try around both filesystem probes, and that is not tidiness (review finding).
+    # `Path.exists()` is not the total predicate it reads as: on 3.11 it re-raises any
+    # OSError outside (ENOENT, ENOTDIR, EBADF, ELOOP), so `.claude/hooks` at mode 000
+    # raises PermissionError straight out of `can_use_tool` — which ECA-135 established
+    # kills the lane's runner loop, and `engine.py` then retries once and fails the turn.
+    # Wrapping only `resolve()` (the first version of this fix) left that hole open one
+    # line above the guard whose docstring invokes the never-raise invariant.
     try:
-        hook_path.resolve(strict=True).relative_to(hooks_dir.resolve())
-    except (OSError, ValueError):
+        if not hook_path.exists():
+            # Deliberately UNCHANGED, and deliberately not "deny" (ECA-140). A well-formed
+            # hook that is absent is a deployment mismatch, not an attack: the same caller
+            # that named the hook could have named none, so failing open crosses no
+            # boundary the caller was not already on the safe side of. Denying would turn
+            # one stale policy row into a lane that cannot use the tool at all, and
+            # reporting it would emit an event per tool call for as long as the mismatch
+            # lasts. The REFUSAL path above is what AC#2 is about, and that one denies.
+            return "none", f"guard hook missing: {_clip(script)}"
+        # A plain filename component cannot escape `hooks_dir` lexically — but a SYMLINK
+        # at that name can, and AC#3 asserts on the DIRECTORY rather than on the string.
+        # Resolve both sides so a symlinked `.claude` or `hooks` is still contained; only
+        # a hook FILE pointing out is refused. No hook file or hooks directory in any live
+        # worker repo on either host is a symlink (checked, not assumed).
+        #
+        # Two residuals, disclosed rather than implied away. A HARD link shares an inode
+        # and has no target to resolve, the same limit ECA-135 recorded for `O_NOFOLLOW`.
+        # And there is a TOCTOU window between this check and the exec below: the file can
+        # be swapped for an out-of-tree symlink in between. Both need write access to the
+        # operator's repo, which a lane with `Write` already has under its own root — and
+        # such a lane can equally overwrite a legitimate hook's CONTENTS, so neither is a
+        # boundary this check ever claimed to hold. It contains the control-socket STRING.
+        contained = hook_path.resolve(strict=True).is_relative_to(hooks_dir.resolve())
+    except OSError as e:
+        # `refused`, not `error`: `error` is the caller's "the hook ran and went wrong"
+        # branch and its message says so, which would be false here. Deny rather than
+        # fail open — a configured guard we could not even evaluate is the one case where
+        # allowing really would be the silent fail-open AC#2 is about.
         return "refused", (
-            f"guard-hook script {script!r} resolves outside {str(hooks_dir)!r} "
-            "(symlinked out, or unresolvable)"
+            f"guard-hook script {_clip(script)} could not be checked: "
+            f"{e.__class__.__name__} on {str(hooks_dir)!r}"
+        )
+    if not contained:
+        return "refused", (
+            f"guard-hook script {_clip(script)} resolves outside {str(hooks_dir)!r} "
+            "(symlinked out of the hooks directory)"
         )
     payload = json.dumps({"tool_name": tool_name, "tool_input": tool_input})
     proc = await asyncio.create_subprocess_exec(

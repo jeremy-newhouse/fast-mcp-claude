@@ -117,18 +117,28 @@ def is_safe_hook_script(script: object) -> bool:
     Why a THIRD predicate rather than reusing the worker one (ECA-140). The task that
     filed this guessed `WORKER_NAME_RE` "probably fits" and asked for it to be checked
     against the hook filenames actually in use before being reused. It does not fit. Two
-    measurements, both against this operator's real hosts:
+    measurements, both against this operator's real hosts, and both taken from the `repo`
+    column of each live `workers` row — i.e. the value that actually becomes `repo_root`
+    here, not a guess at where worker repos live:
 
-    * No guard hook is configured ANYWHERE. All 15 live worker rows (9 on mini2, 6 on
-      mbpm2) carry `guard_hooks={}`, and no worker repo on either host has a
-      `.claude/hooks/` directory at all. So the deployed-config answer is "nothing to
-      break", and the charset question has to be settled from a wider corpus.
-    * That corpus is the 47 distinct `.claude/hooks/` filenames across `~/repos` on
-      mini2. `WORKER_NAME_RE` refuses exactly one of them: `_common.sh`, because it
-      requires an alphanumeric FIRST character. Which is ECA-137's `_supervisor` finding
+    * No guard hook is CONFIGURED anywhere. All 15 live worker rows (9 on mini2, 6 on
+      mbpm2) carry `guard_hooks={}`, so nothing deployed changes behaviour either way.
+    * The hooks directories themselves are very much in use: 6 of those 15 rows have one
+      (mbpm2's `ultra1/2/3/5/6` on `evolv-ultra`, 23 scripts each; mini2's `eca72` on
+      `fast-mcp-claude`, one). 24 distinct filenames between them. `HOOK_SCRIPT_RE`
+      refuses 0 of the 24; `WORKER_NAME_RE` refuses exactly one, `_common.sh`, because it
+      demands an alphanumeric FIRST character. Which is ECA-137's `_supervisor` finding
       arriving a second time in a new name-space — a leading underscore means "shared
       helper, not an entry point" to a shell-script author, so it is idiomatic here in a
       way it never is for a lane name.
+
+    An earlier version of this docstring said no worker repo had a hooks directory at
+    all, and reached the same conclusion from 47 filenames sampled out of `~/repos`. The
+    claim was false — the glob behind it stopped one level short of the real repo roots,
+    which are `~/worker-repos/<lane>/<repo>` — and the sample it fell back on was not the
+    deployed corpus. Review caught it. Recorded because the correction runs the other way
+    for once: `_common.sh` is not an incidental name from some unrelated checkout, it is
+    live in five worker repos this daemon spawns lanes against today.
 
     So the pattern is the worker one with `_` added to the leading class, and nothing
     else. It refuses 0 of the 47 and every traversal shape, because the shapes that

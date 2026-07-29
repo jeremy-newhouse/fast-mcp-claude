@@ -62,9 +62,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from claude_agent_sdk import PermissionResultDeny
-
-from worker_supervisor.gate import QuestionBridge, WorkerPolicy, _run_guard_hook, make_gate
+from worker_supervisor.gate import WorkerPolicy, _run_guard_hook, make_policy_hook
 from worker_supervisor.names import is_safe_hook_script, is_safe_worker_name
 
 # A guard that would be visible if it ran: it creates `sentinel` and then answers "allow",
@@ -88,16 +86,28 @@ def _plant_outside(tmp_path: Path) -> tuple[Path, Path]:
     return script, sentinel
 
 
-def _gate(repo, policy, bridge, events):
-    return make_gate(
-        worker="w1",
-        repo_root=repo,
-        policy=policy,
-        bridge=bridge,
-        events=events,
-        turn_id=1,
-        question_timeout_s=1.0,
+async def _guard_call(repo, policy, events, tool="Bash", tool_input=None):
+    """Drive one tool call through the PreToolUse policy hook.
+
+    ECA-142 moved guard-hook execution out of `can_use_tool` and into the hook,
+    because the CLI auto-approves a subset of calls that never reach `can_use_tool`
+    at all — so a guard configured for Bash simply did not run for them. The hook
+    fires for every call, and it is now the ONLY place a guard runs (exactly-once:
+    it has side effects). These tests follow the code.
+    """
+    hook = make_policy_hook(
+        worker="w1", repo_root=repo, policy=policy, events=events, turn_id=1
     )
+    payload = {"tool_name": tool, "tool_input": tool_input or {"command": "echo hi"}}
+    return await hook(payload, None, None)
+
+
+def _denial(result) -> tuple[bool, str]:
+    """(denied, reason) from a PreToolUse hook result; ({}, "") means no decision."""
+    spec = (result or {}).get("hookSpecificOutput", {})
+    if spec.get("permissionDecision") == "deny":
+        return True, spec.get("permissionDecisionReason", "")
+    return False, ""
 
 
 async def test_relative_traversal_executes_nothing(repo, tmp_path):
@@ -236,7 +246,7 @@ async def test_missing_hook_still_fails_open_unchanged(repo):
 
 
 async def test_gate_denies_refusal_without_claiming_the_hook_ran(registry, events, repo, tmp_path):
-    """End to end through `can_use_tool`: sentinel unwritten, event recorded, honest message.
+    """End to end through the PreToolUse hook: sentinel unwritten, event, honest message.
 
     The message matters as much as the deny. Routing a refusal through the existing
     branch would have told the model "Denied by repo guard hook (deny)" about a hook that
@@ -246,14 +256,13 @@ async def test_gate_denies_refusal_without_claiming_the_hook_ran(registry, event
     script, sentinel = _plant_outside(tmp_path)
     traversal = os.path.relpath(script, repo / ".claude" / "hooks")
     policy = WorkerPolicy(allowed_tools=["Bash"], guard_hooks={"Bash": traversal})
-    gate = _gate(repo, policy, QuestionBridge(registry, events), events)
 
-    res = await gate("Bash", {"command": "echo hi"}, None)
+    denied, message = _denial(await _guard_call(repo, policy, events))
 
     assert not sentinel.exists()
-    assert isinstance(res, PermissionResultDeny)
-    assert "Denied by worker policy" in res.message
-    assert "repo guard hook" not in res.message, "claims a hook ran when none did"
+    assert denied
+    assert "Denied by worker policy" in message
+    assert "repo guard hook" not in message, "claims a hook ran when none did"
     denials = [e for e in events.read("w1") if e["event"] == "tool_denied"]
     assert denials and denials[-1]["reason"].startswith("guard:refused:")
 
@@ -273,11 +282,10 @@ async def test_refusal_is_written_only_under_the_worker_key(registry, events, cf
     target = tmp_path / "REFUSAL-LANDED-HERE"
     traversal = os.path.relpath(target, repo / ".claude" / "hooks")
     policy = WorkerPolicy(allowed_tools=["Bash"], guard_hooks={"Bash": traversal})
-    gate = _gate(repo, policy, QuestionBridge(registry, events), events)
 
-    res = await gate("Bash", {"command": "echo hi"}, None)
+    denied, _ = _denial(await _guard_call(repo, policy, events))
 
-    assert isinstance(res, PermissionResultDeny)
+    assert denied
     assert [e["event"] for e in events.read("w1")] == ["tool_denied"], "the refusal was silent"
     assert sorted(p.name for p in cfg.logs_dir.iterdir()) == ["w1.jsonl"]
 
@@ -286,9 +294,11 @@ async def test_unreadable_hooks_directory_denies_instead_of_raising(registry, ev
     """An OSError from the filesystem probe must not escape into the permission callback.
 
     `Path.exists()` re-raises anything outside (ENOENT, ENOTDIR, EBADF, ELOOP), so a
-    hooks directory at mode 000 raised PermissionError out of `can_use_tool` — the one
-    place ECA-135 established must never raise, because the escape kills the lane's runner
-    loop. Denying rather than failing open is the deliberate half: a configured guard we
+    hooks directory at mode 000 raised PermissionError out of the permission callback —
+    the one place ECA-135 established must never raise, because the escape kills the
+    lane's runner loop. Since ECA-142 the guard runs inside the PreToolUse hook instead,
+    and the invariant transfers unchanged: an exception out of a hook is the same wedge.
+    Denying rather than failing open is the deliberate half: a configured guard we
     cannot even evaluate is exactly the silent fail-open AC#2 names.
     """
     hooks = _hooks(repo)
@@ -299,9 +309,8 @@ async def test_unreadable_hooks_directory_denies_instead_of_raising(registry, ev
         assert decision == "refused", decision
         assert "could not be checked" in reason
         policy = WorkerPolicy(allowed_tools=["Bash"], guard_hooks={"Bash": "ok.sh"})
-        gate = _gate(repo, policy, QuestionBridge(registry, events), events)
-        res = await gate("Bash", {"command": "echo hi"}, None)
-        assert isinstance(res, PermissionResultDeny)
+        denied, _ = _denial(await _guard_call(repo, policy, events))
+        assert denied
     finally:
         hooks.chmod(0o755)
 

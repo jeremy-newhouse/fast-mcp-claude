@@ -24,6 +24,7 @@ from claude_agent_sdk import (
 )
 
 from worker_supervisor.engine import (
+    STOP_GRACE_S,
     Engine,
     TurnOutcome,
     _discipline_append,
@@ -31,6 +32,7 @@ from worker_supervisor.engine import (
 )
 from worker_supervisor.config import Limits
 from worker_supervisor.gate import QuestionBridge, WorkerPolicy
+from worker_supervisor.names import DAEMON_KEY
 from worker_supervisor.registry import TURN_TERMINAL
 
 
@@ -1961,3 +1963,171 @@ async def test_a_legal_lane_still_gets_its_own_log_and_capsule(
     assert not any(e.get("log_key_refused") for e in events.read("ultra-2"))
     capsules = list(cfg.capsules_dir.glob("ultra-2-turn*.json"))
     assert len(capsules) == 1, f"expected one capsule, got {capsules}"
+
+
+# -- ECA-148: daemon shutdown with a turn in flight -----------------------------
+
+
+async def _turn_running(registry, turn_id: int):
+    t = await registry.get_turn(turn_id)
+    return t if t and t["state"] == "running" else None
+
+
+async def test_stop_returns_with_a_turn_in_flight(make_engine, registry, repo, events):
+    """ECA-148: `stop()` must not be wedged by the very turn it is cancelling.
+
+    Bounded TWICE, and the two bounds catch different regressions.
+
+    `wait_for` catches an unbounded `stop()`. It has to be here rather than left
+    to pytest, because the `make_engine` fixture's teardown calls `stop()` too —
+    so an unbounded `stop()` does not fail one test, it wedges the whole
+    interpreter and the run only reports its (true) pass count when SIGINT
+    releases it. That is ECA-146's symptom exactly.
+
+    The `stop_incomplete` assertion catches the actual defect. Restore the
+    swallow in `_worker_loop` and `stop()` still RETURNS — the grace expires —
+    but it abandons a live runner, and only that event tells the two apart.
+    """
+    engine, _ = make_engine([[Hang()]])
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "work")
+    await wait_until(lambda: _turn_running(registry, tid))
+
+    await asyncio.wait_for(engine.stop(), timeout=STOP_GRACE_S * 3)
+
+    abandoned = [e for e in events.read(DAEMON_KEY) if e["event"] == "stop_incomplete"]
+    assert not abandoned, (
+        f"stop() gave up on a runner instead of exiting cleanly: {abandoned} — the "
+        "runner swallowed its own cancellation and went back round the loop"
+    )
+    assert not [t for t in engine._runners.values() if not t.done()]
+
+
+async def test_a_turn_interrupted_by_stop_is_redelivered_on_the_next_boot(
+    make_engine, registry, repo, events
+):
+    """ECA-148 AC#2: what happens to the turn `stop()` interrupted.
+
+    It is left `running` ON PURPOSE and healed by `boot_reconcile`, which is the
+    same at-least-once contract a crash already has — the work is redelivered,
+    not silently dropped. Asserted by actually running the reconcile rather than
+    by asserting the intent, and paired with the `turn_interrupted` event so the
+    gap in `workers events` is explained rather than mysterious.
+    """
+    engine, _ = make_engine([[Hang()]])
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "work")
+    await wait_until(lambda: _turn_running(registry, tid))
+
+    await asyncio.wait_for(engine.stop(), timeout=STOP_GRACE_S * 3)
+
+    interrupted = [e for e in events.read("w1") if e["event"] == "turn_interrupted"]
+    assert [e["turn_id"] for e in interrupted] == [tid], events.read("w1")
+    assert (await registry.get_turn(tid))["state"] == "running"
+
+    stats = await registry.boot_reconcile()
+    assert stats["turns_redelivered"] == 1, stats
+    healed = await registry.get_turn(tid)
+    assert healed["state"] == "queued"
+    assert healed["redeliveries"] == 1
+
+
+async def test_kill_still_leaves_the_runner_alive(make_engine, registry, repo):
+    """The other half of the branch ECA-148 split, and the reason it was one branch.
+
+    `kill()` cancels the TURN task and deliberately leaves the runner loop alive
+    so it can re-read worker status; `stop()` cancels the RUNNER and needs it to
+    exit. Both arrive at the same `await task` as a CancelledError with
+    `task.cancelled()` true. Fixing the shutdown case by simply re-raising would
+    have broken this one, so it is asserted alongside.
+    """
+    engine, _ = make_engine([[Hang()]])
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "work")
+    await wait_until(lambda: _turn_running(registry, tid))
+    runner = engine._runners["w1"]
+
+    await engine.kill("w1")
+    await asyncio.wait_for(asyncio.shield(runner), timeout=5)
+
+    # It exited by reading `killed` off the worker row at the top of the loop —
+    # not by having the shutdown path's re-raise torn through it.
+    assert not runner.cancelled()
+    assert (await registry.get_turn(tid))["state"] == "killed"
+
+
+async def test_stop_gives_up_loudly_on_a_task_cancellation_cannot_reach(
+    make_engine, repo, events, monkeypatch
+):
+    """The backstop bound, tested against the shape that motivates it.
+
+    `stop()` has no cure for an await that cancellation cannot reach, and one
+    demonstrably exists: the SDK's `Query.close()` runs inside
+    `anyio.CancelScope(shield=True)` and its own docstring says it is NOT bounded
+    (unlike `transport.close()`'s shield), so a wedged transport close holds the
+    runner open no matter what `stop()` sends. Modelled with a task that swallows
+    its cancellation, because a unit test cannot honestly wedge a real transport.
+
+    What is asserted is therefore not "it recovers" — it does not — but that the
+    daemon still finishes shutting down and NAMES what it abandoned, instead of
+    waiting on it forever.
+    """
+    monkeypatch.setattr("worker_supervisor.engine.STOP_GRACE_S", 0.2)
+    engine, _ = make_engine([])
+    release = asyncio.Event()
+
+    async def unreachable() -> None:
+        while not release.is_set():
+            try:
+                await asyncio.wait_for(release.wait(), timeout=3600)
+            except asyncio.CancelledError:
+                pass  # a shielded await: the cancel does not land
+
+    stuck = asyncio.create_task(unreachable(), name="wedged-close")
+    engine._watchdogs.add(stuck)
+    try:
+        await asyncio.wait_for(engine.stop(), timeout=10)
+        abandoned = [e for e in events.read(DAEMON_KEY) if e["event"] == "stop_incomplete"]
+        assert [e["abandoned"] for e in abandoned] == [["wedged-close"]], abandoned
+        assert not stuck.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(stuck, timeout=5)
+
+
+async def test_stop_in_the_window_just_after_a_turn_finishes(
+    make_engine, registry, repo, events, monkeypatch
+):
+    """The window ECA-146 kept falling into, asserted directly (ECA-148 AC#4).
+
+    `terminal_turn`/`wait_until` — the helpers nearly every test in this file ends
+    on — observe the turn row the instant `finish_turn` commits, which is BEFORE
+    `_worker_loop` returns from `await task`. So at the moment a typical test stops
+    asserting, the runner is still parked on the in-flight turn task, and the
+    `make_engine` teardown's `stop()` lands in that gap. Pre-fix that swallowed the
+    cancellation and the INTERPRETER never exited: measured, the probe printed
+    "1 passed in 45.09s" and only SIGINT released it — ECA-146's symptom exactly,
+    with no SDK cleanup anywhere in the picture (the fake `query` never enters it).
+
+    `set_worker_status` is slowed to WIDEN that window, not to create it: it is the
+    last await in `_run_turn`, already after `finish_turn`. Un-widened, the gap is a
+    scheduling accident — which is why ECA-146 was never reproducible on demand.
+
+    Stopping EXPLICITLY here rather than leaving it to teardown is what keeps a
+    regression a failure instead of a hang.
+    """
+    original = registry.set_worker_status
+
+    async def slow(*a, **k):
+        await asyncio.sleep(0.5)
+        return await original(*a, **k)
+
+    monkeypatch.setattr(registry, "set_worker_status", slow)
+    engine, _ = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "work")
+    assert (await terminal_turn(registry, tid))["state"] == "done"
+
+    await asyncio.wait_for(engine.stop(), timeout=STOP_GRACE_S * 3)
+
+    assert not [e for e in events.read(DAEMON_KEY) if e["event"] == "stop_incomplete"]

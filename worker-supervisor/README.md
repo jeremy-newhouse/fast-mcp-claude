@@ -128,3 +128,25 @@ cp .env.example .env      # adjust limits / mesh settings
 ./start.sh                # pm2 (name: worker-supervisor)
 uv run workers status     # CLI against the running daemon
 ```
+
+### Restarting with a lane busy
+
+Safe, and it no longer needs a `workers status` busy-lane check first. Until
+ECA-148 a restart with a turn in flight was a genuine trap: `Engine.stop()` never
+returned (the runner swallowed its own cancellation), so the daemon logged
+`shutting down` and then sat there — **measured at >60s after SIGTERM, with the
+CLI subprocess already reaped**. It is now ~7s, `rc=0`; the 7s is the SDK's own
+bounded transport teardown (stdin close → SIGTERM → SIGKILL), not a wait on us.
+
+Two consequences worth knowing:
+
+- **pm2 SIGKILLs before that finishes.** `kill_timeout` is unset on this app, so
+  pm2's 1600ms default applies and the tree is killed at 1.6s. Nothing is lost —
+  `treekill` reaps the CLI child, and `boot_reconcile` resets `claimed`/`running`
+  turns to `queued` (`redeliveries + 1`) on the next boot — but the graceful path
+  does not complete under pm2 today. Raise `kill_timeout` to ~15000 if you want
+  it to (ECA-149).
+- **The interrupted turn is redelivered, not lost.** It stays `running` on
+  purpose and `boot_reconcile` requeues it, the same at-least-once contract a
+  crash has. `workers events` records it as `turn_interrupted` so the gap is
+  explained rather than mysterious.

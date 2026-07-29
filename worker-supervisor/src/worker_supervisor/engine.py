@@ -16,6 +16,7 @@ import re
 import secrets
 from collections import deque
 from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -73,6 +74,26 @@ LIFECYCLE_BUDGET_RESERVE_USD = 5.0
 # unreadable, and the point of the capsule is that a human can open it.
 MAX_ERROR_ITEMS = 10
 ERROR_ITEM_CHARS = 500
+
+# ECA-148: how long `stop()` waits for cancelled runners/watchdogs before it gives
+# up on them and says so. A backstop for an await cancellation cannot reach (the
+# SDK's shielded, explicitly unbounded `Query.close()`), not a tuning knob — so it
+# is a constant rather than a config key, and deliberately shorter than any
+# plausible operator patience. Under pm2 the effective ceiling is `kill_timeout`
+# (default 1600ms) regardless; this grace is for a hand-run daemon and for tests.
+STOP_GRACE_S = 10.0
+
+
+def _self_cancelled() -> bool:
+    """Has cancellation been requested on the CURRENTLY RUNNING task?
+
+    `Task.cancel()` increments this counter on its target before it touches the
+    future that task is awaiting — so it distinguishes "I was cancelled" from "the
+    thing I was awaiting was cancelled", which is the distinction `_worker_loop`
+    could not make and ECA-148 turned into a shutdown that never returned.
+    """
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 # Lifecycle prompts embed the ABSOLUTE handover dir: a weak model given a bare
 # ".claude/handovers/" resolved it against $HOME, missed the repo's handover,
@@ -494,13 +515,43 @@ class Engine:
             )
 
     async def stop(self) -> None:
-        for task in [*self._runners.values(), *self._watchdogs]:
-            task.cancel()
-        for task in [*self._runners.values(), *self._watchdogs]:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        """Cancel every runner/watchdog and wait for them — BOUNDED (ECA-148).
+
+        The unbounded `await task` this replaces could not return at all while a
+        turn was in flight, because `_worker_loop` swallowed the runner's own
+        cancellation (fixed there; this is the backstop, not the cure). A bound
+        belongs here regardless: the SDK's `Query.close()` is documented as
+        SHIELDED and explicitly *not* bounded, so a wedged transport close cannot
+        be interrupted by the cancellation this sends — `stop()` would wait on it
+        forever, and the daemon's SIGTERM path awaits `stop()` before it closes
+        the registry and exits.
+
+        Anything still pending at the deadline is ABANDONED, loudly: the process
+        is on its way out either way, and an event naming the tasks beats a
+        shutdown that never completes. Under pm2 the practical ceiling is much
+        lower than this grace anyway (`kill_timeout` defaults to 1600ms, after
+        which the tree is SIGKILLed) — the grace exists for a daemon run by hand
+        and for tests, not to hold pm2 open.
+        """
+        tasks = [*self._runners.values(), *self._watchdogs]
+        pending: set[asyncio.Task[None]] = set()
+        if tasks:
+            for task in tasks:
+                task.cancel()
+            _, pending = await asyncio.wait(tasks, timeout=STOP_GRACE_S)
+            for task in tasks:
+                # Retrieve outcomes so a runner that died of its own exception
+                # does not surface as "Task exception was never retrieved" during
+                # interpreter shutdown. The old per-task `await` did this
+                # implicitly; `asyncio.wait` does not.
+                if task.done():
+                    with suppress(asyncio.CancelledError, Exception):
+                        task.exception()
+        if pending:
+            self._events.emit(
+                DAEMON_KEY, "stop_incomplete", grace_s=STOP_GRACE_S,
+                abandoned=sorted(t.get_name() for t in pending),
+            )
         self._runners.clear()
         self._watchdogs.clear()
 
@@ -646,6 +697,30 @@ class Engine:
                 try:
                     await task
                 except asyncio.CancelledError:
+                    # ECA-148: WHOSE cancellation is this? Two callers cancel into
+                    # this await and they want opposite things. `kill()` cancels the
+                    # TURN task and deliberately leaves the runner alive so the loop
+                    # can re-read worker status; `stop()` cancels the RUNNER and
+                    # needs it to exit. Both arrive here as a CancelledError with
+                    # `task.cancelled()` true — asyncio cancels the awaited future
+                    # when the awaiting task is cancelled — so the inner task's own
+                    # state cannot tell them apart. It answered "killed" for both,
+                    # and `continue` then swallowed the runner's cancellation: the
+                    # loop went round, parked in the 15s idle wait below, and
+                    # `stop()`'s await never returned. Ask whether WE were cancelled
+                    # instead; that is true only on the `stop()` path.
+                    if _self_cancelled():
+                        # Leave the turn row `running` on purpose. `boot_reconcile`
+                        # resets claimed/running turns to queued (redeliveries + 1),
+                        # so the interrupted work is redelivered on the next boot
+                        # rather than silently dropped — the same at-least-once
+                        # contract a crash already has. Emitted so the gap in
+                        # `workers events` is explained rather than mysterious.
+                        self._events.emit(
+                            name, "turn_interrupted", turn_id=turn["id"],
+                            reason="daemon stop",
+                        )
+                        raise
                     if task.cancelled():
                         continue  # the turn was killed; loop decides via status
                     task.cancel()

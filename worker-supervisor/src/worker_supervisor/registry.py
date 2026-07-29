@@ -315,6 +315,37 @@ class Registry:
         )
         return _row(await cur.fetchone())
 
+    async def previous_epoch_end_reason(self, worker: str) -> str | None:
+        """Why the epoch before the current one ended — i.e. why THIS one was opened.
+
+        ECA-147: G7's circuit breaker needs to know whether it is already inside a
+        resume-failure recovery, and the reason a roll happened is only recorded on the
+        epoch it ended.
+        """
+        epoch = await self.current_epoch(worker)
+        if epoch is None:
+            return None
+        cur = await self.db.execute(
+            "SELECT end_reason FROM epochs WHERE worker = ? AND seq = ?",
+            (worker, epoch["seq"] - 1),
+        )
+        row = await cur.fetchone()
+        return row["end_reason"] if row else None
+
+    async def has_successful_resume(self, epoch_id: int) -> bool:
+        """Has any turn in this epoch actually resumed a session and finished cleanly?
+
+        ECA-147: this is what "the chain is healthy again" means. A `done` turn with no
+        `resume_from` does not qualify — the restore turn G7 enqueues is exactly that,
+        and it succeeding proves the CLI works, not that resuming does.
+        """
+        cur = await self.db.execute(
+            "SELECT 1 FROM turns WHERE epoch_id = ? AND state = 'done'"
+            " AND resume_from IS NOT NULL LIMIT 1",
+            (epoch_id,),
+        )
+        return await cur.fetchone() is not None
+
     async def roll_epoch(self, worker: str, reason: str) -> dict[str, Any]:
         """End the current epoch (reason) and open the next one."""
         now = _now()

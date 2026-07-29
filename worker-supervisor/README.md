@@ -28,15 +28,24 @@ Tracked as **ECA-60** (Backlog in evolv-coder-agent).
   consulting `can_use_tool` (ECA-142). `AskUserQuestion` parks as an escalation answered
   via the CLI. Grant syntax below.
 - **Failure ladder**: a turn that dies is retried ONCE with the same resume id — unless the
-  CLI reported a 4xx `api_error_status` (a 429 spend cap, a 401), which is terminal and skips
-  the retry with the reason recorded as `no_retry` on the `turn_error` event, because the
-  retry has no backoff. A **dead resume chain** ends the epoch (`resume_failed`) and opens the
-  next one on a handover restore rather than silently continuing fresh. That is detected by
-  what the CLI DID — a resumed turn with no `system/init` frame never had its chain accepted —
-  and deliberately not by the exception type, which varies with where inside the SDK the exit
-  was noticed and so silently skipped this branch for two of its three forms (ECA-147). Every
-  failed turn also writes a capsule carrying `saw_init` / `frames` alongside the CLI's own
-  result diagnostics.
+  CLI reported a 4xx `api_error_status`, which skips the retry and records why as `no_retry`
+  on the `turn_error` event. Not because a 429 is inherently unretryable (it usually is), but
+  because the CLI runs its own exponential backoff *before* it reports a status at all, so
+  this ladder — immediate, no backoff — can only re-ask a question the CLI just spent minutes
+  on. 5xx keeps its retry.
+- **Dead resume chain** (G7): ends the epoch (`resume_failed`) and opens the next one on a
+  handover restore rather than silently continuing fresh. Detected by what the CLI DID, not by
+  the exception type — the type depends on where inside the SDK the exit was noticed, and all
+  three possibilities describe the same event (ECA-147). The test is: the turn was resuming,
+  no `system/init` frame arrived, **and** the CLI corroborated a refusal by exiting non-zero
+  or saying so on stderr. The corroboration is not optional — a missing binary, a vanished
+  cwd, or a slow-MCP `initialize` timeout also die before `init`, and rolling on those would
+  discard a live session and re-ground the lane from a possibly stale handover. Recovery is
+  attempted **once**: if the epoch it opened cannot resume either, that is
+  `resume_recovery_exhausted` and the turn just fails (keep-on-failure) instead of rolling
+  again. Every failed turn that reached a subprocess writes a capsule carrying `saw_init` /
+  `frames` alongside the CLI's own result diagnostics (a pre-spawn `budget_refused` has no
+  outcome to report, and a `killed` turn gets no capsule).
 - **Control surface**: `workers` CLI over a unix socket (local-only, JSON out):
   `spawn / prompt / status / questions / answer / cycle / kill / events / attach / history`.
 - **Auth**: the host's logged-in Claude CLI subscription. Worker env is allowlist-built;

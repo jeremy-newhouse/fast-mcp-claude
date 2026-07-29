@@ -16,6 +16,7 @@ import pytest
 from claude_agent_sdk import (
     AssistantMessage,
     CLIConnectionError,
+    CLINotFoundError,
     ProcessError,
     ResultMessage,
     SystemMessage,
@@ -108,11 +109,46 @@ def init(**data: Any) -> SystemMessage:
     return SystemMessage(subtype="init", data=data)
 
 
+class Refused:
+    """Script sentinel: the CLI refused the session it was told to resume.
+
+    The full measured shape (CLI 2.1.220), not just the exception: the refusal goes to
+    STDERR, no message frame is emitted, and the process exits. Which exception the SDK
+    then delivers depends on where it noticed the exit, so that is a parameter here —
+    but the stderr line is the CLI's own, and it is the same either way. G7 needs one of
+    the two as corroboration, so a script that raises without the stderr line describes
+    a DIFFERENT failure (an environment one) and must not be mistaken for this.
+    """
+
+    def __init__(self, exc: Exception, session_id: str = "s1") -> None:
+        self.exc = exc
+        self.stderr = f"No conversation found with session ID: {session_id}"
+
+
+class Stderr:
+    """Script sentinel: write a line to the turn's stderr instead of yielding a frame.
+
+    Lets a script put the CLI's refusal text on stderr for a turn that DID start, which
+    is the adversarial case for G7's narrowness: corroboration present, init present, so
+    the absence test is the only thing standing between an ordinary failure and a
+    discarded epoch.
+    """
+
+    def __init__(self, line: str) -> None:
+        self.line = line
+
+
 def make_fake_query(script: list[Any], calls: list[Any]):
     async def fake_query(*, prompt, options, transport=None):
         idx = len(calls)
         calls.append(options)
         item = script[idx] if idx < len(script) else script[-1]
+        if isinstance(item, Refused):
+            # stderr FIRST: the CLI writes its complaint and then exits, so the tail is
+            # already populated by the time the SDK surfaces an exception.
+            if options.stderr is not None:
+                options.stderr(item.stderr)
+            raise item.exc
         if isinstance(item, Exception):
             # A bare raise is the DIED-BEFORE-ANY-FRAME shape, and on the real CLI
             # that is what a rejected resume looks like: measured on 2.1.220, a
@@ -145,6 +181,10 @@ def make_fake_query(script: list[Any], calls: list[Any]):
             # and `receive_messages` then raises a bare `Exception`. Confirmed by the
             # live ECA-143 capsule, whose recorded reason begins "Exception: " — the
             # engine's ProcessError clause would have written "ProcessError: ".
+            if isinstance(msg, Stderr):
+                if options.stderr is not None:
+                    options.stderr(msg.line)
+                continue
             if isinstance(msg, Exception):
                 raise msg
             if isinstance(msg, Hang):
@@ -393,6 +433,10 @@ async def test_resume_failed_capsule_says_the_session_never_started(
     has no COALESCE), but it is no longer load-bearing and this test no longer claims
     it is. What IS load-bearing: an operator opening this capsule can tell "the chain
     was refused" from "the turn ran and then broke".
+
+    Deliberately a bare `ProcessError` rather than the fuller `Refused` shape: with no
+    refusal line on stderr, the non-zero exit is the ONLY corroboration available, so
+    this is the test that keeps that route alive on its own.
     """
     engine, _ = make_engine(
         [[r("s1")], ProcessError("Command failed with exit code 1", exit_code=1), [r("s3")]]
@@ -544,10 +588,19 @@ async def test_turn_mcp_diagnostics_emitted_on_failure_ladder_too(
         #                        `receive_messages` raises. The ECA-143 shape.
         # G7 used to be spelled `except ProcessError`, so two of these three silently
         # skipped it. This parametrization is the regression guard: the branch must not
-        # be reachable-by-type again.
-        pytest.param(ProcessError("Command failed with exit code 1", exit_code=1), id="ProcessError"),
-        pytest.param(CLIConnectionError("Cannot write to process that exited"), id="CLIConnectionError"),
-        pytest.param(Exception("Command failed with exit code 1"), id="bare-Exception"),
+        # be reachable-by-type again. All three carry the CLI's refusal on stderr,
+        # because that is what the real thing does (`Refused`) — and for the two
+        # non-ProcessError types it is the ONLY corroboration, so this also proves the
+        # stderr route works, not just the exit-code one.
+        pytest.param(
+            Refused(ProcessError("Command failed with exit code 1", exit_code=1)),
+            id="ProcessError",
+        ),
+        pytest.param(
+            Refused(CLIConnectionError("Cannot write to process that exited")),
+            id="CLIConnectionError",
+        ),
+        pytest.param(Refused(Exception("Command failed with exit code 1")), id="bare-Exception"),
     ],
 )
 async def test_resume_failure_rolls_epoch_and_enqueues_restore(
@@ -580,26 +633,41 @@ async def test_resume_failure_rolls_epoch_and_enqueues_restore(
     assert calls[2].resume is None  # fresh chain, grounded by the handover restore
 
 
+REFUSAL = ["No conversation found with session ID: s1"]
+
+
 @pytest.mark.parametrize(
-    "resume_from,saw_init,dead",
+    "resume_from,saw_init,exc,stderr,dead,why",
     [
-        ("s1", False, True),   # resuming, and the CLI never announced the session
-        ("s1", True, False),   # resuming, session was live: an ordinary turn failure
-        (None, False, False),  # no chain to lose
-        (None, True, False),
+        # The measured refusal: exited non-zero, announced nothing.
+        ("s1", False, ProcessError("x", exit_code=1), [], True, "exit code corroborates"),
+        # Same refusal reported only on stderr — the type is the SDK's to change.
+        ("s1", False, Exception("x"), REFUSAL, True, "the CLI said so"),
+        # Chain was accepted, then the turn died: ordinary failure, keep the epoch.
+        ("s1", True, ProcessError("x", exit_code=1), REFUSAL, False, "session was live"),
+        # No chain to lose.
+        (None, False, ProcessError("x", exit_code=1), REFUSAL, False, "not resuming"),
+        # Pre-init deaths that say NOTHING about the chain. Review round found these
+        # rolling: a missing binary or a vanished cwd raises out of connect() before a
+        # read task exists, and a 60s initialize timeout is a bare Exception with no
+        # frames. Rolling on those discards a live session and re-grounds the lane from
+        # a handover file that may be an epoch old.
+        ("s1", False, CLINotFoundError("no claude binary"), [], False, "environment"),
+        ("s1", False, CLIConnectionError("cwd is gone"), [], False, "environment"),
+        ("s1", False, Exception("Control request timeout: initialize"), [], False, "slow MCP"),
     ],
 )
-def test_dead_resume_chain_predicate(resume_from, saw_init, dead):
-    """G7's trigger, pinned directly.
+def test_dead_resume_chain_predicate(resume_from, saw_init, exc, stderr, dead, why):
+    """G7's trigger, pinned directly: absence of an init frame PLUS corroboration.
 
     The engine-level tests below prove the WIRING, and they are the ones that matter —
-    but each of them reaches this decision through a full turn, so a mutation that
-    makes it fire everywhere sends the lane into a roll/restore loop and those tests
-    then HANG instead of failing (measured while falsifying this change). A predicate
-    test cannot hang, so it is what actually pins the truth table.
+    but each reaches this decision through a full turn, so a mutation that makes it fire
+    everywhere sends the lane into a roll/restore loop and those tests then HANG instead
+    of failing (measured while falsifying this change). A predicate test cannot hang, so
+    it is what pins the truth table.
     """
     outcome = TurnOutcome(saw_init=saw_init)
-    assert _is_dead_resume_chain(resume_from, outcome) is dead
+    assert _is_dead_resume_chain(resume_from, outcome, exc, stderr) is dead, why
 
 
 async def test_a_resumed_turn_that_started_and_then_died_does_not_roll_the_epoch(
@@ -608,14 +676,21 @@ async def test_a_resumed_turn_that_started_and_then_died_does_not_roll_the_epoch
     """The other half of ECA-147: G7 must stay NARROW.
 
     The CLI accepted the chain (it announced the session, and here even produced a
-    result) and then the process exited non-zero. That is an ordinary turn failure —
-    the epoch is alive, keep-on-failure applies, and rolling it would throw away a
-    working session plus a restore turn's worth of context for nothing. This is the
-    case the live ECA-143 lane hit on every turn, so an over-broad fix would have
-    cycled that lane's epoch repeatedly instead of just failing the turn.
+    result) and then the process died. That is an ordinary turn failure — the epoch is
+    alive, keep-on-failure applies, and rolling it would throw away a working session
+    plus a restore turn's worth of context for nothing. This is the case the live
+    ECA-143 lane hit on every turn, so an over-broad fix would have cycled that lane's
+    epoch repeatedly instead of just failing the turn.
+
+    Set up adversarially: the refusal text is on stderr TOO, so the corroboration half of
+    the test is satisfied and the observed init frame is the only thing preventing a
+    roll. That makes this the test that fails if `_observe` stops recording `saw_init` —
+    and the one that fails if the fake stops prepending the init frame the real CLI
+    always sends.
     """
     boom = SDK_ERROR_EXIT()
-    engine, _ = make_engine([[r("s1")], [r("s2"), boom], [r("s2"), boom]])
+    started_then_died = [r("s2"), Stderr("No conversation found with session ID: sX"), boom]
+    engine, _ = make_engine([[r("s1")], started_then_died, started_then_died])
     await engine.spawn("w1", str(repo))
     t1 = await engine.prompt("w1", "one")
     await terminal_turn(registry, t1)
@@ -648,16 +723,17 @@ async def test_a_first_turn_dying_before_init_does_not_roll_the_epoch(
     assert epoch["seq"] == 1
 
 
-async def test_a_dead_resume_rolls_the_epoch_at_most_once(
+async def test_a_failing_restore_does_not_roll_the_epoch_again(
     make_engine, registry, repo, events
 ):
-    """Termination: the recovery cannot become a loop.
+    """The easy half of termination: the recovery's own restore turn fails.
 
-    Every call after the first fails before init here, so the restore turn G7 enqueues
-    fails too. It must not roll again — and it cannot, because the fresh epoch holds no
-    session id, so its turns run with `resume_from is None` and take the ordinary
-    ladder. Asserted rather than argued: this is the property that makes it safe for
-    the dead-chain test to be broader than "the resume was specifically rejected".
+    It cannot roll again, because the fresh epoch holds no session id, so its turns run
+    with `resume_from is None` and take the ordinary ladder. NOTE what this does not
+    prove — see the next test. This test used to be called "…at most once" and claimed
+    to establish termination in general; the review round showed that was false, and
+    that its script (every call after the first fails) was the one shape in which the
+    loop cannot start.
     """
     engine, _ = make_engine(
         [[r("s1")], ProcessError("Command failed with exit code 1", exit_code=1)]
@@ -682,6 +758,100 @@ async def test_a_dead_resume_rolls_the_epoch_at_most_once(
     assert epoch["seq"] == 2, "the epoch rolled more than once"
 
 
+async def test_a_second_dead_resume_inside_a_recovery_does_not_roll_again(
+    make_engine, registry, repo, events
+):
+    """The hard half, and the one the first round of this change got wrong.
+
+    Systemic refusal: the CLI works, but every RESUME is refused (a read-only
+    `~/.claude/projects`, or `session_transcript_path` drifting from what the CLI
+    actually reads). Then G7's cure feeds itself — roll, restore (succeeds, it resumes
+    nothing), auto-continue (ECA-84), that continuation resumes the restore's session,
+    refused, roll again. The review round measured the unbounded version at 40 rolls /
+    82 CLI invocations, each roll costing a real restore turn, and each new epoch
+    getting a fresh `max_budget_usd_per_epoch` so the budget cannot bound it.
+
+    Exactly one roll, then it stops loudly with `resume_recovery_exhausted`.
+    """
+    refused = ProcessError("Command failed with exit code 1", exit_code=1)
+    #  fresh ok  |  resume refused  |  restore ok  |  every resume after: refused
+    engine, _ = make_engine([[r("s1")], refused, [r("s2")], refused])
+    await engine.spawn("w1", str(repo))
+    t1 = await engine.prompt("w1", "one")
+    await terminal_turn(registry, t1)
+    t2 = await engine.prompt("w1", "two")
+    await terminal_turn(registry, t2)
+
+    async def _exhausted():
+        rows = [e for e in events.read("w1") if e["event"] == "resume_recovery_exhausted"]
+        return rows or None
+
+    await wait_until(_exhausted, timeout=10.0)
+    assert len([e for e in events.read("w1") if e["event"] == "resume_failed"]) == 1, (
+        "G7 rolled more than once for the same unresolved refusal"
+    )
+    epoch = await registry.current_epoch("w1")
+    assert epoch["seq"] == 2, f"epoch rolled again (seq={epoch['seq']})"
+    # The continuation is the turn that got refused inside the recovery: it must be a
+    # plain error, and it must say why no roll happened.
+    errored = [e for e in events.read("w1") if e["event"] == "turn_error"][-1]
+    assert "not rolling the epoch a second time" in errored["error"]
+    assert "operator" in errored["no_retry"]
+
+
+async def test_recovery_breaker_reopens_once_a_resume_actually_works(
+    cfg, registry, events, repo
+):
+    """The breaker's truth table, directly — and its release condition.
+
+    A hang-proof test on purpose: the engine-level version above drives real turns, so a
+    mutation that disables the breaker makes it loop instead of fail. What matters here
+    is that the condition is not a permanent latch — one successfully RESUMED turn and a
+    genuine dead chain months later still gets its recovery.
+    """
+    engine = Engine(cfg, registry, events, QuestionBridge(registry, events))
+    await engine.spawn("w1", str(repo))
+    assert await engine._resume_recovery_would_repeat("w1") is False, "no roll yet"
+
+    await registry.roll_epoch("w1", "cycled")
+    assert await engine._resume_recovery_would_repeat("w1") is False, (
+        "a cycle is not a resume failure"
+    )
+
+    await registry.roll_epoch("w1", "resume_failed")
+    assert await engine._resume_recovery_would_repeat("w1") is True
+
+    # A `done` restore turn resumes nothing, so it proves the CLI works, not the chain.
+    epoch = await registry.current_epoch("w1")
+    tid = await registry.enqueue_turn("w1", "restore me", kind="restore")
+    await registry.claim_turn(tid)
+    await registry.start_turn(tid, None)
+    await registry.finish_turn(tid, "done", session_id="sR")
+    assert await engine._resume_recovery_would_repeat("w1") is True, (
+        "a restore turn has no resume_from — it cannot be the proof the chain is back"
+    )
+
+    # Nor does a turn that TRIED to resume and failed. It is the same evidence that got
+    # us here, so counting it would release the breaker on the strength of the problem.
+    tid_bad = await registry.enqueue_turn("w1", "resume and fail", kind="prompt")
+    await registry.claim_turn(tid_bad)
+    await registry.start_turn(tid_bad, "sR")
+    await registry.finish_turn(tid_bad, "error", error="refused again")
+    assert await engine._resume_recovery_would_repeat("w1") is True, (
+        "a FAILED resumed turn was counted as proof the chain recovered"
+    )
+
+    tid2 = await registry.enqueue_turn("w1", "work", kind="prompt")
+    await registry.claim_turn(tid2)
+    await registry.start_turn(tid2, "sR")
+    await registry.finish_turn(tid2, "done", session_id="sR2")
+    assert await registry.has_successful_resume(epoch["id"]) is True
+    assert await engine._resume_recovery_would_repeat("w1") is False, (
+        "the breaker latched after the chain demonstrably recovered"
+    )
+    await engine.stop()
+
+
 @pytest.mark.parametrize(
     "status,attempts,retried",
     [
@@ -689,14 +859,20 @@ async def test_a_dead_resume_rolls_the_epoch_at_most_once(
         (401, 1, False),  # auth: a second attempt has the same credential
         (503, 2, True),   # upstream overload: genuinely worth one more attempt
         (None, 2, True),  # no status at all: unchanged behavior, retry once
+        # The LOWER bound, which the review round found untested: a status the CLI
+        # should never pair with is_error is not an error class, and must not be read
+        # as "terminal" just because it is a number.
+        (200, 2, True),
     ],
 )
 async def test_the_ladder_retries_only_what_a_retry_could_fix(
     make_engine, registry, repo, events, status, attempts, retried
 ):
-    """ECA-147 AC#4. The retry rebuilds the subprocess IMMEDIATELY — there is no
-    backoff — so the question is not "might this succeed later" but "can it succeed
-    right now". A status the API attributed to the caller cannot; a 5xx can."""
+    """ECA-147 AC#4. By the time the CLI reports an `api_error_status` it has already
+    run its own exponential backoff (measured: ten `api_retry` frames over ~190s), so
+    this ladder — which rebuilds the subprocess immediately, with no backoff — can only
+    re-ask a question that was just answered. A 5xx is where a fresh process plausibly
+    lands differently, so it keeps its retry."""
     boom = SDK_ERROR_EXIT()
     frame = r_api_error(status=status) if status is not None else r("s1")
     script = [[frame, boom], [frame, boom]] if status is not None else [
@@ -716,6 +892,32 @@ async def test_the_ladder_retries_only_what_a_retry_could_fix(
         assert "no_retry" not in errored, "a retried failure must not claim it was suppressed"
     else:
         assert f"api_error_status={status}" in errored["no_retry"]
+
+
+async def test_a_turn_that_did_retry_never_claims_the_retry_was_suppressed(
+    make_engine, registry, repo, events
+):
+    """The status can appear only on the SECOND attempt, and then the event lied.
+
+    Review round: `no_retry` was computed from whichever outcome failed terminally, so a
+    turn that died statuslessly (retried, correctly) and then came back 429 recorded BOTH
+    a `turn_retry` row and a "this was not retried" reason. The field exists to tell a
+    missing retry apart from a ladder that was never wired up, so being wrong here is
+    worse than being absent.
+    """
+    engine, calls = make_engine(
+        [RuntimeError("died with no status"), [r_api_error(status=429), SDK_ERROR_EXIT()]]
+    )
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "statusless then 429")
+    turn = await terminal_turn(registry, tid)
+
+    assert turn["state"] == "error" and len(calls) == 2
+    rows = events.read("w1")
+    assert [e for e in rows if e["event"] == "turn_retry"], "attempt 1 should have retried"
+    errored = [e for e in rows if e["event"] == "turn_error"][-1]
+    assert "no_retry" not in errored, f"claimed a suppression that never happened: {errored}"
+    assert errored["api_error_status"] == 429  # the status still reaches the operator
 
 
 async def test_epoch_budget_refuses_next_turn(make_engine, registry, repo):

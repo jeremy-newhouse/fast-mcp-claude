@@ -218,6 +218,14 @@ class TurnOutcome:
     tools: list[str] = field(default_factory=list)
     saw_result: bool = False
     mcp_init: list[dict[str, Any]] | None = None
+    # ECA-147: did the CLI ever announce the session, and did it emit anything at
+    # all? `saw_init` is what distinguishes "the resume was rejected" (the CLI dies
+    # with no frame) from "the turn got going and then failed" — measured on CLI
+    # 2.1.220: SystemMessage(subtype="init") is the FIRST frame of a fresh turn and
+    # of a valid resume alike, and a rejected resume yields nothing at all. The
+    # exception TYPE cannot make that distinction; see _is_dead_resume_chain.
+    saw_init: bool = False
+    frames: int = 0
     # ECA-143: result metadata the CLI reports alongside is_error. None of it has a
     # `turns` column, so it reaches an operator through the failure capsule (and
     # api_error_status through the turn_error/turn_retry events) rather than the row.
@@ -257,6 +265,12 @@ class TurnOutcome:
             "stop_reason": self.stop_reason,
             "saw_result": self.saw_result,
             "num_turns": self.num_turns,
+            # ECA-147: "did the session ever start" is the first question to ask of
+            # any failed turn, and until now no capsule field answered it —
+            # `saw_result: false` conflates "died before the CLI said hello" with
+            # "ran, then died before finishing".
+            "saw_init": self.saw_init,
+            "frames": self.frames,
         }
 
 
@@ -303,6 +317,63 @@ def _status_field(outcome: TurnOutcome) -> dict[str, int]:
     if outcome.api_error_status is None:
         return {}
     return {"api_error_status": outcome.api_error_status}
+
+
+def _is_dead_resume_chain(resume_from: str | None, outcome: TurnOutcome) -> bool:
+    """G7's question, asked of the EVIDENCE instead of the exception type (ECA-147).
+
+    G7 says a dead resume chain is never silently continued fresh: end the epoch and
+    ground the next one on the handover file. It used to be spelled `except
+    ProcessError`, which made the invariant hostage to an SDK implementation detail:
+
+      * A CLI death while `initialize()` is in flight re-raises the transport's RAW
+        `ProcessError` — the SDK's read task hands its exception to every pending
+        control request (`_internal/query.py`), and `_send_control_request` re-raises
+        it. This IS the rejected-resume case, measured on SDK 0.2.128 / CLI 2.1.220:
+        `ProcessError(exit_code=1)`, zero frames, stderr "No conversation found with
+        session ID: <id>" — for a missing transcript AND for a present-but-rejected
+        one.
+      * A death AFTER initialize has no pending request, so the same transport error
+        is converted to a `{"type": "error"}` frame and `receive_messages` raises a
+        BARE `Exception`. That is the ECA-143 shape (an error result, then exit 1).
+      * A pre-initialize exit that loses the race with initialize's stdin write
+        raises `CLIConnectionError` instead (subprocess_cli.py: "Cannot write to
+        process that exited with error"). Read from source, not measured.
+
+    Three types, one meaning. So key on what was OBSERVED: the CLI announces a live
+    session with `SystemMessage(subtype="init")` — first frame of a fresh turn and of
+    a valid resume alike — and a rejected resume produces no frame at all. No init on
+    a resumed turn means the CLI never accepted the chain.
+
+    Deliberately broader than "the resume was rejected": ANY pre-init death on a
+    resumed turn rolls the epoch. That errs toward G7's own invariant (never continue
+    a chain we cannot prove is alive) and it terminates — the restore turn runs in a
+    fresh epoch with `resume_from is None`, so a repeat failure cannot roll again.
+    """
+    return resume_from is not None and not outcome.saw_init
+
+
+def _no_retry_reason(outcome: TurnOutcome) -> str | None:
+    """Why this failure must not be retried, or None to run the normal ladder (ECA-147).
+
+    The retry ladder has no backoff — it rebuilds the subprocess immediately — so
+    retrying an error the API attributed to the CALLER cannot change the answer. The
+    motivating case: a monthly spend cap (HTTP 429) on mbpm2 was retried on every
+    turn, doubling the load and writing a `turn_retry` event that implied the failure
+    might be transient. `api_error_status` (captured by ECA-143) is the CLI's own
+    classification, and the SDK documents it as content-free metadata.
+
+    4xx is terminal: quota, auth, and malformed-request errors are all facts about
+    this turn. 5xx keeps the retry — an overloaded upstream genuinely can succeed on
+    a second attempt, and that is the existing behavior, so it stays.
+    """
+    status = outcome.api_error_status
+    if status is None or not 400 <= status < 500:
+        return None
+    return (
+        f"api_error_status={status} is client-side (quota/auth/request), "
+        "and the retry has no backoff — a second attempt cannot change it"
+    )
 
 
 def context_pressure_pct(usage: dict[str, Any] | None) -> int | None:
@@ -757,14 +828,34 @@ class Engine:
                 self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
                 await self._reg.set_worker_status(name, "idle", active=True)
                 return
-            except ProcessError as e:
-                if resume_from is not None:
+            except asyncio.CancelledError:
+                raise  # kill() owns the record
+            except Exception as e:  # noqa: BLE001 — G2: any death, whatever its type
+                # ECA-147: ONE handler for every failure the SDK can deliver. There
+                # used to be a `except ProcessError` clause ahead of this one holding
+                # all of G7, and which of the two ran depended on WHERE inside the SDK
+                # the CLI's exit was noticed (pending control request -> the raw
+                # ProcessError; after initialize -> a bare Exception; lost write race
+                # -> CLIConnectionError). Same event, three types: a decision that
+                # matters cannot be spelled as an exception type.
+                exit_code = e.exit_code if isinstance(e, ProcessError) else None
+                reason = f"{type(e).__name__}: {e}"
+                if exit_code is not None:
+                    reason += f" (exit={exit_code})"
+                if _is_dead_resume_chain(resume_from, outcome):
                     # G7: the chain is dead. Never silently fresh — end the epoch,
                     # open the next one grounded on the handover file.
                     # ECA-143 review round: same six as the timeout path. Persisting
                     # session_id here cannot resurrect the dead chain — this branch
                     # rolls the epoch, and _pick_resume_target only ever considers
                     # session ids WHERE epoch_id = <the new epoch>.
+                    # Those fields are now DEFENSIVE rather than load-bearing: this
+                    # branch requires that no init frame was seen, and a ResultMessage
+                    # only ever follows one, so on CLI 2.1.220 there is nothing here to
+                    # persist. Kept unconditional anyway — `finish_turn` has no COALESCE,
+                    # so an omitted keyword writes NULL, and the day a CLI reports a
+                    # result without announcing the session this must not be the one
+                    # path that loses a turn's spend.
                     await self._reg.finish_turn(
                         turn_id, "error",
                         session_id=outcome.session_id,
@@ -775,7 +866,7 @@ class Engine:
                         num_turns=outcome.num_turns,
                         usage=outcome.usage,
                         tools=outcome.tools,
-                        error=f"resume failed: {e} (exit={e.exit_code})",
+                        error=f"resume failed: {reason}",
                     )
                     self._events.emit(
                         name, "resume_failed", turn_id=turn_id, resume=resume_from,
@@ -794,29 +885,16 @@ class Engine:
                     await self._reg.set_worker_status(name, "idle", active=True)
                     self._kick(name)
                     return
-                if attempt == 1:
+                no_retry = _no_retry_reason(outcome)
+                if attempt == 1 and no_retry is None:
                     self._events.emit(
                         name, "turn_retry", turn_id=turn_id, error=str(e),
                         **_status_field(outcome),
                     )
                     continue
                 await self._fail_turn(
-                    name, turn_id, outcome, f"ProcessError: {e}", options_snapshot,
-                    stderr_tail, resume_from, policy,
-                )
-                return
-            except asyncio.CancelledError:
-                raise  # kill() owns the record
-            except Exception as e:  # noqa: BLE001 — G2: mid-stream death is a BARE Exception
-                if attempt == 1:
-                    self._events.emit(
-                        name, "turn_retry", turn_id=turn_id, error=str(e),
-                        **_status_field(outcome),
-                    )
-                    continue
-                await self._fail_turn(
-                    name, turn_id, outcome, f"{type(e).__name__}: {e}", options_snapshot,
-                    stderr_tail, resume_from, policy,
+                    name, turn_id, outcome, reason, options_snapshot,
+                    stderr_tail, resume_from, policy, no_retry=no_retry,
                 )
                 return
 
@@ -954,9 +1032,15 @@ class Engine:
         stderr_tail: deque[str],
         resume_from: str | None,
         policy: WorkerPolicy,
+        no_retry: str | None = None,
     ) -> None:
         """Terminal error after the retry: record, capsule, keep the epoch
         (keep-on-failure, Amendment A6) — the orchestrator decides what's next.
+
+        `no_retry` (ECA-147) is set when the ladder deliberately skipped the retry,
+        and names why. It goes on the event because that is where an operator looks
+        first, and a MISSING retry is otherwise invisible — the absence of a
+        `turn_retry` row reads identically to a ladder that never ran.
 
         ECA-143: this used to persist cost/duration/usage/tools and DROP
         result_text, is_error and num_turns — the three fields that say what the
@@ -979,6 +1063,7 @@ class Engine:
         )
         self._events.emit(
             name, "turn_error", turn_id=turn_id, error=error,
+            **({"no_retry": no_retry} if no_retry else {}),
             **_status_field(outcome),
         )
         await self._finish_failure_capsule(
@@ -1253,6 +1338,9 @@ class Engine:
         return [dict(r) for r in await cur.fetchall()]
 
     def _observe(self, name: str, turn_id: int, msg: Any, outcome: TurnOutcome) -> None:
+        # ECA-147: counted for EVERY frame, before any type dispatch — "the CLI sent
+        # us something" has to hold for message types this method does not model.
+        outcome.frames += 1
         if isinstance(msg, ResultMessage):
             outcome.saw_result = True
             outcome.session_id = msg.session_id
@@ -1281,6 +1369,10 @@ class Engine:
                         name, "tool_use", turn_id=turn_id, tool=block.name
                     )
         elif isinstance(msg, SystemMessage) and msg.subtype == "init":
+            # ECA-147: the CLI's announcement that a session is live. On a resumed
+            # turn it is also the proof the chain was ACCEPTED — see
+            # _is_dead_resume_chain, which is the whole of G7's trigger.
+            outcome.saw_init = True
             # ECA-101 diagnostic: a point-in-time snapshot taken at turn start —
             # non-'sdk' servers are commonly still "pending" here (the CLI never
             # waits on them), so this does NOT prove a server never connected,

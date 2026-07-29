@@ -27,6 +27,16 @@ Tracked as **ECA-60** (Backlog in evolv-coder-agent).
   `can_use_tool`, is the total point: the CLI auto-approves some calls without ever
   consulting `can_use_tool` (ECA-142). `AskUserQuestion` parks as an escalation answered
   via the CLI. Grant syntax below.
+- **Failure ladder**: a turn that dies is retried ONCE with the same resume id — unless the
+  CLI reported a 4xx `api_error_status` (a 429 spend cap, a 401), which is terminal and skips
+  the retry with the reason recorded as `no_retry` on the `turn_error` event, because the
+  retry has no backoff. A **dead resume chain** ends the epoch (`resume_failed`) and opens the
+  next one on a handover restore rather than silently continuing fresh. That is detected by
+  what the CLI DID — a resumed turn with no `system/init` frame never had its chain accepted —
+  and deliberately not by the exception type, which varies with where inside the SDK the exit
+  was noticed and so silently skipped this branch for two of its three forms (ECA-147). Every
+  failed turn also writes a capsule carrying `saw_init` / `frames` alongside the CLI's own
+  result diagnostics.
 - **Control surface**: `workers` CLI over a unix socket (local-only, JSON out):
   `spawn / prompt / status / questions / answer / cycle / kill / events / attach / history`.
 - **Auth**: the host's logged-in Claude CLI subscription. Worker env is allowlist-built;

@@ -32,8 +32,8 @@ ENV CLAUDE_CODE_USE_BEDROCK=1 \
 
 # --- Runner install ----------------------------------------------------------
 # Copy only the subproject sources (the .dockerignore guarantees no .env/.git/
-# creds enter the context). Installing the wheel pins claude-agent-sdk==0.2.91
-# (bundles the Claude Code CLI) and nothing else.
+# creds enter the context). Installing the wheel pins claude-agent-sdk==0.2.128
+# (bundles the Claude Code CLI 2.1.220) and nothing else.
 WORKDIR /opt/sandbox-runner
 COPY pyproject.toml README.md ./
 COPY src ./src

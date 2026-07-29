@@ -3,7 +3,7 @@
 The **in-container SDK runner** and **hardened image** for the Docker agent
 sandbox. Design of record: `evolv-coder-agent/docs/architecture/container-sandbox.md`,
 ADR-0024. A self-contained uv subproject, sibling to `worker-supervisor/`, but
-deliberately **leaner** — the image pins `claude-agent-sdk==0.2.91` and nothing
+deliberately **leaner** — the image pins `claude-agent-sdk==0.2.128` and nothing
 else (no MCP, no NATS, no coordination deps). The container **is** the security
 boundary; the per-peer **spawner (ECA-65)** is the only launcher and owns the
 run flags, secret mounts, egress network, and result publication.
@@ -41,7 +41,7 @@ from `state`, not the exit code.
 | Limit | Mechanism |
 |---|---|
 | `max_turns` | native `ClaudeAgentOptions.max_turns` |
-| `max_budget_usd` | **native** `ClaudeAgentOptions.max_budget_usd` (present in 0.2.91) |
+| `max_budget_usd` | **native** `ClaudeAgentOptions.max_budget_usd` (present in 0.2.128) |
 | `wall_clock_s` | runner `asyncio.timeout` → cancel transport → SIGTERM/SIGKILL |
 
 ## Secrets (AC#3)

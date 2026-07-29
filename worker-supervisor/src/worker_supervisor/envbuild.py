@@ -1,6 +1,7 @@
 """Allowlist-built worker environments (FR-WS10 / AC-WS-9, Amendment A7).
 
-SDK fact this design rests on (claude-agent-sdk 0.2.91, subprocess_cli.py:425-482):
+SDK fact this design rests on (claude-agent-sdk 0.2.128, subprocess_cli.py:689-733;
+it was 0.2.91:425-482 before the ECA-138 bump, with identical semantics):
 `ClaudeAgentOptions.env` MERGES onto the parent's full `os.environ` — it cannot
 remove variables. The structural guarantee therefore has two halves:
 

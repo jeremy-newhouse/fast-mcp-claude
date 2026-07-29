@@ -315,8 +315,9 @@ async def test_restore_continuation_is_guarded_by_a_pending_queue(
 
 
 async def test_resume_skips_unpersisted_session(cfg, registry, events, repo, monkeypatch):
-    """CLI-2.1.165 gotcha: a reported session id may never reach disk — resume
-    the newest PERSISTED id instead of erroring the whole epoch."""
+    """Gotcha observed on CLI 2.1.165 (see _pick_resume_target; not re-measured on
+    the 2.1.220 bundle): a reported session id may never reach disk — resume the
+    newest PERSISTED id instead of erroring the whole epoch."""
     calls: list[Any] = []
     monkeypatch.setattr(
         "worker_supervisor.engine.query", make_fake_query([[r("s1")], [r("s2")], [r("s3")]], calls)

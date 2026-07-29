@@ -46,31 +46,59 @@ record; this is the contract an operator authors against.
 **A matcher uses Claude Code's `settings.json` syntax, and is applied to every command in
 a compound command** (ECA-144) — so a granted prefix cannot smuggle a second command:
 
-- `*` matches any run of characters, **including spaces**, at any position (`git * main`
-  matches `git checkout main`). Every other character is literal — `:` included, so
-  `Bash(npm run test:*)` means what it looks like.
+- `*` matches any run of characters, **including spaces and newlines**, at any position
+  (`git * main` matches `git checkout main`). Every other character is literal.
 - **The space before a trailing `*` is what creates the word boundary.** `Bash(ls *)`
   matches `ls -la` but not `lsof`; `Bash(ls*)` matches both. Same rule as Claude Code.
+- **A trailing `:*` is an equivalent way to write that wildcard**, so `Bash(ls:*)` ==
+  `Bash(ls *)` — which matters because `cmd:*` is the form Claude Code's own permission
+  dialog writes, i.e. what you will be pasting out of a `settings.json`. Only at the very
+  end: the colon in `Bash(git:* push)` is literal, and so is the one in the MIDDLE of
+  `Bash(npm run test:*)`'s pattern — that grant means `npm run test *`, so it admits
+  `npm run test --watch` and refuses `npm run test:unit`.
+- `Bash(*)` is exactly the bare `Bash` grant.
 - The command is split on `&&`, `||`, `|&`, `;`, `|`, `&` and newlines, and the inner
   command of every `$(...)`, backtick, `<(...)`/`>(...)` and `(...)` is hoisted out and
   judged too. **Every** resulting command must match one of that tool's grants. Under
   `Bash(echo *)`, `echo hi && cat /etc/passwd` is denied — before ECA-144 it was allowed,
   by both enforcement layers. Several grants compose: with `Bash(git *)` + `Bash(uv *)`,
-  `git status && uv run pytest` passes because each command matches one of them.
-- Quoting is honoured as a shell honours it: a single-quoted or backslash-escaped operator
-  is literal (`echo 'a && b'` is one command), while a substitution inside **double**
-  quotes still executes and so is still judged.
+  `git status && uv run pytest` passes because each command matches one of them, and so
+  does `ls $(git rev-parse --show-toplevel)` (the substitution is judged on its own, and
+  the enclosing command still sees an argument).
+- Quoting: a single-quoted or backslash-escaped operator is literal (`echo 'a && b'` is one
+  command), while a substitution inside **double** quotes still executes and so is still
+  judged. Single quotes are POSIX — there are no escapes inside them.
 
-**Two deliberate deltas from Claude Code, both fail-closed.** A matcher-granted command
-carrying a **redirection** (`>`, `>>`, `<`, `<<`, `<<<`) is refused — a redirect target is
-not a command, so "every command matches a grant" says nothing about it, and ignoring it
-would let `Bash(echo *)` write any file. A command that cannot be parsed (unbalanced quote,
-unterminated substitution) is refused rather than guessed at. A lane that genuinely needs
-either wants a bare `Bash` grant. A wildcard-free matcher is also compared to the whole
-command, so a deliberate literal compound (`Bash(git status && npm test)`) still works.
+### Fail-closed refusals — ours, not Claude Code's
 
-There is **no path matcher**: `Read(*)` is not a path filter and denies rather than
-allowing every Read. Pin file tools with a bare grant — the cwd pin scopes them.
+A matcher-granted command is **refused** (not just unmatched) when it carries something
+this matcher does not model. Each of these is a construct where a shell's idea of where a
+quote or a command ends differs from the splitter's, and every one of them was a working
+arbitrary-command bypass during review:
+
+| Refused | Why |
+|---|---|
+| a redirection (`>`, `>>`, `<`, `<<`, `<<<`) | a redirect target is not a command, so "every command matches a grant" says nothing about it; ignoring it would let `Bash(echo *)` write any file |
+| `#` (a comment) | a shell does **not** apply line continuation inside a comment, so the newline after one is a real separator |
+| `$'...'` / `$"..."` | ANSI-C quoting treats `\'` as an escaped quote, so a shell's string ends later than a POSIX scan thinks — one quote out of phase hides a whole `$(...)` |
+| a line continuation (`\` + newline) | a shell splices it away before tokenising, even inside double quotes, so `"$\`<newline>`(cmd)"` really is `"$(cmd)"` |
+| unbalanced quotes/parens, an unterminated substitution, nesting > 32 | the tail cannot be attributed to any command |
+
+Also unlike Claude Code: **command wrappers are not stripped.** CC strips `timeout`, `time`,
+`nice`, `nohup`, `xargs` and a leading `VAR=value` before matching; this matcher does not,
+so `timeout 30 uv run pytest` is outside a `Bash(uv *)` grant. Deliberate — every wrapper
+stripped is a rule about what that wrapper does, and `xargs`-class wrappers run arbitrary
+commands. Grant the wrapper form explicitly, or give the lane a bare `Bash`.
+
+One carve-out that is **ours rather than CC parity**: a wildcard-free matcher is also
+compared to the whole command, so a deliberate literal compound (`Bash(git status && npm
+test)`) works. CC's docs say a rule must match each subcommand independently and that it
+saves one rule per subcommand; without this carve-out there would be no way to grant a
+compound command at all, and string equality against text the operator wrote out cannot
+smuggle anything.
+
+There is **no path matcher**: `Read(*.py)` is not a path filter and denies rather than
+quietly doing something else. Pin file tools with a bare grant — the cwd pin scopes them.
 
 ## Run
 

@@ -105,11 +105,15 @@ def main(argv: list[str] | None = None) -> None:
             "comma-separated tool ceiling specs, e.g. 'Read,Bash(uv run *)'. A matcher "
             "uses Claude Code's settings.json syntax and is applied to EVERY command in "
             "a compound command, so a granted prefix cannot smuggle a second one "
-            "(ECA-144): '*' matches any run of characters including spaces, ':' is "
-            "literal, and the space before a trailing '*' is what makes the word "
-            "boundary ('ls *' does not match 'lsof'; 'ls*' does). Unlike Claude Code, a "
-            "matcher-granted command carrying a redirection ('>', '<') is refused — "
-            "grant bare 'Bash' to a lane that needs one. See WorkerPolicy.ceiling_denial."
+            "(ECA-144): '*' matches any run of characters including spaces; the space "
+            "before a trailing '*' is what makes the word boundary ('ls *' does not "
+            "match 'lsof', 'ls*' does); a trailing ':*' is an equivalent way to write "
+            "that wildcard ('ls:*' == 'ls *'); and 'Bash(*)' is the bare grant. "
+            "Fail-closed extras of OURS, not Claude Code behaviour: a matcher-granted "
+            "command is refused if it carries a redirection, a comment, ANSI-C quoting "
+            "(\"$'...'\"), a line continuation or anything unparseable, and command "
+            "wrappers (timeout/time/xargs, a leading VAR=value) are NOT stripped. Grant "
+            "bare 'Bash' to a lane that needs those. See WorkerPolicy.ceiling_denial."
         ),
     )
     sp.add_argument("--allow-env", action="append", default=[], metavar="NAME")

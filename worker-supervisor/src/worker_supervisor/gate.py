@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -21,12 +23,269 @@ from .names import HOOK_SCRIPT_RE, is_safe_hook_script
 from .registry import Registry
 
 # Tool-input keys that carry filesystem paths (cwd pin scope). Bash is governed
-# by the ceiling's command matchers, not path inspection.
+# by the ceiling's command matchers (`ceiling_denial`), not path inspection —
+# nothing here reads a path out of a shell command.
 _PATH_KEYS = ("file_path", "path", "notebook_path", "directory")
 
 # Escalation + skills must exist for every worker: /handover write|restore rides
 # the Skill tool (G10), questions ride AskUserQuestion.
 _ALWAYS_BASE_TOOLS = ("AskUserQuestion", "Skill")
+
+# Shell operators that separate one command from the next, longest-first so '&&'
+# is consumed before '&' and '|&' before '|'. A command's segments are matched
+# against the ceiling INDEPENDENTLY (ECA-144) — this is Claude Code's own rule
+# for compound commands, and the list is its documented set plus newline.
+_COMMAND_SEPARATORS = ("&&", "||", "|&", ";", "|", "&", "\n")
+
+# Redirection operators. A redirect TARGET is not a command, so "every segment
+# must match a grant" says nothing about it — see `_split_command_segments` for
+# why a matcher-granted command carrying one is refused rather than ignored.
+_REDIRECTIONS = (">>", "<<<", "<<", ">", "<")
+
+
+class UnparseableCommand(Exception):
+    """A Bash command that cannot be split into segments we can vouch for.
+
+    Raised — and turned into a REFUSAL by the only caller — rather than returning
+    a best guess. See `_split_command_segments`.
+    """
+
+
+def _split_command_segments(command: str) -> list[str]:
+    """Split a shell command into the individual commands it would run.
+
+    Why this exists: `ceiling_allows` used to test the whole command string with
+    `startswith`, so a `Bash(echo*)` grant allowed `echo hi && cat /etc/passwd`
+    (ECA-144). Every separated command has to face the ceiling on its own.
+
+    What one pass produces: the top-level segments split on `_COMMAND_SEPARATORS`,
+    plus the inner command of every substitution (`$(...)`, backticks, `<(...)`,
+    `>(...)`) and of every `(...)` subshell, hoisted out as segments of their own
+    and REMOVED from the text they were embedded in. Hoisting matters in both
+    directions: the inner command must be judged (it executes), and the outer
+    segment must not be judged with the substitution still glued to it (a grant
+    for `echo` should not have to anticipate `echo $(...)`).
+
+    Quoting is honoured the way a shell honours it: a backslash escape and a
+    single-quoted run make an operator literal, so `echo 'a && b'` is ONE segment.
+    Double quotes suppress operators but NOT substitution, because a shell still
+    executes `$(...)` inside them — that asymmetry is the whole point of parsing
+    this rather than pattern-matching it.
+
+    **This function fails closed** (ECA-144 AC#2). It raises `UnparseableCommand`
+    for input it cannot account for, and the caller REFUSES the call rather than
+    allowing it:
+
+    - unbalanced quotes, or an unterminated substitution/group — the tail cannot
+      be attributed to any segment, so a grant cannot be said to cover it;
+    - a redirection operator (`>`, `>>`, `<`, `<<`, `<<<`) anywhere outside
+      quotes. A redirect is not a command, so requiring it to "match a grant" is
+      meaningless, and silently ignoring it would let a lane granted
+      `Bash(echo *)` run `echo x > ~/.zshrc` — the same class of defect as this
+      task. This is a DELIBERATE delta from Claude Code, which permits
+      redirection inside a matched segment. Grant bare `Bash` to a lane that
+      needs to redirect.
+
+    Deliberately NOT modelled, because none of it can widen what runs: variable
+    expansion (`$FOO` and `${FOO}` are left in the segment as written — an
+    expansion that produces an operator is expanded after word-splitting by the
+    shell and cannot introduce a new command), aliases, and `env`-style prefixes.
+    A pattern is matched against the segment's literal text, so an unexpanded
+    `$FOO` simply fails to match a narrow grant.
+
+    Two constructs are over-refused rather than modelled, which is the safe
+    direction: a `{ ...; }` brace group leaves its braces in the segments, and
+    `$((...))` arithmetic contributes its expression as a segment. Neither matches
+    a narrow grant, so both deny. A lane that needs either wants bare `Bash`.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    i = 0
+    n = len(command)
+
+    def flush() -> None:
+        text = "".join(current).strip()
+        if text:
+            segments.append(text)
+        current.clear()
+
+    while i < n:
+        ch = command[i]
+
+        if ch == "\\":  # escape: the next character is literal, operator or not
+            if i + 1 >= n:
+                # A trailing backslash is a line continuation with nothing to
+                # continue. Refuse rather than guess what the shell would join.
+                raise UnparseableCommand("command ends in a dangling backslash")
+            current.append(command[i : i + 2])
+            i += 2
+            continue
+
+        if ch == "'":
+            end = command.find("'", i + 1)
+            if end < 0:
+                raise UnparseableCommand("unbalanced single quote")
+            current.append(command[i : end + 1])
+            i = end + 1
+            continue
+
+        if ch == '"':
+            # Double quotes suppress operators but not substitution, so the body
+            # is walked rather than skipped.
+            body, i = _scan_double_quoted(command, i, segments)
+            current.append(body)
+            continue
+
+        if ch == "`":
+            end = _find_unescaped(command, "`", i + 1)
+            if end < 0:
+                raise UnparseableCommand("unbalanced backtick substitution")
+            segments.extend(_split_command_segments(command[i + 1 : end]))
+            i = end + 1
+            continue
+
+        if command.startswith("$(", i):
+            end = _match_paren(command, i + 1)
+            segments.extend(_split_command_segments(command[i + 2 : end]))
+            i = end + 1
+            continue
+
+        # Process substitution: <(cmd) / >(cmd). Checked BEFORE the redirection
+        # scan below, since both start with a redirection character.
+        if command.startswith("<(", i) or command.startswith(">(", i):
+            end = _match_paren(command, i + 1)
+            segments.extend(_split_command_segments(command[i + 2 : end]))
+            i = end + 1
+            continue
+
+        if ch == "(":  # subshell group
+            end = _match_paren(command, i)
+            segments.extend(_split_command_segments(command[i + 1 : end]))
+            i = end + 1
+            continue
+
+        if ch == ")":
+            # Unmatched: the matching '(' would have consumed it.
+            raise UnparseableCommand("unbalanced parenthesis")
+
+        redirect = next((op for op in _REDIRECTIONS if command.startswith(op, i)), None)
+        if redirect is not None:
+            raise UnparseableCommand(f"redirection {redirect!r} is not a command")
+
+        separator = next(
+            (op for op in _COMMAND_SEPARATORS if command.startswith(op, i)), None
+        )
+        if separator is not None:
+            flush()
+            i += len(separator)
+            continue
+
+        current.append(ch)
+        i += 1
+
+    flush()
+    return segments
+
+
+def _scan_double_quoted(command: str, start: int, segments: list[str]) -> tuple[str, int]:
+    """Consume a double-quoted run, hoisting any substitution inside it.
+
+    Returns the quoted text with substitutions REMOVED (their inner commands are
+    appended to `segments`) and the index just past the closing quote. A shell
+    executes `$(...)` and backticks inside double quotes, so `echo "$(cat x)"`
+    must contribute `cat x` as its own segment — this is the case a naive
+    "skip to the closing quote" scan gets wrong.
+    """
+    out: list[str] = ['"']
+    i = start + 1
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                raise UnparseableCommand("unbalanced double quote")
+            out.append(command[i : i + 2])
+            i += 2
+            continue
+        if ch == '"':
+            out.append('"')
+            return "".join(out), i + 1
+        if command.startswith("$(", i):
+            end = _match_paren(command, i + 1)
+            segments.extend(_split_command_segments(command[i + 2 : end]))
+            i = end + 1
+            continue
+        if ch == "`":
+            end = _find_unescaped(command, "`", i + 1)
+            if end < 0:
+                raise UnparseableCommand("unbalanced backtick substitution")
+            segments.extend(_split_command_segments(command[i + 1 : end]))
+            i = end + 1
+            continue
+        out.append(ch)
+        i += 1
+    raise UnparseableCommand("unbalanced double quote")
+
+
+def _find_unescaped(text: str, char: str, start: int) -> int:
+    i = start
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == char:
+            return i
+        i += 1
+    return -1
+
+
+def _match_paren(text: str, open_index: int) -> int:
+    """Index of the ')' closing the '(' at `open_index`, honouring nesting/quotes."""
+    depth = 0
+    i = open_index
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "'":
+            end = text.find("'", i + 1)
+            if end < 0:
+                raise UnparseableCommand("unbalanced single quote")
+            i = end + 1
+            continue
+        if ch == '"':
+            end = _find_unescaped(text, '"', i + 1)
+            if end < 0:
+                raise UnparseableCommand("unbalanced double quote")
+            i = end + 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise UnparseableCommand("unterminated substitution or group")
+
+
+@lru_cache(maxsize=512)
+def _compile_matcher(pattern: str) -> re.Pattern[str]:
+    """Compile one grant matcher to an anchored regex, Claude Code's semantics.
+
+    `*` matches any run of characters INCLUDING spaces, at any position; every
+    other character is literal. Whether a trailing `*` enforces a word boundary
+    therefore falls out of the pattern the author wrote, exactly as it does in
+    Claude Code: `Bash(ls *)` requires the space and so does not match `lsof`,
+    while `Bash(ls*)` does. Nothing else is special — a colon is literal, so a
+    `Bash(npm run test:*)` grant means what it looks like.
+
+    Cached because this runs on every tool call; patterns come from the policy
+    row, so the key space is the operator's own grant list.
+    """
+    body = "".join(".*" if part == "*" else re.escape(part) for part in re.split(r"(\*)", pattern))
+    return re.compile(body, re.DOTALL)
 
 DEFAULT_ALLOWED_TOOLS = [
     "Read",
@@ -133,30 +392,95 @@ class WorkerPolicy:
         return names
 
     def ceiling_allows(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
-        """Grant-spec match: bare 'Tool' allows all inputs; 'Bash(prefix*)' is a
-        prefix matcher on the command field (Claude Code matcher semantics)."""
+        """Whether this call is inside the ceiling. See `ceiling_denial` for why."""
+        return self.ceiling_denial(tool_name, tool_input) is None
+
+    def ceiling_denial(self, tool_name: str, tool_input: dict[str, Any]) -> str | None:
+        """Grant-spec match; returns a denial reason, or None if the call passes.
+
+        Three grant shapes, in the order they are tested:
+
+        - `Tool` — bare name, every input allowed.
+        - `prefix*` — a tool-NAME wildcard with no `(...)` matcher (ECA-100), the
+          way to grant a whole MCP server: `mcp__jira__*` → `mcp__jira__search`.
+        - `Tool(matcher)` — a command matcher, applied to `tool_input['command']`.
+
+        **The matcher is Claude Code's syntax, applied per COMMAND (ECA-144.)** It
+        used to be `command.startswith(...)` on the whole string, which is not a
+        boundary at all: under a `Bash(echo*)` grant, `echo hi && cat /etc/passwd`
+        passed, and so did `echoes_not_a_thing; rm -rf x`, since a raw prefix
+        compare does not even respect a word boundary. Now the command is split
+        into the separate commands it would run (`_split_command_segments`) and
+        EVERY one of them must match some granted pattern for this tool.
+
+        Matching follows Claude Code so that a policy written by analogy with
+        `settings.json` means what its author expects (AC#3): `*` matches any run
+        of characters including spaces, at any position; every other character —
+        including `:` — is literal; a space before a trailing `*` is what makes
+        the boundary (`ls *` does not match `lsof`, `ls*` does). The one
+        deliberate delta is fail-closed refusal of redirection, documented in
+        `_split_command_segments`.
+
+        Two carve-outs, both narrow on purpose:
+
+        - A pattern with NO wildcard is also compared to the whole raw command.
+          That keeps a deliberate literal compound grant (`Bash(git status && npm
+          test)`, a form Claude Code documents) working, and it cannot smuggle
+          anything: it is string equality against text the operator wrote out.
+        - A matcher grant on a tool whose input carries no `command` REFUSES,
+          rather than treating the absent field as an empty string. `Read(*)`
+          therefore denies instead of allowing every Read — a behaviour change,
+          and the fail-closed one: the alternative is a grant that looks like a
+          path filter and silently is not (there is no path matcher here; pin
+          file tools with a bare `Read` plus the cwd pin).
+        """
+        patterns: list[str] = []
         for spec in self.allowed_tools:
             base, _, matcher = spec.partition("(")
             base = base.strip()
-            # Tool-NAME wildcard (ECA-100): a spec ending in '*' with no '(...)'
-            # matcher grants every tool whose name shares that prefix — the way to
-            # allow a whole MCP server, e.g. 'mcp__jira__*' -> mcp__jira__search.
             if not matcher and base.endswith("*"):
                 if tool_name.startswith(base[:-1]):
-                    return True
+                    return None
                 continue
             if base != tool_name:
                 continue
             if not matcher:  # bare tool name: all inputs
-                return True
-            pattern = matcher.rstrip(")").strip()
-            command = str(tool_input.get("command", ""))
-            if pattern.endswith("*"):
-                if command.startswith(pattern[:-1]):
-                    return True
-            elif command == pattern:
-                return True
-        return False
+                return None
+            patterns.append(matcher.rstrip(")").strip())
+
+        if not patterns:
+            return f"tool {tool_name!r} is outside this worker's ceiling"
+
+        raw = tool_input.get("command")
+        command = raw if isinstance(raw, str) else ""
+        if not command.strip():
+            return (
+                f"tool {tool_name!r} is granted only by command matcher, and this call "
+                f"carries no command to match ({_clip(raw)})"
+            )
+
+        # Literal (wildcard-free) grant of the whole command, incl. a compound one.
+        if any("*" not in p and command.strip() == p.strip() for p in patterns):
+            return None
+
+        try:
+            segments = _split_command_segments(command)
+        except UnparseableCommand as e:
+            # AC#2: refuse what we cannot account for. A ceiling that guesses is
+            # not a ceiling — and every other such question in this daemon has
+            # settled the same way (see `_run_guard_hook`'s derivation refusals).
+            return f"command could not be parsed, so it is refused: {e} ({_clip(command)})"
+        if not segments:
+            return f"command parsed to no commands, so it is refused ({_clip(command)})"
+
+        compiled = [_compile_matcher(p) for p in patterns]
+        for segment in segments:
+            if not any(rx.fullmatch(segment) for rx in compiled):
+                return (
+                    f"{tool_name} command {_clip(segment)} is outside this worker's "
+                    f"ceiling (granted: {', '.join(sorted(patterns))})"
+                )
+        return None
 
 
 def redact_policy(policy: Any) -> dict[str, Any]:
@@ -455,8 +779,9 @@ def _ceiling_or_cwd_denial(
     for why the hook is the one that has to run, and `make_gate` for why the gate
     keeps them anyway.
     """
-    if not policy.ceiling_allows(tool_name, tool_input):
-        return f"tool {tool_name!r} is outside this worker's ceiling"
+    denial = policy.ceiling_denial(tool_name, tool_input)
+    if denial is not None:
+        return denial
     offending = _path_escapes(repo_root, tool_input)
     if offending is not None:
         return f"path {offending!r} escapes the worker root {str(repo_root)!r}"

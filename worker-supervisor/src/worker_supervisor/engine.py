@@ -933,8 +933,10 @@ class Engine:
         the ECA-138 bump). Argv is world-readable to every process of
         the same uid, so a granted lane's bearers sat in the process table for the
         whole turn — readable by that lane's own `Bash`, and by every OTHER lane
-        running concurrently, granted or not. Confirmed live on mbpm2 (CLI 2.1.220 /
-        SDK 0.2.91, 2026-07-28): a worker turn read both planted sentinels out of its
+        running concurrently, granted or not. Confirmed live on mbpm2 (SDK 0.2.91,
+        i.e. bundled CLI 2.1.165 — the original note said 2.1.220, which was the
+        host's PATH `claude`, NOT the binary the SDK spawns; corrected under
+        ECA-138): a worker turn read both planted sentinels out of its
         parent's argv, and `workers get` then returned them to the caller.
 
         The SDK's documented str/Path branch passes the value through as a file path

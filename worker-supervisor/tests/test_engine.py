@@ -525,7 +525,9 @@ async def test_mcp_startup_grace_skipped_without_mcp_grant(
 
 # --- ECA-135: granted MCP credentials must never enter the child's argv ---------
 #
-# Confirmed live on mbpm2 (CLI 2.1.220 / SDK 0.2.91, 2026-07-28) before the fix: a
+# Confirmed live on mbpm2 (SDK 0.2.91 = bundled CLI 2.1.165; the original note said
+# 2.1.220, which was PATH `claude`, not the spawned binary — corrected under ECA-138)
+# on 2026-07-28, before the fix: a
 # worker turn read both of its own planted sentinels out of its parent's argv with
 # one `ps`, and `workers get` handed them back to the caller. These tests exercise
 # the real SDK argv builder, so they fail against the pre-fix engine rather than

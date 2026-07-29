@@ -12,7 +12,7 @@ not call it back without a cycle, and their derivations stayed unguarded through
 ECA-135 and ECA-136. Keeping it here, importing nothing from the package, means the
 lowest-level writers can hold the same guard as the engine.
 
-Two predicates, not one, and the difference is load-bearing:
+Three predicates, not one, and the differences are load-bearing:
 
 * `require_safe_worker_name` — for a real lane. Its MESSAGE is byte-identical to
   ECA-135's, because operators read it and tests assert on it. Its BEHAVIOUR is not
@@ -26,9 +26,12 @@ Two predicates, not one, and the difference is load-bearing:
   ECA-135's `mcp_config_purge_refused`, the event whose entire purpose is to report a
   refused name without writing through it, and `_supervisor`, which carries the live
   mesh-announce loop on both supervisor hosts.
+* `is_safe_hook_script` (ECA-140) — for a repo guard-hook FILENAME, a third name-space
+  again. See `HOOK_SCRIPT_RE` for the one character class that differs and the evidence
+  for it.
 
-Both predicates are total over their argument's TYPE as well as its value, because the
-control socket hands JSON through uncoerced. See `is_safe_worker_name`.
+All three are total over their argument's TYPE as well as its value, because the control
+socket hands JSON through uncoerced. See `is_safe_worker_name`.
 """
 
 from __future__ import annotations
@@ -39,6 +42,16 @@ import re
 # matches before a trailing newline, so "Ultra1\n" would pass and produce a filename
 # with an embedded newline.
 WORKER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+# A repo guard-hook filename (ECA-140). Identical to WORKER_NAME_RE except that the
+# LEADING class also admits '_' — the whole difference, and the reason this is a separate
+# pattern instead of a reuse. Evidence and the measurement behind it: `is_safe_hook_script`.
+# '.' is still excluded from the leading class, which is what rules out dotfiles, '.' and
+# '..'; a separator is excluded from both classes, which is what rules out every other
+# traversal shape including a bare absolute path (see gate._run_guard_hook — an absolute
+# `script` needs no '..' at all, because Path.__truediv__ discards its left operand).
+# fullmatch, NOT '$', for the same trailing-newline reason as above.
+HOOK_SCRIPT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
 
 # Keys the DAEMON writes its own event streams under, not lanes. Both deliberately fail
 # WORKER_NAME_RE, so neither can ever collide with a real worker — `Engine.spawn` would
@@ -96,6 +109,43 @@ def require_safe_worker_name(name: object) -> None:
             f"invalid worker name {name!r}: must match {WORKER_NAME_RE.pattern} "
             "and contain no '..' (the name is used as a filename)"
         )
+
+
+def is_safe_hook_script(script: object) -> bool:
+    """True if `script` is a plain filename component safe to join under `.claude/hooks/`.
+
+    Why a THIRD predicate rather than reusing the worker one (ECA-140). The task that
+    filed this guessed `WORKER_NAME_RE` "probably fits" and asked for it to be checked
+    against the hook filenames actually in use before being reused. It does not fit. Two
+    measurements, both against this operator's real hosts:
+
+    * No guard hook is configured ANYWHERE. All 15 live worker rows (9 on mini2, 6 on
+      mbpm2) carry `guard_hooks={}`, and no worker repo on either host has a
+      `.claude/hooks/` directory at all. So the deployed-config answer is "nothing to
+      break", and the charset question has to be settled from a wider corpus.
+    * That corpus is the 47 distinct `.claude/hooks/` filenames across `~/repos` on
+      mini2. `WORKER_NAME_RE` refuses exactly one of them: `_common.sh`, because it
+      requires an alphanumeric FIRST character. Which is ECA-137's `_supervisor` finding
+      arriving a second time in a new name-space — a leading underscore means "shared
+      helper, not an entry point" to a shell-script author, so it is idiomatic here in a
+      way it never is for a lane name.
+
+    So the pattern is the worker one with `_` added to the leading class, and nothing
+    else. It refuses 0 of the 47 and every traversal shape, because the shapes that
+    traverse need a separator or a leading dot and neither is in the charset.
+
+    Total over its argument's TYPE, like its siblings and for the same reason: `server.py`
+    passes control-socket JSON through uncoerced, so `guard_hooks={"Bash": 123}` really
+    does arrive here, and before this guard existed it raised TypeError out of
+    `Path.__truediv__` INSIDE the SDK's permission callback (verified, not reasoned).
+
+    There is no `require_safe_hook_script` twin on purpose. The sole consumer,
+    `gate._run_guard_hook`, has to answer with a `(decision, reason)` tuple rather than
+    raise, so a raising wrapper would be code nothing calls.
+    """
+    if not isinstance(script, str):
+        return False
+    return bool(HOOK_SCRIPT_RE.fullmatch(script)) and ".." not in script
 
 
 def require_safe_log_key(key: object) -> None:

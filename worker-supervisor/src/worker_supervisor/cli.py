@@ -99,7 +99,19 @@ def main(argv: list[str] | None = None) -> None:
     sp = sub.add_parser("spawn", help="create a worker (idle, epoch 1)")
     sp.add_argument("name")
     sp.add_argument("repo", help="worker cwd root (the cwd pin)")
-    sp.add_argument("--tools", help="comma-separated tool ceiling specs, e.g. 'Read,Bash(uv run*)'")
+    sp.add_argument(
+        "--tools",
+        help=(
+            "comma-separated tool ceiling specs, e.g. 'Read,Bash(uv run *)'. A matcher "
+            "uses Claude Code's settings.json syntax and is applied to EVERY command in "
+            "a compound command, so a granted prefix cannot smuggle a second one "
+            "(ECA-144): '*' matches any run of characters including spaces, ':' is "
+            "literal, and the space before a trailing '*' is what makes the word "
+            "boundary ('ls *' does not match 'lsof'; 'ls*' does). Unlike Claude Code, a "
+            "matcher-granted command carrying a redirection ('>', '<') is refused — "
+            "grant bare 'Bash' to a lane that needs one. See WorkerPolicy.ceiling_denial."
+        ),
+    )
     sp.add_argument("--allow-env", action="append", default=[], metavar="NAME")
     sp.add_argument("--guard-hook", action="append", default=[], metavar="TOOL=script.sh")
     sp.add_argument("--model")

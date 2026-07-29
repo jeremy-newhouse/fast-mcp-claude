@@ -99,3 +99,48 @@ async def test_off_ceiling_read_only_command_is_denied_in_a_real_turn(
     assert _SECRET not in result_text, (
         "the canary reached the model: the command executed despite the ceiling"
     )
+
+
+async def test_granted_prefix_cannot_smuggle_a_second_command_in_a_real_turn(
+    cfg, registry, events, repo
+):
+    """ECA-144 AC#1, end to end: `echo hi && cat SECRET.txt` under `Bash(echo *)`.
+
+    A different path through the CLI from the test above, which is why it earns its
+    own real turn rather than trusting the unit tests. ECA-142 measured that a
+    compound command does NOT get auto-approved — the CLI's classifier reads the
+    whole string and escalates it — so this call reaches the policy on the normal
+    route and the ceiling is what has to refuse it. On the shipped matcher the
+    ceiling said ALLOW, so escalating changed nothing: the command ran.
+
+    The canary assertion is again the load-bearing one. A `tool_denied` event only
+    says something denied something; the absent secret says the `cat` never ran.
+    """
+    (repo / "SECRET.txt").write_text(_SECRET + "\n")
+    smuggle = f"echo hi && {_AUTO_APPROVED_COMMAND}"
+    cfg = dataclasses.replace(
+        cfg, limits=dataclasses.replace(cfg.limits, wall_clock_s=180, max_turns=3)
+    )
+    bridge = QuestionBridge(registry, events)
+    engine = Engine(cfg, registry, events, bridge)
+    try:
+        await engine.spawn("live2", str(repo), WorkerPolicy(allowed_tools=["Bash(echo *)"]))
+        turn_id = await engine.prompt(
+            "live2",
+            "Run exactly this shell command with the Bash tool and then stop, with no "
+            f"other tool calls and no follow-up: {smuggle}",
+        )
+        turn = await _drain(registry, turn_id)
+    finally:
+        await engine.stop()
+
+    denials = [e for e in events.read("live2") if e["event"] == "tool_denied"]
+    assert denials, "no tool_denied event: the compound command was not refused"
+    assert any("cat SECRET.txt" in d["reason"] for d in denials), (
+        f"the denial did not name the smuggled command: {denials}"
+    )
+
+    result_text = turn["result_text"] or ""
+    assert _SECRET not in result_text, (
+        "the canary reached the model: the smuggled command executed"
+    )

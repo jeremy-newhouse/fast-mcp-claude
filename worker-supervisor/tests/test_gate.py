@@ -139,15 +139,70 @@ async def test_pretooluse_hook_pins_cwd_and_ignores_ask_user_question(registry, 
 async def test_pretooluse_hook_survives_a_non_dict_guard_hooks(registry, events, repo):
     """A malformed `guard_hooks` must not raise out of the hook (ECA-141's wedge class).
 
-    ECA-141 fixes the coercion at the construction site; until then the hook must not
-    become a NEW way to wedge a lane, since an exception out of a PreToolUse hook kills
-    the same runner loop that an exception out of can_use_tool does.
+    ECA-141 fixes the coercion at the construction site. Until then the hook must not
+    raise — but skipping a configured security control silently is its own defect, so
+    the skip is recorded. It is not a deny: the malformed value grants nothing, and
+    denying every call over a bad policy row would wedge the lane a different way.
     """
     policy = WorkerPolicy(allowed_tools=["Bash"], guard_hooks=[])  # type: ignore[arg-type]
     res = await _policy_hook(repo, policy, events)(
         {"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, None, None
     )
     assert res == {}
+    skips = [e for e in events.read("w1") if "guard:skipped" in e.get("reason", "")]
+    assert skips, "a configured guard was skipped with no record"
+
+
+async def test_pretooluse_hook_fails_CLOSED_when_its_own_body_raises(registry, events, repo):
+    """The regression this hook could have introduced, and the reason for its blanket except.
+
+    An exception out of an SDK hook callback is caught by the CLI and turned into NO
+    DECISION — after which the CLI's own auto-approval runs the tool. That is the
+    opposite of `can_use_tool`, where the same failure becomes a deny. Since this hook
+    is the only thing policing the auto-approved subset, and since the guard hooks
+    (subprocesses, filesystem probes) now run here, an unhandled exception would
+    silently restore the ECA-142 defect with nothing recorded.
+
+    Verified live during review with the body made to raise: the lane read its canary,
+    `can_use_tool` was never consulted, and no `tool_denied` was written.
+    """
+
+    class Exploding:
+        """Passes `_is_mapping` (it has `.get`), then raises from inside it."""
+
+        def get(self, _key):
+            raise RuntimeError("boom from inside the policy evaluation")
+
+    policy = WorkerPolicy(allowed_tools=["Bash"], guard_hooks=Exploding())  # type: ignore[arg-type]
+    res = await _policy_hook(repo, policy, events)(
+        {"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, None, None
+    )
+
+    spec = res["hookSpecificOutput"]
+    assert spec["permissionDecision"] == "deny", "a failing policy hook must not allow"
+    assert "policy hook failed" in spec["permissionDecisionReason"]
+    assert "RuntimeError" in spec["permissionDecisionReason"]
+    assert any("policy hook failed" in e.get("reason", "") for e in events.read("w1"))
+
+
+async def test_a_broken_event_log_still_denies(registry, events, repo, cfg, monkeypatch):
+    """The deny must not be conditional on the record being written.
+
+    `EventLog.emit` is not exception-free, and a lane can break its own log file (one
+    symlink — there is no lane-to-lane boundary here, same uid). Emitting BEFORE
+    building the return value turned every subsequent denial into a raise, which the
+    CLI converts to a silent allow. Ordering, not the record, is the control.
+    """
+
+    def explode(*a, **kw):
+        raise OSError(62, "Too many levels of symbolic links")
+
+    monkeypatch.setattr(events, "emit", explode)
+    policy = WorkerPolicy(allowed_tools=["Bash(echo*)"])
+    res = await _policy_hook(repo, policy, events)(
+        {"tool_name": "Bash", "tool_input": {"command": "ls -a"}}, None, None
+    )
+    assert res["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 async def test_question_bridge_round_trip(registry, events, repo):

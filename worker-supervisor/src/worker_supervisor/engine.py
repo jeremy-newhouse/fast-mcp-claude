@@ -590,10 +590,23 @@ class Engine:
                         ),
                         # ECA-142: the TOTAL policy point. `matcher=None` fires for
                         # every tool call, including the ones the CLI auto-approves
-                        # and therefore never routes through can_use_tool. Registered
-                        # as its own matcher rather than folded into the one above:
-                        # matchers on an event dispatch CONCURRENTLY, so the question
-                        # bridge's long park must not gate policy for other tools.
+                        # and therefore never route through can_use_tool.
+                        #
+                        # Its own matcher rather than folded into the one above, and
+                        # the reason is NOT the one first written here. Review checked
+                        # the CLI: when every matcher on an event is an SDK callback —
+                        # this daemon's shape — 2.1.220 awaits them SEQUENTIALLY in
+                        # registration order, not concurrently (concurrency applies
+                        # only in its general branch). Separate matchers are still
+                        # right, for a stronger reason: `getMatchingHooks` filters the
+                        # "AskUserQuestion" entry out for every other tool name, so
+                        # the bridge's park cannot gate any other tool. FOLDING them
+                        # into one matcher is what would have gated everything.
+                        #
+                        # No `timeout=` here: in that all-callback path the CLI never
+                        # reads one (which also makes the sibling's timeout above a
+                        # no-op today). It starts to matter only if a non-callback
+                        # PreToolUse hook ever joins this event.
                         HookMatcher(
                             matcher=None,
                             hooks=[

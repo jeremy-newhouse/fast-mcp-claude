@@ -494,52 +494,93 @@ def make_policy_hook(
     subset above keeps executing without a prompt exactly as before — only now the
     ceiling and the guard hooks apply to it.
 
-    AskUserQuestion is skipped here: `make_question_hook` owns that tool, and the
-    ceiling never governs it (it is in every worker's base set by construction).
+    AskUserQuestion is skipped here because `make_question_hook` owns that tool and
+    must be the only thing that answers for it. Note what that does NOT rest on: the
+    ceiling would in fact REFUSE it for a narrow policy (`ceiling_allows` is False for
+    a `Bash(echo*)` grant), and `_ALWAYS_BASE_TOOLS` puts it in every lane's `--tools`
+    regardless of grant. So the escalation channel is deliberately outside the ceiling
+    for every lane — an earlier draft of this docstring said the ceiling "never governs
+    it", which confused a tool EXISTING with a tool being permitted. `tool_name` here
+    comes from the CLI's dispatcher, not the model, so it cannot be forged.
+
+    **This hook fails CLOSED, and that is not decoration.** An exception out of an SDK
+    hook callback is caught by the CLI, logged, and converted to NO DECISION — after
+    which the CLI's own auto-approval runs the tool. That is the opposite of
+    `can_use_tool`, where the CLI turns the same failure into a deny. Since this hook
+    is the ONLY thing policing the auto-approved subset, and since it is where the
+    guard hooks now run — subprocesses, filesystem probes, the part most likely to
+    raise — an unhandled exception here would silently restore the exact ECA-142
+    defect with no event recorded. Measured, not reasoned: with the body made to raise,
+    a lane granted `Bash(echo*)` read its canary file, `can_use_tool` was never
+    consulted, and no `tool_denied` was written. Hence the blanket `except` below.
     """
 
+    def _record(reason: str) -> None:
+        """Emit is best-effort; the DENY is not conditional on it.
+
+        `EventLog.emit` is documented as not exception-free (ENOSPC, an unwritable
+        logs dir, an EISDIR/ELOOP target). It was previously called before building
+        the return value, so a lane that broke its own event log — one `ln -s`, since
+        there is no lane-to-lane boundary here — turned every subsequent denial into a
+        raise, i.e. into a silent allow. Order matters more than the record does.
+        """
+        try:
+            events.emit(
+                worker, "tool_denied", turn_id=turn_id, tool=tool_name_seen[0],
+                reason=reason, layer="pretooluse",
+            )
+        except Exception:  # noqa: BLE001 - a lost record must never lose the deny
+            pass
+
+    tool_name_seen = [""]
+
     async def on_pre_tool_use(hook_input: Any, tool_use_id: str | None, context: Any):
-        data = hook_input or {}
-        tool_name = data.get("tool_name") or ""
-        tool_input = data.get("tool_input") or {}
-        if tool_name == "AskUserQuestion":
-            return {}
+        try:
+            data = hook_input or {}
+            tool_name = data.get("tool_name") or ""
+            tool_input = data.get("tool_input") or {}
+            tool_name_seen[0] = tool_name
+            if tool_name == "AskUserQuestion":
+                return {}
 
-        reason = _ceiling_or_cwd_denial(repo_root, policy, tool_name, tool_input)
-        if reason is None:
-            # Guard hooks live HERE and only here, so they run exactly once per call
-            # and — unlike before — for the CLI-auto-approved subset too.
-            script = policy.guard_hooks.get(tool_name) if _is_mapping(policy.guard_hooks) else None
-            if script:
-                decision, guard_reason = await _run_guard_hook(
-                    repo_root, script, tool_name, tool_input
-                )
-                if decision == "refused":
-                    # A separate branch from the one below, because that message says
-                    # "Denied by repo guard hook" and that would be FALSE here: nothing
-                    # ran. The refusal cannot itself traverse — `script` reaches this
-                    # path only as message and record BODY, never as a path, and the
-                    # event is keyed on `worker`, which ECA-137 validates in EventLog.
-                    events.emit(
-                        worker, "tool_denied", turn_id=turn_id, tool=tool_name,
-                        reason=f"guard:refused:{guard_reason}", layer="pretooluse",
+            reason = _ceiling_or_cwd_denial(repo_root, policy, tool_name, tool_input)
+            if reason is None:
+                # Guard hooks live HERE and only here, so they run exactly once per
+                # call and — unlike before — for the CLI-auto-approved subset too.
+                if not _is_mapping(policy.guard_hooks):
+                    # ECA-141's wedge is closed, but silently skipping a configured
+                    # security control is its own defect: record it. (Not a deny —
+                    # the malformed value grants nothing, and denying every call on a
+                    # bad policy row would wedge the lane a different way.)
+                    _record(f"guard:skipped:malformed guard_hooks {_clip(policy.guard_hooks)}")
+                    return {}
+                script = policy.guard_hooks.get(tool_name)
+                if script:
+                    decision, guard_reason = await _run_guard_hook(
+                        repo_root, script, tool_name, tool_input
                     )
-                    return _hook_deny(f"Denied by worker policy: {guard_reason}")
-                if decision in ("deny", "ask", "error"):
-                    events.emit(
-                        worker, "tool_denied", turn_id=turn_id, tool=tool_name,
-                        reason=f"guard:{decision}:{guard_reason}", layer="pretooluse",
-                    )
-                    return _hook_deny(
-                        f"Denied by repo guard hook ({decision}): {guard_reason or script}"
-                    )
-            return {}
+                    if decision == "refused":
+                        # A separate branch from the one below, because that message
+                        # says "Denied by repo guard hook" and that would be FALSE
+                        # here: nothing ran. The refusal cannot itself traverse —
+                        # `script` reaches this path only as message and record BODY,
+                        # never as a path, and the event is keyed on `worker`, which
+                        # ECA-137 validates inside EventLog.
+                        _record(f"guard:refused:{guard_reason}")
+                        return _hook_deny(f"Denied by worker policy: {guard_reason}")
+                    if decision in ("deny", "ask", "error"):
+                        _record(f"guard:{decision}:{guard_reason}")
+                        return _hook_deny(
+                            f"Denied by repo guard hook ({decision}): {guard_reason or script}"
+                        )
+                return {}
 
-        events.emit(
-            worker, "tool_denied", turn_id=turn_id, tool=tool_name,
-            reason=reason, layer="pretooluse",
-        )
-        return _hook_deny(f"Denied by worker policy: {reason}")
+            _record(reason)
+            return _hook_deny(f"Denied by worker policy: {reason}")
+        except Exception as e:  # noqa: BLE001 - see the docstring: no decision = allow
+            reason = f"policy hook failed: {e.__class__.__name__}: {_clip(str(e))}"
+            _record(reason)
+            return _hook_deny(f"Denied by worker policy: {reason}")
 
     return on_pre_tool_use
 
@@ -556,8 +597,14 @@ def _hook_deny(reason: str) -> dict[str, Any]:
 
 def _is_mapping(value: Any) -> bool:
     """`guard_hooks` reaches here uncoerced from control-socket JSON (ECA-141 tracks
-    the real fix at the construction site). Until then, a non-dict must not raise out
-    of a hook or a gate — that wedges the lane for as long as the row exists."""
+    the real fix at the construction site).
+
+    Until then a non-dict must not raise out of this hook. Note the consequence is not
+    the one ECA-135 recorded: on the pinned SDK (0.2.128) an exception here does not
+    kill the runner loop, it is swallowed into "no decision", so the failure mode is a
+    silent ALLOW rather than a loud wedge. Worse, not better — which is why the caller
+    both guards this and records the skip.
+    """
     return hasattr(value, "get")
 
 
@@ -575,11 +622,18 @@ def make_gate(
 
     This is NOT the total gate — see `make_policy_hook`, which is, and which runs
     first for every call. What remains here is the AskUserQuestion escalation channel
-    plus a second, idempotent evaluation of the two pure checks: if the hook ever
-    stops firing, the calls that DO reach a permission prompt still meet the ceiling
-    and the cwd pin. Guard hooks deliberately do not run here any more — they have
-    side effects, so they must run exactly once, and the hook is the path that sees
-    every call.
+    plus a second, idempotent evaluation of the two pure checks. Guard hooks
+    deliberately do not run here any more — they have side effects, so they must run
+    exactly once, and the hook is the path that sees every call.
+
+    Be precise about what that second evaluation is worth, because an earlier draft
+    of this docstring overclaimed it. It covers the calls that reach a permission
+    prompt — which are exactly the calls that were NEVER the exposed ones. The subset
+    ECA-142 is about (read-only Bash inside the cwd) does not reach here at all, so
+    for that subset the hook is a single point of failure with no backstop in this
+    function. It fails closed for its own errors; what nothing here would detect is
+    the hook silently ceasing to be dispatched at all. That residual is recorded in
+    the architecture doc rather than papered over.
     """
 
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context: Any):

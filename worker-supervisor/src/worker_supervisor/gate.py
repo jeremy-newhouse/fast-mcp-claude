@@ -269,10 +269,12 @@ def make_question_hook(
 ):
     """PreToolUse hook interception for AskUserQuestion.
 
-    On CLI 2.1.165 AskUserQuestion is a UI tool, not a permission-gated one:
-    it never reaches can_use_tool and errors headless ("stream closed"). Hooks
+    On CLI 2.1.165 AskUserQuestion was a UI tool, not a permission-gated one:
+    it never reached can_use_tool and errored headless ("stream closed"). Hooks
     fire for every tool use, so the bridge lives here; the hook's deny reason
-    carries the answer back (the eck-dev contract, relocated).
+    carries the answer back (the eck-dev contract, relocated). Not re-measured on
+    the current 2.1.220 bundle (ECA-138), and it does not need to be: the hook
+    path is correct whether or not the tool also became permission-gated.
     """
 
     async def on_ask_user_question(hook_input: Any, tool_use_id: str | None, context: Any):

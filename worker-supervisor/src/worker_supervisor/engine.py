@@ -726,11 +726,14 @@ class Engine:
     ) -> str | None:
         """Newest session id in the epoch whose transcript is actually on disk.
 
-        CLI 2.1.165 (SDK mode) writes the transcript at process exit, and the
-        SDK's close() (stdin-close -> 5s -> SIGTERM -> SIGKILL) races it: a turn
-        can report a session id that never persists. Resuming that id fails with
-        'No conversation found'. Skipping to the newest persisted id loses one
-        turn of context instead of the whole epoch; G7 remains the backstop.
+        Observed on CLI 2.1.165 (SDK mode): the transcript is written at process
+        exit, and the SDK's close() (stdin-close -> 5s -> SIGTERM -> SIGKILL)
+        races it, so a turn can report a session id that never persists.
+        Resuming that id fails with 'No conversation found'. Skipping to the
+        newest persisted id loses one turn of context instead of the whole epoch;
+        G7 remains the backstop. NOT re-measured on the current 2.1.220 bundle
+        (ECA-138) — the guard is kept because it costs one turn when the race is
+        gone and saves an epoch when it is not.
         """
         cur = await self._reg.db.execute(
             "SELECT DISTINCT session_id FROM turns WHERE epoch_id = ?"
@@ -925,8 +928,9 @@ class Engine:
         """ECA-135: hand the CLI a 0600 config FILE PATH, never inline JSON.
 
         The SDK renders a DICT-valued `ClaudeAgentOptions.mcp_servers` into
-        `--mcp-config <the entire JSON>` in the child's ARGV (0.2.91
-        subprocess_cli.py, dict branch). Argv is world-readable to every process of
+        `--mcp-config <the entire JSON>` in the child's ARGV (subprocess_cli.py, dict
+        branch — the same code in 0.2.91 and in the current 0.2.128 pin, re-read at
+        the ECA-138 bump). Argv is world-readable to every process of
         the same uid, so a granted lane's bearers sat in the process table for the
         whole turn — readable by that lane's own `Bash`, and by every OTHER lane
         running concurrently, granted or not. Confirmed live on mbpm2 (CLI 2.1.220 /

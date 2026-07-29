@@ -6,7 +6,7 @@ requires-python = ">=3.12"
 # Deliberately minimal image dependency closure (AC#1/AC#3): the SDK ONLY.
 # No fastmcp (no in-container MCP — invariant-9 analog), no aiosqlite, no httpx.
 dependencies = [
-    "claude-agent-sdk==0.2.91",
+    "claude-agent-sdk==0.2.128",
 ]
 
 [project.optional-dependencies]

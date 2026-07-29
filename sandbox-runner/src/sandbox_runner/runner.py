@@ -12,7 +12,7 @@ Hermetic posture (the container *is* the boundary — container-sandbox.md):
     Sonnet — must pin to our posture).
 
 Limits: ``max_turns`` + ``max_budget_usd`` are native SDK options (both exist in
-0.2.91); ``wall_clock_s`` is enforced here via ``asyncio.timeout`` — a breach
+0.2.128); ``wall_clock_s`` is enforced here via ``asyncio.timeout`` — a breach
 cancels the transport, escalating SIGTERM->SIGKILL to the CLI subprocess group.
 """
 

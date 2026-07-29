@@ -5,7 +5,7 @@ Name-compatible with the spawner (ECA-65) and worker-supervisor's `Limits`.
 Enforcement split (confirmed against the pinned SDK, not assumed):
   * ``max_turns``       — native ``ClaudeAgentOptions.max_turns``.
   * ``max_budget_usd``  — native ``ClaudeAgentOptions.max_budget_usd`` (this
-    option DOES exist in claude-agent-sdk 0.2.91; worker-supervisor uses it).
+    option DOES exist in claude-agent-sdk 0.2.128; worker-supervisor uses it).
     The runner also keeps a defensive running-cost tally purely for reporting.
   * ``wall_clock_s``    — runner-enforced via ``asyncio.timeout`` around the
     query stream; on breach the transport is cancelled (SIGTERM->SIGKILL to the

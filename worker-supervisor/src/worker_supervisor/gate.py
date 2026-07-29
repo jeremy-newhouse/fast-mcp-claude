@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
 from .events import EventLog
+from .names import HOOK_SCRIPT_RE, is_safe_hook_script
 from .registry import Registry
 
 # Tool-input keys that carry filesystem paths (cwd pin scope). Bash is governed
@@ -46,7 +47,12 @@ class WorkerPolicy:
 
     allowed_tools: list[str] = field(default_factory=lambda: list(DEFAULT_ALLOWED_TOOLS))
     allow_env: list[str] = field(default_factory=list)
-    guard_hooks: dict[str, str] = field(default_factory=dict)  # tool -> .claude/hooks script
+    # tool -> a script name inside the repo's `.claude/hooks/`. The VALUE is a plain
+    # filename component, not a path: it is joined under that directory and executed, so
+    # anything else is refused at derivation (ECA-140 — see `_run_guard_hook`). Typed
+    # `dict[str, str]` because that is the contract; the runtime does not enforce it,
+    # since control-socket JSON reaches this field uncoerced.
+    guard_hooks: dict[str, str] = field(default_factory=dict)
     model: str | None = None
     limits: dict[str, Any] = field(default_factory=dict)  # per-worker Limits overrides
     # Per-lane MCP grant (ECA-100): server-name -> SDK McpServerConfig, passed to
@@ -300,15 +306,64 @@ def make_question_hook(
 
 
 async def _run_guard_hook(
-    repo_root: Path, script: str, tool_name: str, tool_input: dict[str, Any]
+    repo_root: Path, script: object, tool_name: str, tool_input: dict[str, Any]
 ) -> tuple[str, str]:
     """Run a repo .claude/hooks guard with the hook JSON contract on stdin.
 
-    Returns (decision, reason): decision in allow/deny/ask/error/none.
+    Returns (decision, reason): decision in allow/deny/ask/error/none/refused.
+
+    `script` arrives from the control socket (`server._dispatch` -> `WorkerPolicy.
+    guard_hooks` -> `can_use_tool`) with no validation between there and here, and this
+    function then hands it to `bash`. That made it an EXECUTE primitive (ECA-140): until
+    the guard below, `--guard-hook Bash=../../../../tmp/x.sh` ran `/tmp/x.sh`, and a bare
+    ABSOLUTE path did the same with no `..` in it at all, because `Path.__truediv__`
+    discards its left operand entirely when the right one is absolute. Both shapes were
+    demonstrated executing before the fix, and both are covered by tests that assert on a
+    sentinel FILE rather than on a return value — a decision string cannot tell you
+    whether a subprocess ran.
+
+    Typed `object`, not `str`, for the reason `names.require_safe_worker_name` is: a
+    non-str genuinely arrives here (control-socket JSON is uncoerced) and is genuinely
+    handled. Annotating `str` would be a claim the runtime does not make.
+
+    Severity, so nobody re-derives it wrongly from the word "execute": the socket is
+    local-only and same-uid, and a caller who can set a worker policy can already ask for
+    a bare `Bash` grant, which reaches arbitrary execution by a shorter route. What this
+    closes is the REVIEWABILITY gap — running a script from outside the operator-owned
+    repo tree while looking like a policy setting rather than a tool grant.
     """
-    hook_path = repo_root / ".claude" / "hooks" / script
+    hooks_dir = repo_root / ".claude" / "hooks"
+    # AC#1: refuse at PATH DERIVATION, ahead of the join, not at the caller. Validating
+    # in `can_use_tool` would leave this function unsafe for its next caller, which is
+    # the mistake ECA-135 made at `Engine.spawn` and ECA-137 had to correct.
+    if not is_safe_hook_script(script):
+        return "refused", (
+            f"guard-hook script {script!r} is not a plain filename component: it must "
+            f"match {HOOK_SCRIPT_RE.pattern} and contain no '..' (the value is joined "
+            "under <repo>/.claude/hooks/ and executed)"
+        )
+    hook_path = hooks_dir / script
     if not hook_path.exists():
+        # Deliberately UNCHANGED, and deliberately not "deny" (ECA-140). A well-formed
+        # hook that is absent is a deployment mismatch, not an attack: the same caller
+        # that named the hook could have named none, so failing open crosses no boundary
+        # the caller was not already on the safe side of. Denying instead would also turn
+        # one stale policy row into a lane that cannot use the tool at all, and reporting
+        # it would emit an event per tool call for as long as the mismatch lasts. The
+        # REFUSAL path above is the one AC#2 is about, and that one denies loudly.
         return "none", f"guard hook missing: {script}"
+    # A plain filename component cannot escape `hooks_dir` lexically — but a SYMLINK at
+    # that name can, and AC#3 asserts on the directory rather than on the string. Resolve
+    # both sides so a symlinked `.claude` or `hooks` is still contained; only a hook FILE
+    # pointing out is refused. Nothing on either supervisor host is affected: no hook file
+    # and no hooks directory anywhere under ~/repos is a symlink (checked, not assumed).
+    try:
+        hook_path.resolve(strict=True).relative_to(hooks_dir.resolve())
+    except (OSError, ValueError):
+        return "refused", (
+            f"guard-hook script {script!r} resolves outside {str(hooks_dir)!r} "
+            "(symlinked out, or unresolvable)"
+        )
     payload = json.dumps({"tool_name": tool_name, "tool_input": tool_input})
     proc = await asyncio.create_subprocess_exec(
         "bash",
@@ -399,6 +454,17 @@ def make_gate(
         script = policy.guard_hooks.get(tool_name)
         if script:
             decision, reason = await _run_guard_hook(repo_root, script, tool_name, tool_input)
+            if decision == "refused":
+                # A separate branch, not folded into the one below, because the message
+                # there says "Denied by repo guard hook" and that would be FALSE here:
+                # nothing ran. The refusal cannot itself traverse — `script` reaches this
+                # path only as message and record BODY, never as a path, and the event is
+                # keyed on `worker`, which ECA-137 already validates inside EventLog.path.
+                events.emit(
+                    worker, "tool_denied", turn_id=turn_id, tool=tool_name,
+                    reason=f"guard:refused:{reason}",
+                )
+                return PermissionResultDeny(message=f"Denied by worker policy: {reason}")
             if decision in ("deny", "ask", "error"):
                 events.emit(
                     worker, "tool_denied", turn_id=turn_id, tool=tool_name,

@@ -48,6 +48,7 @@ def r_api_error(
     status: int | None = 429,
     errors: list[str] | None = None,
     text: str = "You've hit your monthly spend limit",
+    cost: float = 0.0,
 ) -> ResultMessage:
     """The ECA-143 result frame: is_error with subtype "success".
 
@@ -62,7 +63,7 @@ def r_api_error(
         is_error=True,
         num_turns=1,
         session_id=session_id,
-        total_cost_usd=0.0,
+        total_cost_usd=cost,
         usage={"input_tokens": 0, "output_tokens": 0},
         result=text,
         errors=errors,
@@ -76,6 +77,16 @@ def a(*tools: str, usage: dict | None = None) -> AssistantMessage:
         model="test-model",
         usage=usage,
     )
+
+
+def SDK_ERROR_EXIT() -> Exception:
+    """What the SDK actually raises when the CLI exits non-zero after an error result.
+
+    A BARE `Exception` carrying the CLI's own text — see the note in
+    `make_fake_query`. Named rather than inlined so no test quietly reverts to
+    `ProcessError` and ends up exercising a clause production never reaches.
+    """
+    return Exception("Claude Code returned an error result: success")
 
 
 class Hang:
@@ -104,6 +115,13 @@ def make_fake_query(script: list[Any], calls: list[Any]):
             # is_error=True and only THEN exits non-zero, so the SDK surfaces an
             # exception for a turn whose result was already observed. A script that
             # can only raise INSTEAD of yielding cannot express that at all.
+            #
+            # Use a BARE `Exception` for that, not ProcessError. The SDK swallows the
+            # transport's ProcessError (`_internal/query.py` catches it, replaces it
+            # with the CLI's own error text, and re-sends it as `{"type": "error"}`),
+            # and `receive_messages` then raises a bare `Exception`. Confirmed by the
+            # live ECA-143 capsule, whose recorded reason begins "Exception: " — the
+            # engine's ProcessError clause would have written "ProcessError: ".
             if isinstance(msg, Exception):
                 raise msg
             if isinstance(msg, Hang):
@@ -213,11 +231,14 @@ async def test_api_error_failure_keeps_the_clis_own_account_of_it(
     and a `usage` blob in the capsule beside `result_text: null`: a ResultMessage
     had plainly been observed.
     """
-    boom = ProcessError("cli exited 1", exit_code=1)
+    boom = SDK_ERROR_EXIT()
     engine, _ = make_engine([[r_api_error(), boom], [r_api_error(), boom]])
     await engine.spawn("w1", str(repo))
     tid = await engine.prompt("w1", "spend-capped")
     turn = await terminal_turn(registry, tid)
+    # The bare-Exception clause, which is the one the live SDK reaches — the
+    # engine's own error string proves which clause ran.
+    assert turn["error"].startswith("Exception: ")
 
     assert turn["state"] == "error"
     # The three fields the success path kept and this one silently discarded.
@@ -293,10 +314,106 @@ async def test_timeout_path_keeps_the_result_it_had_observed(
     assert capsule["result_diagnostics"]["api_error_status"] == 429
 
 
+async def test_timeout_row_still_charges_the_epoch_for_what_the_turn_spent(
+    make_engine, registry, repo
+):
+    """ECA-143 review round: the timeout path dropped SIX fields, not three.
+
+    `finish_turn` writes every column unconditionally and the epoch's spend is
+    incremented only from the `cost_usd` handed to it, so a turn that burned money
+    and THEN hit the wall clock was charged nothing against max_budget_usd_per_epoch
+    — and wall-clock breaches are exactly the expensive turns. `workers status` also
+    reported a null context_pct, because it reads the last finished turn's usage.
+    """
+    engine, _ = make_engine([[r("s1", cost=0.05, usage={"input_tokens": 20_000}), Hang()]])
+    await engine.spawn("w1", str(repo), WorkerPolicy(limits={"wall_clock_s": 1}))
+    tid = await engine.prompt("w1", "expensive, then stalls")
+    turn = await terminal_turn(registry, tid, timeout=15.0)
+
+    assert turn["state"] == "timeout"
+    assert turn["cost_usd"] == 0.05
+    assert turn["duration_ms"] == 100 and json.loads(turn["usage"])["input_tokens"] == 20_000
+    epoch = await registry.current_epoch("w1")
+    assert epoch["cost_usd"] == 0.05, "spend escaped the epoch budget cap"
+    # `status` reads context_pct off the last finished turn's usage, so dropping
+    # `usage` here also blinded the operator's only context-pressure signal.
+    assert (await engine.status())[0]["context_pct"] == 10
+
+
+async def test_resume_failed_row_keeps_the_turns_telemetry_too(
+    make_engine, registry, repo, cfg, events
+):
+    """ECA-143 review round: the resume_failed row dropped the same six.
+
+    Persisting session_id here is safe by construction: this branch rolls the epoch,
+    and `_pick_resume_target` only considers ids `WHERE epoch_id = <new epoch>`, so a
+    dead chain's id can never be resumed out of it.
+
+    Caveat recorded rather than papered over: on the pinned SDK this whole `except
+    ProcessError` branch is unreachable, because the SDK converts the CLI's exit into
+    a bare `Exception` (see SDK_ERROR_EXIT). Filed separately — G7's resume recovery
+    is dead code, which is a bigger problem than this task's. The branch is still
+    tested here: it is present, reachable by any caller that does raise ProcessError,
+    and must not be the one path that silently loses a turn's spend.
+    """
+    engine, _ = make_engine(
+        [
+            [r("s1")],
+            [r_api_error("s2", cost=0.07), ProcessError("resume rejected", exit_code=1)],
+            [r("s3")],
+        ]
+    )
+    await engine.spawn("w1", str(repo))
+    t1 = await engine.prompt("w1", "one")
+    await terminal_turn(registry, t1)
+    t2 = await engine.prompt("w1", "two")
+    turn2 = await terminal_turn(registry, t2)
+
+    assert turn2["state"] == "error" and "resume failed" in turn2["error"]
+    assert turn2["session_id"] == "s2" and turn2["cost_usd"] == 0.07
+    assert turn2["result_text"] == "You've hit your monthly spend limit"
+    assert turn2["num_turns"] == 1 and turn2["is_error"] == 1
+    capsule = json.loads(
+        sorted(cfg.capsules_dir.glob(f"w1-turn{t2}-*.json"))[-1].read_text(encoding="utf-8")
+    )
+    assert capsule["result_diagnostics"]["saw_result"] is True
+    assert capsule["result_diagnostics"]["api_error_status"] == 429
+    failed = [e for e in events.read("w1") if e["event"] == "resume_failed"]
+    assert failed and failed[-1]["api_error_status"] == 429
+
+
+@pytest.mark.parametrize(
+    "event,script",
+    [
+        # The clause the LIVE failure takes. The ProcessError sibling is covered by
+        # test_api_error_..., and both must carry the status.
+        ("turn_retry", [[r_api_error(), SDK_ERROR_EXIT()], [r("sOK")]]),
+        ("turn_timeout", [[r_api_error(), Hang()]]),
+        # is_error result, CLI exits 0: no exception anywhere, so the event is the
+        # ONLY place an operator sees a reason at all.
+        ("turn_finished", [[r_api_error()]]),
+    ],
+)
+async def test_every_failure_event_carries_the_api_status(
+    make_engine, registry, repo, events, event, script
+):
+    """ECA-143 review round: five of the new event fields had no falsifying test,
+    including the retry clause the live SDK actually reaches — so the suite proved
+    the status reached a path production never takes."""
+    engine, _ = make_engine(script)
+    await engine.spawn("w1", str(repo), WorkerPolicy(limits={"wall_clock_s": 1}))
+    tid = await engine.prompt("w1", "429")
+    await terminal_turn(registry, tid, timeout=15.0)
+
+    rows = [e for e in events.read("w1") if e["event"] == event]
+    assert rows, f"no {event} event"
+    assert rows[-1]["api_error_status"] == 429
+
+
 async def test_capsule_bounds_the_clis_error_list(make_engine, registry, repo, cfg):
     """ECA-143: `errors` is the one diagnostics field that can carry text, so it is
     bounded. A capsule too large to open is not evidence."""
-    boom = ProcessError("cli exited 1", exit_code=1)
+    boom = SDK_ERROR_EXIT()
     flood = [f"{i}:" + "x" * 2000 for i in range(50)]
     engine, _ = make_engine(
         [[r_api_error(errors=flood), boom], [r_api_error(errors=flood), boom]]
@@ -312,6 +429,45 @@ async def test_capsule_bounds_the_clis_error_list(make_engine, registry, repo, c
     assert len(errors) == 10
     assert all(len(e) == 500 for e in errors)
     assert errors[0].startswith("0:")  # bounded from the FRONT: the first error caused the rest
+
+
+async def test_a_non_list_errors_field_cannot_fail_a_successful_turn(
+    make_engine, registry, repo
+):
+    """ECA-143 review round: `list(msg.errors)` on a non-iterable raised inside
+    `_observe`, i.e. inside the message loop — so a turn the CLI reported as DONE
+    became a supervisor error whose recorded reason blamed the supervisor. A
+    diagnostic must not be able to fail the thing it is describing."""
+    good = r("s1")
+    good.errors = 5  # a protocol violation; message_parser validates nothing here
+    engine, _ = make_engine([[good]])
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "fine, but malformed errors")
+    turn = await terminal_turn(registry, tid)
+    assert turn["state"] == "done", turn["error"]
+
+
+async def test_a_string_errors_field_is_not_split_into_characters(
+    make_engine, registry, repo, cfg
+):
+    """ECA-143 review round: a str is Iterable, so `list()` exploded it per character
+    and the 10-item bound then kept ten single letters — the message destroyed, in the
+    one field meant to carry the CLI's own words. Mangled evidence is worse than none:
+    it reads as data."""
+    engine, _ = make_engine(
+        [
+            [r_api_error(errors="monthly spend cap"), SDK_ERROR_EXIT()],
+            [r_api_error(errors="monthly spend cap"), SDK_ERROR_EXIT()],
+        ]
+    )
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "string errors")
+    await terminal_turn(registry, tid)
+
+    capsule = json.loads(
+        sorted(cfg.capsules_dir.glob("w1-turn*.json"))[-1].read_text(encoding="utf-8")
+    )
+    assert capsule["result_diagnostics"]["errors"] == ["monthly spend cap"]
 
 
 async def test_turn_mcp_diagnostics_emitted_on_failure_ladder_too(

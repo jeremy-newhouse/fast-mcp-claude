@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -257,6 +258,36 @@ class TurnOutcome:
             "saw_result": self.saw_result,
             "num_turns": self.num_turns,
         }
+
+
+def _as_error_list(errors: Any) -> list[Any] | None:
+    """Whatever the CLI put in `errors`, as a list — without trusting the type.
+
+    ECA-143 review round, two confirmed defects from a bare `list(msg.errors)`:
+
+    A non-iterable (`errors=5`) raised TypeError inside `_observe`, i.e. inside
+    the message loop — so a turn the CLI reported as DONE was converted into a
+    supervisor-side error, with a recorded reason pointing at us instead of at
+    the protocol violation. A diagnostic must not be able to fail the thing it
+    describes.
+
+    A plain string (`errors="monthly spend cap"`) was iterated per CHARACTER and
+    then truncated to ten, so the capsule showed ten one-letter "errors" and the
+    message was destroyed — worse than dropping it, because it looks like data.
+
+    `message_parser` does no validation on this field, so the type is the CLI's
+    word, not a guarantee.
+    """
+    if errors is None or errors == "" or errors == []:
+        return None
+    if isinstance(errors, list):
+        return errors or None
+    if isinstance(errors, (str, bytes)) or not isinstance(errors, Iterable):
+        return [errors]  # one value, never a per-character explosion
+    try:
+        return list(errors) or None
+    except Exception:  # noqa: BLE001 — a hostile __iter__ must not fail the turn
+        return [repr(errors)[:ERROR_ITEM_CHARS]]
 
 
 def _status_field(outcome: TurnOutcome) -> dict[str, int]:
@@ -696,12 +727,23 @@ class Engine:
             except (asyncio.TimeoutError, TimeoutError):
                 # Wall-clock breach: cancellation closed the transport, which
                 # escalates SIGTERM->SIGKILL on the subprocess group.
+                # ECA-143 review round: this path dropped SIX fields, not three, and
+                # the missing three were the expensive ones. `finish_turn` writes every
+                # column unconditionally (no COALESCE), and the epoch's spend is
+                # incremented only from the `cost_usd` it is handed — so a turn that
+                # burned money and then hit the wall clock was charged NOTHING against
+                # max_budget_usd_per_epoch, and `status`'s context_pct (read off the
+                # last finished turn's usage) came back null. Wall-clock breaches are
+                # exactly the expensive turns.
                 await self._reg.finish_turn(
                     turn_id, "timeout",
                     session_id=outcome.session_id,
-                    result_text=outcome.result_text,  # ECA-143: was dropped here too
+                    result_text=outcome.result_text,
                     is_error=outcome.is_error,
+                    cost_usd=outcome.cost_usd,
+                    duration_ms=outcome.duration_ms,
                     num_turns=outcome.num_turns,
+                    usage=outcome.usage,
                     error=f"wall clock exceeded ({limits.wall_clock_s}s)",
                     tools=outcome.tools,
                 )
@@ -710,7 +752,7 @@ class Engine:
                 )
                 await self._finish_failure_capsule(
                     name, turn_id, "timeout", options_snapshot, list(stderr_tail),
-                    [resume_from], diagnostics=outcome.diagnostics(),
+                    [resume_from], outcome=outcome,
                 )
                 self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
                 await self._reg.set_worker_status(name, "idle", active=True)
@@ -719,11 +761,20 @@ class Engine:
                 if resume_from is not None:
                     # G7: the chain is dead. Never silently fresh — end the epoch,
                     # open the next one grounded on the handover file.
+                    # ECA-143 review round: same six as the timeout path. Persisting
+                    # session_id here cannot resurrect the dead chain — this branch
+                    # rolls the epoch, and _pick_resume_target only ever considers
+                    # session ids WHERE epoch_id = <the new epoch>.
                     await self._reg.finish_turn(
                         turn_id, "error",
-                        result_text=outcome.result_text,  # ECA-143
+                        session_id=outcome.session_id,
+                        result_text=outcome.result_text,
                         is_error=outcome.is_error,
+                        cost_usd=outcome.cost_usd,
+                        duration_ms=outcome.duration_ms,
                         num_turns=outcome.num_turns,
+                        usage=outcome.usage,
+                        tools=outcome.tools,
                         error=f"resume failed: {e} (exit={e.exit_code})",
                     )
                     self._events.emit(
@@ -733,7 +784,7 @@ class Engine:
                     await self._finish_failure_capsule(
                         name, turn_id, "resume_failed", options_snapshot,
                         list(stderr_tail), [resume_from],
-                        diagnostics=outcome.diagnostics(),
+                        outcome=outcome,
                     )
                     self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
                     await self._reg.roll_epoch(name, "resume_failed")
@@ -793,7 +844,7 @@ class Engine:
             await self._finish_failure_capsule(
                 name, turn_id, "question_timeout", options_snapshot,
                 list(stderr_tail), [resume_from, outcome.session_id],
-                diagnostics=outcome.diagnostics(),
+                outcome=outcome,
             )
             self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
             await self._reg.set_worker_status(name, "idle", active=True)
@@ -840,7 +891,7 @@ class Engine:
             await self._finish_failure_capsule(
                 name, turn_id, "result_error", options_snapshot,
                 list(stderr_tail), [resume_from, outcome.session_id],
-                diagnostics=outcome.diagnostics(),
+                outcome=outcome,
             )
         await self._reg.set_worker_status(name, "idle", active=True)
 
@@ -932,7 +983,7 @@ class Engine:
         )
         await self._finish_failure_capsule(
             name, turn_id, "error", options_snapshot, list(stderr_tail),
-            [resume_from, outcome.session_id], diagnostics=outcome.diagnostics(),
+            [resume_from, outcome.session_id], outcome=outcome,
         )
         self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
         await self._reg.set_worker_status(name, "idle", active=True)
@@ -1165,8 +1216,19 @@ class Engine:
         options_snapshot: dict[str, Any],
         stderr_tail: list[str],
         resume_chain: list[str | None],
-        diagnostics: dict[str, Any] | None = None,
+        outcome: TurnOutcome | None = None,
     ) -> None:
+        """ECA-143 review round: this takes the OUTCOME, not a pre-built diagnostics
+        dict, so `diagnostics()` is called INSIDE the try below.
+
+        Arguments are evaluated before the call, so a `diagnostics=outcome.diagnostics()`
+        at a call site sat outside this handler: a raise in there would escape
+        `_run_turn` past `set_worker_status(name, "idle")` and kill the runner loop —
+        the ECA-135/137 lane-wedge class, and precisely the trap `write_capsule`'s own
+        docstring records for `events_tail`. `None` means the caller had no outcome
+        (the pre-spawn budget refusal), which is different from an outcome with
+        nothing in it.
+        """
         try:
             turn = await self._reg.get_turn(turn_id)
             path = write_capsule(
@@ -1178,7 +1240,7 @@ class Engine:
                 events_tail=self._events.read(name, limit=50),
                 stderr_tail=stderr_tail,
                 resume_chain=[s for s in resume_chain],
-                result_diagnostics=diagnostics,
+                result_diagnostics=outcome.diagnostics() if outcome else None,
             )
             self._events.emit(name, "failure_capsule", turn_id=turn_id, path=str(path))
         except Exception as e:  # noqa: BLE001 — capsule failure is never fatal
@@ -1204,7 +1266,7 @@ class Engine:
             # future SDK rename into "no diagnostics" again, which is the bug.
             outcome.subtype = msg.subtype
             outcome.api_error_status = msg.api_error_status
-            outcome.errors = list(msg.errors) if msg.errors else None
+            outcome.errors = _as_error_list(msg.errors)
             outcome.terminal_reason = msg.terminal_reason
             outcome.stop_reason = msg.stop_reason
             if outcome.usage is None:  # cumulative fallback; see CONTEXT_WINDOW_TOKENS

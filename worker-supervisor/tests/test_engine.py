@@ -15,13 +15,19 @@ from typing import Any
 import pytest
 from claude_agent_sdk import (
     AssistantMessage,
+    CLIConnectionError,
     ProcessError,
     ResultMessage,
     SystemMessage,
     ToolUseBlock,
 )
 
-from worker_supervisor.engine import Engine, _discipline_append
+from worker_supervisor.engine import (
+    Engine,
+    TurnOutcome,
+    _discipline_append,
+    _is_dead_resume_chain,
+)
 from worker_supervisor.config import Limits
 from worker_supervisor.gate import QuestionBridge, WorkerPolicy
 from worker_supervisor.registry import TURN_TERMINAL
@@ -98,17 +104,34 @@ class Hang:
     """
 
 
+def init(**data: Any) -> SystemMessage:
+    return SystemMessage(subtype="init", data=data)
+
+
 def make_fake_query(script: list[Any], calls: list[Any]):
     async def fake_query(*, prompt, options, transport=None):
         idx = len(calls)
         calls.append(options)
         item = script[idx] if idx < len(script) else script[-1]
         if isinstance(item, Exception):
+            # A bare raise is the DIED-BEFORE-ANY-FRAME shape, and on the real CLI
+            # that is what a rejected resume looks like: measured on 2.1.220, a
+            # resume the CLI refuses produces zero frames and stderr "No
+            # conversation found with session ID: <id>". ECA-147 keys G7 on exactly
+            # that absence, so this distinction is now load-bearing — an Exception
+            # INSIDE the message list (yield-then-raise) is a different failure.
             raise item
         async for _ in prompt:  # consume the stream like the SDK does
             break
         if options.stderr is not None:
             options.stderr("mock cli stderr line")
+        # ECA-147: the real CLI opens EVERY turn — fresh or resumed — with
+        # SystemMessage(subtype="init"), probed on 2.1.220. A script that omits it
+        # describes a stream the SDK never produces, which is how G7 came to be
+        # tested only through a shape production never reaches. Scripts that supply
+        # their own init frame (the ECA-101 mcp_servers snapshot) keep it.
+        if not (item and isinstance(item[0], SystemMessage) and item[0].subtype == "init"):
+            item = [init()] + list(item)
         for msg in item:
             # An Exception INSIDE the message list means yield-then-raise, which is
             # the real ECA-143 shape: the CLI emits a result frame with
@@ -232,12 +255,12 @@ async def test_api_error_failure_keeps_the_clis_own_account_of_it(
     had plainly been observed.
     """
     boom = SDK_ERROR_EXIT()
-    engine, _ = make_engine([[r_api_error(), boom], [r_api_error(), boom]])
+    engine, calls = make_engine([[r_api_error(), boom], [r_api_error(), boom]])
     await engine.spawn("w1", str(repo))
     tid = await engine.prompt("w1", "spend-capped")
     turn = await terminal_turn(registry, tid)
-    # The bare-Exception clause, which is the one the live SDK reaches — the
-    # engine's own error string proves which clause ran.
+    # The bare-Exception path, which is the one the live SDK reaches for a failure
+    # AFTER the session started — the engine's own error string proves it.
     assert turn["error"].startswith("Exception: ")
 
     assert turn["state"] == "error"
@@ -253,14 +276,24 @@ async def test_api_error_failure_keeps_the_clis_own_account_of_it(
     assert diag["api_error_status"] == 429  # the field that makes the failure a diagnosis
     assert diag["subtype"] == "success" and diag["is_error"] is True
     assert diag["saw_result"] is True
+    assert diag["saw_init"] is True, "ECA-147: this failure came AFTER the session started"
+    assert diag["frames"] >= 2, f"the init and result frames were not counted: {diag}"
 
     # `workers events` is read before any capsule is opened, so the status has to
-    # be visible there too — on the retry AND on the terminal error.
+    # be visible there too.
     rows = events.read("w1")
-    for event in ("turn_retry", "turn_error"):
-        matching = [e for e in rows if e["event"] == event]
-        assert matching, f"no {event} event"
-        assert matching[-1]["api_error_status"] == 429, event
+    errored = [e for e in rows if e["event"] == "turn_error"]
+    assert errored and errored[-1]["api_error_status"] == 429
+
+    # ECA-147, AC#4: and it is NOT retried. This test used to assert a `turn_retry`
+    # carrying the 429 — the ladder really did rebuild the subprocess and re-spend
+    # the turn against a monthly spend cap, with no backoff, on every turn. A second
+    # attempt cannot raise a quota, so the retry is pure load; the suppression has to
+    # be RECORDED, because a missing turn_retry row is otherwise indistinguishable
+    # from a ladder that was never wired up.
+    assert not [e for e in rows if e["event"] == "turn_retry"], "a 429 must not be retried"
+    assert len(calls) == 1, "the CLI was invoked twice for a non-retryable failure"
+    assert "api_error_status=429" in errored[-1]["no_retry"]
 
 
 async def test_failure_with_no_result_frame_says_so_rather_than_inventing_a_status(
@@ -340,28 +373,29 @@ async def test_timeout_row_still_charges_the_epoch_for_what_the_turn_spent(
     assert (await engine.status())[0]["context_pct"] == 10
 
 
-async def test_resume_failed_row_keeps_the_turns_telemetry_too(
+async def test_resume_failed_capsule_says_the_session_never_started(
     make_engine, registry, repo, cfg, events
 ):
-    """ECA-143 review round: the resume_failed row dropped the same six.
+    """What a dead resume actually records — and why its old script was fiction.
 
-    Persisting session_id here is safe by construction: this branch rolls the epoch,
-    and `_pick_resume_target` only considers ids `WHERE epoch_id = <new epoch>`, so a
-    dead chain's id can never be resumed out of it.
+    This test used to script `[result_frame, ProcessError]`: a turn that observed a
+    429 result and THEN got a ProcessError, asserting the resume_failed row kept all
+    six telemetry fields (the ECA-143 spend-leak fix on this path). ECA-147 measured
+    the real thing and that shape does not exist. A rejected resume dies with ZERO
+    frames — so there is no result to keep, and `saw_result: false` /
+    `saw_init: false` is the honest content of the capsule. Nor was the docstring's
+    caveat right: `except ProcessError` was not unreachable, it was reachable ONLY
+    here (the SDK re-raises the raw transport error to a pending `initialize`), which
+    is why the branch appeared to work while the invariant it encodes did not hold
+    for the other two exception types.
 
-    Caveat recorded rather than papered over: on the pinned SDK this whole `except
-    ProcessError` branch is unreachable, because the SDK converts the CLI's exit into
-    a bare `Exception` (see SDK_ERROR_EXIT). Filed separately — G7's resume recovery
-    is dead code, which is a bigger problem than this task's. The branch is still
-    tested here: it is present, reachable by any caller that does raise ProcessError,
-    and must not be the one path that silently loses a turn's spend.
+    The six-field pass-through stays in the code as a defensive write (`finish_turn`
+    has no COALESCE), but it is no longer load-bearing and this test no longer claims
+    it is. What IS load-bearing: an operator opening this capsule can tell "the chain
+    was refused" from "the turn ran and then broke".
     """
     engine, _ = make_engine(
-        [
-            [r("s1")],
-            [r_api_error("s2", cost=0.07), ProcessError("resume rejected", exit_code=1)],
-            [r("s3")],
-        ]
+        [[r("s1")], ProcessError("Command failed with exit code 1", exit_code=1), [r("s3")]]
     )
     await engine.spawn("w1", str(repo))
     t1 = await engine.prompt("w1", "one")
@@ -370,44 +404,47 @@ async def test_resume_failed_row_keeps_the_turns_telemetry_too(
     turn2 = await terminal_turn(registry, t2)
 
     assert turn2["state"] == "error" and "resume failed" in turn2["error"]
-    assert turn2["session_id"] == "s2" and turn2["cost_usd"] == 0.07
-    assert turn2["result_text"] == "You've hit your monthly spend limit"
-    assert turn2["num_turns"] == 1 and turn2["is_error"] == 1
+    # The type and the exit code both survive into the row: on a rejected resume the
+    # CLI's own words are in stderr, and the exit code is all the exception carries.
+    assert "ProcessError" in turn2["error"] and "exit=1" in turn2["error"]
     capsule = json.loads(
         sorted(cfg.capsules_dir.glob(f"w1-turn{t2}-*.json"))[-1].read_text(encoding="utf-8")
     )
-    assert capsule["result_diagnostics"]["saw_result"] is True
-    assert capsule["result_diagnostics"]["api_error_status"] == 429
+    diag = capsule["result_diagnostics"]
+    assert diag["saw_init"] is False and diag["frames"] == 0
+    assert diag["saw_result"] is False and diag["api_error_status"] is None
     failed = [e for e in events.read("w1") if e["event"] == "resume_failed"]
-    assert failed and failed[-1]["api_error_status"] == 429
+    assert failed and failed[-1]["resume"] == "s1"
+    assert "api_error_status" not in failed[-1]  # absence is not a status (ECA-143)
 
 
 @pytest.mark.parametrize(
-    "event,script",
+    "event,script,status",
     [
-        # The clause the LIVE failure takes. The ProcessError sibling is covered by
-        # test_api_error_..., and both must carry the status.
-        ("turn_retry", [[r_api_error(), SDK_ERROR_EXIT()], [r("sOK")]]),
-        ("turn_timeout", [[r_api_error(), Hang()]]),
+        # The retry path, which ECA-147 narrowed: it is reached by a 5xx (an
+        # overloaded upstream can genuinely succeed on a second attempt) and NOT by
+        # the 4xx this test used to use — see test_api_error_failure_... for that.
+        ("turn_retry", [[r_api_error(status=503), SDK_ERROR_EXIT()], [r("sOK")]], 503),
+        ("turn_timeout", [[r_api_error(), Hang()]], 429),
         # is_error result, CLI exits 0: no exception anywhere, so the event is the
         # ONLY place an operator sees a reason at all.
-        ("turn_finished", [[r_api_error()]]),
+        ("turn_finished", [[r_api_error()]], 429),
     ],
 )
 async def test_every_failure_event_carries_the_api_status(
-    make_engine, registry, repo, events, event, script
+    make_engine, registry, repo, events, event, script, status
 ):
     """ECA-143 review round: five of the new event fields had no falsifying test,
     including the retry clause the live SDK actually reaches — so the suite proved
     the status reached a path production never takes."""
     engine, _ = make_engine(script)
     await engine.spawn("w1", str(repo), WorkerPolicy(limits={"wall_clock_s": 1}))
-    tid = await engine.prompt("w1", "429")
+    tid = await engine.prompt("w1", "api error")
     await terminal_turn(registry, tid, timeout=15.0)
 
     rows = [e for e in events.read("w1") if e["event"] == event]
     assert rows, f"no {event} event"
-    assert rows[-1]["api_error_status"] == 429
+    assert rows[-1]["api_error_status"] == status
 
 
 async def test_capsule_bounds_the_clis_error_list(make_engine, registry, repo, cfg):
@@ -491,13 +528,33 @@ async def test_turn_mcp_diagnostics_emitted_on_failure_ladder_too(
     assert diag[0]["granted"] == ["context7"]
 
 
+@pytest.mark.parametrize(
+    "boom",
+    [
+        # Every type the SDK can hand us for the SAME event — the CLI died before it
+        # announced the session. Which one arrives depends on where inside the SDK the
+        # exit was noticed, not on anything about the failure:
+        #   ProcessError       — the raw transport error, re-raised to the pending
+        #                        `initialize` control request. MEASURED as the shape a
+        #                        rejected resume produces (SDK 0.2.128 / CLI 2.1.220).
+        #   CLIConnectionError — the exit lost the race with initialize's stdin write
+        #                        ("Cannot write to process that exited with error").
+        #                        Read from subprocess_cli.py, not measured.
+        #   Exception          — the converted `{"type": "error"}` frame, which is what
+        #                        `receive_messages` raises. The ECA-143 shape.
+        # G7 used to be spelled `except ProcessError`, so two of these three silently
+        # skipped it. This parametrization is the regression guard: the branch must not
+        # be reachable-by-type again.
+        pytest.param(ProcessError("Command failed with exit code 1", exit_code=1), id="ProcessError"),
+        pytest.param(CLIConnectionError("Cannot write to process that exited"), id="CLIConnectionError"),
+        pytest.param(Exception("Command failed with exit code 1"), id="bare-Exception"),
+    ],
+)
 async def test_resume_failure_rolls_epoch_and_enqueues_restore(
-    make_engine, registry, repo, cfg
+    make_engine, registry, repo, cfg, boom
 ):
-    """G7: ProcessError on a resumed chain -> epoch ends, restore turn grounds the next."""
-    engine, calls = make_engine(
-        [[r("s1")], ProcessError("resume rejected", exit_code=1), [r("s3")]]
-    )
+    """G7: a dead resumed chain -> epoch ends, restore turn grounds the next."""
+    engine, calls = make_engine([[r("s1")], boom, [r("s3")]])
     await engine.spawn("w1", str(repo))
     t1 = await engine.prompt("w1", "one")
     await terminal_turn(registry, t1)
@@ -521,6 +578,144 @@ async def test_resume_failure_rolls_epoch_and_enqueues_restore(
     epoch = await registry.current_epoch("w1")
     assert epoch["seq"] == 2
     assert calls[2].resume is None  # fresh chain, grounded by the handover restore
+
+
+@pytest.mark.parametrize(
+    "resume_from,saw_init,dead",
+    [
+        ("s1", False, True),   # resuming, and the CLI never announced the session
+        ("s1", True, False),   # resuming, session was live: an ordinary turn failure
+        (None, False, False),  # no chain to lose
+        (None, True, False),
+    ],
+)
+def test_dead_resume_chain_predicate(resume_from, saw_init, dead):
+    """G7's trigger, pinned directly.
+
+    The engine-level tests below prove the WIRING, and they are the ones that matter —
+    but each of them reaches this decision through a full turn, so a mutation that
+    makes it fire everywhere sends the lane into a roll/restore loop and those tests
+    then HANG instead of failing (measured while falsifying this change). A predicate
+    test cannot hang, so it is what actually pins the truth table.
+    """
+    outcome = TurnOutcome(saw_init=saw_init)
+    assert _is_dead_resume_chain(resume_from, outcome) is dead
+
+
+async def test_a_resumed_turn_that_started_and_then_died_does_not_roll_the_epoch(
+    make_engine, registry, repo, events
+):
+    """The other half of ECA-147: G7 must stay NARROW.
+
+    The CLI accepted the chain (it announced the session, and here even produced a
+    result) and then the process exited non-zero. That is an ordinary turn failure —
+    the epoch is alive, keep-on-failure applies, and rolling it would throw away a
+    working session plus a restore turn's worth of context for nothing. This is the
+    case the live ECA-143 lane hit on every turn, so an over-broad fix would have
+    cycled that lane's epoch repeatedly instead of just failing the turn.
+    """
+    boom = SDK_ERROR_EXIT()
+    engine, _ = make_engine([[r("s1")], [r("s2"), boom], [r("s2"), boom]])
+    await engine.spawn("w1", str(repo))
+    t1 = await engine.prompt("w1", "one")
+    await terminal_turn(registry, t1)
+    t2 = await engine.prompt("w1", "two")
+    turn2 = await terminal_turn(registry, t2)
+
+    assert turn2["state"] == "error"
+    assert "resume failed" not in (turn2["error"] or "")
+    rows = events.read("w1")
+    assert not [e for e in rows if e["event"] == "resume_failed"]
+    epoch = await registry.current_epoch("w1")
+    assert epoch["seq"] == 1 and epoch["ended_at"] is None
+    assert not [t for t in await registry.history("w1", limit=10) if t["kind"] == "restore"]
+
+
+async def test_a_first_turn_dying_before_init_does_not_roll_the_epoch(
+    make_engine, registry, repo, events
+):
+    """No resume, no dead chain. G7 is about a chain we cannot prove is alive; a
+    fresh turn has no chain to lose, so a pre-init death there is just a failure —
+    otherwise a lane whose very first turn cannot start would roll epochs forever."""
+    engine, _ = make_engine([ProcessError("Command failed with exit code 1", exit_code=1)])
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "first turn ever")
+    turn = await terminal_turn(registry, tid)
+
+    assert turn["state"] == "error" and "resume failed" not in (turn["error"] or "")
+    assert not [e for e in events.read("w1") if e["event"] == "resume_failed"]
+    epoch = await registry.current_epoch("w1")
+    assert epoch["seq"] == 1
+
+
+async def test_a_dead_resume_rolls_the_epoch_at_most_once(
+    make_engine, registry, repo, events
+):
+    """Termination: the recovery cannot become a loop.
+
+    Every call after the first fails before init here, so the restore turn G7 enqueues
+    fails too. It must not roll again — and it cannot, because the fresh epoch holds no
+    session id, so its turns run with `resume_from is None` and take the ordinary
+    ladder. Asserted rather than argued: this is the property that makes it safe for
+    the dead-chain test to be broader than "the resume was specifically rejected".
+    """
+    engine, _ = make_engine(
+        [[r("s1")], ProcessError("Command failed with exit code 1", exit_code=1)]
+    )
+    await engine.spawn("w1", str(repo))
+    t1 = await engine.prompt("w1", "one")
+    await terminal_turn(registry, t1)
+    t2 = await engine.prompt("w1", "two")
+    await terminal_turn(registry, t2)
+
+    async def _restore_terminal():
+        rows = await registry.history("w1", limit=10)
+        done = [
+            t for t in rows if t["kind"] == "restore" and t["state"] in TURN_TERMINAL
+        ]
+        return done or None
+
+    restore = (await wait_until(_restore_terminal))[0]
+    assert restore["state"] == "error", "the restore turn was supposed to fail too"
+    assert len([e for e in events.read("w1") if e["event"] == "resume_failed"]) == 1
+    epoch = await registry.current_epoch("w1")
+    assert epoch["seq"] == 2, "the epoch rolled more than once"
+
+
+@pytest.mark.parametrize(
+    "status,attempts,retried",
+    [
+        (429, 1, False),  # monthly spend cap — the live ECA-143 failure
+        (401, 1, False),  # auth: a second attempt has the same credential
+        (503, 2, True),   # upstream overload: genuinely worth one more attempt
+        (None, 2, True),  # no status at all: unchanged behavior, retry once
+    ],
+)
+async def test_the_ladder_retries_only_what_a_retry_could_fix(
+    make_engine, registry, repo, events, status, attempts, retried
+):
+    """ECA-147 AC#4. The retry rebuilds the subprocess IMMEDIATELY — there is no
+    backoff — so the question is not "might this succeed later" but "can it succeed
+    right now". A status the API attributed to the caller cannot; a 5xx can."""
+    boom = SDK_ERROR_EXIT()
+    frame = r_api_error(status=status) if status is not None else r("s1")
+    script = [[frame, boom], [frame, boom]] if status is not None else [
+        [r("s1"), boom], [r("s1"), boom]
+    ]
+    engine, calls = make_engine(script)
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "classify me")
+    turn = await terminal_turn(registry, tid)
+
+    assert turn["state"] == "error"
+    assert len(calls) == attempts
+    rows = events.read("w1")
+    assert bool([e for e in rows if e["event"] == "turn_retry"]) is retried
+    errored = [e for e in rows if e["event"] == "turn_error"][-1]
+    if retried:
+        assert "no_retry" not in errored, "a retried failure must not claim it was suppressed"
+    else:
+        assert f"api_error_status={status}" in errored["no_retry"]
 
 
 async def test_epoch_budget_refuses_next_turn(make_engine, registry, repo):

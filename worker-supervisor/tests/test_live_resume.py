@@ -34,6 +34,7 @@ Opt-in because it needs a real `claude` binary on PATH:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import os
@@ -44,7 +45,7 @@ import pytest
 from worker_supervisor import engine as engine_module
 from worker_supervisor.engine import Engine, session_transcript_path
 from worker_supervisor.gate import QuestionBridge
-from worker_supervisor.registry import TURN_TERMINAL
+from worker_supervisor.registry import TURN_TERMINAL, _now as registry_now
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("WS_LIVE_RESUME") != "1",
@@ -98,11 +99,14 @@ async def _seed_finished_turn(registry, worker: str, session_id: str) -> None:
     terminal so the runner never claims it.
     """
     epoch = await registry.current_epoch(worker)
+    # registry._now()'s format, not SQLite's `datetime('now')` — nothing parses
+    # turns.created_at today, but a hand-written row that does not look like the ones
+    # the code writes is a trap for whoever adds the first reader.
+    now = registry_now()
     await registry.db.execute(
         "INSERT INTO turns (epoch_id, worker, kind, prompt, state, session_id,"
-        " created_at, finished_at) VALUES (?, ?, 'prompt', ?, 'done', ?,"
-        " datetime('now'), datetime('now'))",
-        (epoch["id"], worker, "seeded by test", session_id),
+        " created_at, finished_at) VALUES (?, ?, 'prompt', ?, 'done', ?, ?, ?)",
+        (epoch["id"], worker, "seeded by test", session_id, now, now),
     )
     await registry.db.commit()
 
@@ -140,6 +144,14 @@ async def test_a_resume_the_real_cli_refuses_rolls_the_epoch(
         turn_id = await engine.prompt("liveres1", "say ok")
         turn = await _drain(registry, turn_id)
 
+        # FIRST, before anything else can fail and take the blame: was the CLI actually
+        # asked to resume the seeded id? If _pick_resume_target ever returns None, this
+        # runs an ordinary fresh turn that SUCCEEDS — no G7, no restore, a real model
+        # call — and every assertion below would misreport that as a G7 defect.
+        assert turn["resume_from"] == session_id, (
+            "the CLI was never asked to resume the seeded id, so this test proved nothing"
+        )
+
         # G7's recovery: a fresh epoch, and a restore turn to ground it.
         deadline = asyncio.get_event_loop().time() + 30
         restore: list | None = None
@@ -152,9 +164,6 @@ async def test_a_resume_the_real_cli_refuses_rolls_the_epoch(
         epoch = await registry.current_epoch("liveres1")
         assert epoch["seq"] == 2
 
-        assert turn["resume_from"] == session_id, (
-            "the CLI was never asked to resume the seeded id, so this test proved nothing"
-        )
         assert turn["state"] == "error"
         assert "resume failed" in (turn["error"] or ""), (
             f"G7 did not fire on a resume the real CLI refused: {turn['error']!r}"
@@ -184,3 +193,7 @@ async def test_a_resume_the_real_cli_refuses_rolls_the_epoch(
     finally:
         await engine.stop()
         transcript.unlink(missing_ok=True)
+        # The parent is this repo's own cwd-slug directory under the operator's real
+        # ~/.claude/projects; remove it if this test is what created it.
+        with contextlib.suppress(OSError):
+            transcript.parent.rmdir()

@@ -319,7 +319,24 @@ def _status_field(outcome: TurnOutcome) -> dict[str, int]:
     return {"api_error_status": outcome.api_error_status}
 
 
-def _is_dead_resume_chain(resume_from: str | None, outcome: TurnOutcome) -> bool:
+def _refusal_in_stderr(stderr_tail: Iterable[str]) -> bool:
+    """Did the CLI itself say it would not take the session?
+
+    Measured wording on CLI 2.1.220 (both a missing transcript and a present-but-
+    rejected one): "No conversation found with session ID: <id>", on stderr, with no
+    message frame emitted. Matched loosely because the exact phrasing is the CLI's to
+    change — and because this is one of TWO independent signals, not the only one, so
+    a wording change degrades to the other rather than to silence.
+    """
+    return any("no conversation found" in line.lower() for line in stderr_tail)
+
+
+def _is_dead_resume_chain(
+    resume_from: str | None,
+    outcome: TurnOutcome,
+    exc: BaseException,
+    stderr_tail: Iterable[str],
+) -> bool:
     """G7's question, asked of the EVIDENCE instead of the exception type (ECA-147).
 
     G7 says a dead resume chain is never silently continued fresh: end the epoch and
@@ -340,39 +357,72 @@ def _is_dead_resume_chain(resume_from: str | None, outcome: TurnOutcome) -> bool
         raises `CLIConnectionError` instead (subprocess_cli.py: "Cannot write to
         process that exited with error"). Read from source, not measured.
 
-    Three types, one meaning. So key on what was OBSERVED: the CLI announces a live
-    session with `SystemMessage(subtype="init")` — first frame of a fresh turn and of
-    a valid resume alike — and a rejected resume produces no frame at all. No init on
-    a resumed turn means the CLI never accepted the chain.
+    Three types, one meaning. So the first half of the test is what was OBSERVED: the
+    CLI announces a live session with `SystemMessage(subtype="init")` — first frame of
+    a fresh turn and of a valid resume alike, probed both ways — so a resumed turn with
+    no init frame never got as far as a live session.
 
-    Deliberately broader than "the resume was rejected": ANY pre-init death on a
-    resumed turn rolls the epoch. That errs toward G7's own invariant (never continue
-    a chain we cannot prove is alive) and it terminates — the restore turn runs in a
-    fresh epoch with `resume_from is None`, so a repeat failure cannot roll again.
+    The second half is corroboration, and it is NOT optional. "No init frame" alone is
+    absence, and plenty of pre-init deaths say nothing about the chain: a missing CLI
+    binary or a vanished cwd (`CLINotFoundError` / `CLIConnectionError` out of
+    `connect()`, before a read task even exists), a 60s `initialize` control-request
+    timeout while MCP servers start, or a crash inside `_prompt_as_stream`'s startup
+    grace. Rolling is DESTRUCTIVE — it ends a live epoch, and the restore turn
+    re-grounds from the newest handover file, which can be an epoch old — so treating
+    those as dead chains would trade a failed turn (recoverable, and the operator sees
+    it under keep-on-failure) for a silently discarded session. Review round found
+    this; the first version of this predicate had exactly that hole.
+
+    So we require that the CLI ran and refused, evidenced EITHER way:
+      * it exited non-zero (`ProcessError`, which only the transport raises, i.e. the
+        process started and terminated with a code — the measured refusal shape), or
+      * it said so on stderr (`_refusal_in_stderr`).
+    Two independent signals for one fact, deliberately: the SDK could stop delivering
+    the raw `ProcessError` (that plumbing is an implementation detail and the whole
+    reason this function exists), and the CLI could reword its message. Either alone
+    still fires. If both ever change at once the capsule now records `saw_init` and
+    `frames`, which is the evidence needed to notice.
+
+    Still one thing this does NOT bound: a SYSTEMIC refusal (every resume rejected —
+    a read-only `~/.claude/projects`, or `session_transcript_path`'s sanitization
+    drifting from what the CLI reads) makes each recovery's own continuation fail the
+    same way. `_resume_recovery_would_repeat` is the circuit breaker for that.
     """
-    return resume_from is not None and not outcome.saw_init
+    if resume_from is None or outcome.saw_init:
+        return False
+    return isinstance(exc, ProcessError) or _refusal_in_stderr(stderr_tail)
 
 
 def _no_retry_reason(outcome: TurnOutcome) -> str | None:
     """Why this failure must not be retried, or None to run the normal ladder (ECA-147).
 
-    The retry ladder has no backoff — it rebuilds the subprocess immediately — so
-    retrying an error the API attributed to the CALLER cannot change the answer. The
-    motivating case: a monthly spend cap (HTTP 429) on mbpm2 was retried on every
+    The motivating case: a monthly spend cap (HTTP 429) on mbpm2 was retried on every
     turn, doubling the load and writing a `turn_retry` event that implied the failure
     might be transient. `api_error_status` (captured by ECA-143) is the CLI's own
     classification, and the SDK documents it as content-free metadata.
 
-    4xx is terminal: quota, auth, and malformed-request errors are all facts about
-    this turn. 5xx keeps the retry — an overloaded upstream genuinely can succeed on
-    a second attempt, and that is the existing behavior, so it stays.
+    The reason 4xx is terminal here is NOT that a 429 is inherently unretryable — it
+    usually is retryable, and treating it as a spend cap would be reading one incident
+    as a rule. It is that **the CLI has already run its own exponential backoff before
+    it reports a status at all**: the review round measured ten `system/api_retry`
+    frames over ~190s ahead of the `is_error` result. By the time this function sees a
+    status, the retryable interpretation has been tried and lost. This ladder rebuilds
+    the subprocess immediately, with no backoff of its own, so it can only re-ask a
+    question the CLI just spent three minutes on.
+
+    5xx still retries: that is the pre-existing behavior, an overloaded upstream is the
+    case where a fresh process plausibly lands differently, and narrowing it further is
+    not this task's business. Below 400 is not an error class at all — a status the CLI
+    should never pair with `is_error` — so it takes the ordinary ladder rather than
+    being silently treated as terminal.
     """
     status = outcome.api_error_status
     if status is None or not 400 <= status < 500:
         return None
     return (
-        f"api_error_status={status} is client-side (quota/auth/request), "
-        "and the retry has no backoff — a second attempt cannot change it"
+        f"api_error_status={status} is client-side (quota/auth/request), and the CLI "
+        "already exhausted its own backoff before reporting it — an immediate, "
+        "backoff-free second attempt cannot change it"
     )
 
 
@@ -842,7 +892,28 @@ class Engine:
                 reason = f"{type(e).__name__}: {e}"
                 if exit_code is not None:
                     reason += f" (exit={exit_code})"
-                if _is_dead_resume_chain(resume_from, outcome):
+                dead_chain = _is_dead_resume_chain(resume_from, outcome, e, stderr_tail)
+                if dead_chain and await self._resume_recovery_would_repeat(name):
+                    # The breaker tripped: G7 already recovered this epoch and the
+                    # recovery's own work is failing the same way. Fail the turn instead
+                    # (keep-on-failure) so it stops loudly rather than burning restore
+                    # turns. Distinct event: this is not an ordinary error, it is G7
+                    # declining to try the same cure twice.
+                    self._events.emit(
+                        name, "resume_recovery_exhausted", turn_id=turn_id,
+                        resume=resume_from, **_status_field(outcome),
+                    )
+                    await self._fail_turn(
+                        name, turn_id, outcome,
+                        f"resume failed again inside a resume_failed recovery"
+                        f" (not rolling the epoch a second time): {reason}",
+                        options_snapshot, stderr_tail, resume_from, policy,
+                        no_retry="the previous epoch already ended in resume_failed and"
+                        " nothing has resumed successfully since — an operator has to"
+                        " look at the session store",
+                    )
+                    return
+                if dead_chain:
                     # G7: the chain is dead. Never silently fresh — end the epoch,
                     # open the next one grounded on the handover file.
                     # ECA-143 review round: same six as the timeout path. Persisting
@@ -894,7 +965,13 @@ class Engine:
                     continue
                 await self._fail_turn(
                     name, turn_id, outcome, reason, options_snapshot,
-                    stderr_tail, resume_from, policy, no_retry=no_retry,
+                    stderr_tail, resume_from, policy,
+                    # Only when the retry was actually SKIPPED. Review round: computed
+                    # from attempt 2's outcome this claimed a suppression that had not
+                    # happened — a turn that retried on a statusless failure and then
+                    # came back 429 carried both a turn_retry row and a "not retried"
+                    # reason, which is a lie in exactly the case the field exists for.
+                    no_retry=no_retry if attempt == 1 else None,
                 )
                 return
 
@@ -1021,6 +1098,34 @@ class Engine:
         self._events.emit(
             name, "session_transcript_missing", turn_id=turn_id, session_id=session_id
         )
+
+    async def _resume_recovery_would_repeat(self, name: str) -> bool:
+        """Is this a second dead chain inside a recovery that has not worked? (ECA-147)
+
+        G7's cure for a dead chain is: roll the epoch, restore from the handover file,
+        and (ECA-84) auto-enqueue one continuation. That continuation resumes the RESTORE
+        turn's own session — so if resuming is systemically broken (a read-only
+        `~/.claude/projects`, a `session_transcript_path` that no longer matches what the
+        CLI reads), it is refused too, and G7 rolls again. Each roll costs a real restore
+        turn, and each new epoch gets a fresh `max_budget_usd_per_epoch`, so the epoch
+        budget cannot bound it. Review round measured the unmutated loop: 40 rolls, 82
+        CLI invocations, no natural end.
+
+        The breaker: if this epoch was opened BY a resume_failed roll and nothing in it
+        has resumed a session successfully, the cure has already been tried and failed.
+        A `done` restore turn does not count as success — it runs with no `resume_from`
+        at all, so it proves the CLI works, not that this lane can resume.
+
+        Deliberately not a counter on the worker: the condition resets itself the moment
+        a resumed turn finishes cleanly, so a genuine dead chain months later still gets
+        its recovery.
+        """
+        if await self._reg.previous_epoch_end_reason(name) != "resume_failed":
+            return False
+        epoch = await self._reg.current_epoch(name)
+        if epoch is None:
+            return False
+        return not await self._reg.has_successful_resume(epoch["id"])
 
     async def _fail_turn(
         self,
@@ -1338,8 +1443,11 @@ class Engine:
         return [dict(r) for r in await cur.fetchall()]
 
     def _observe(self, name: str, turn_id: int, msg: Any, outcome: TurnOutcome) -> None:
-        # ECA-147: counted for EVERY frame, before any type dispatch — "the CLI sent
-        # us something" has to hold for message types this method does not model.
+        # ECA-147: counted before any type dispatch, so types this method does not model
+        # still register as "the CLI sent us something" — `RateLimitEvent` and
+        # `system/api_retry` both arrive here and are otherwise invisible. Bounded by
+        # what the SDK's parser accepts (a frame it drops never reaches us), so this is a
+        # diagnostic count of delivered messages, not of bytes on the wire.
         outcome.frames += 1
         if isinstance(msg, ResultMessage):
             outcome.saw_result = True

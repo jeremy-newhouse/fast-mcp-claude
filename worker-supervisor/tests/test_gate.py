@@ -8,7 +8,12 @@ import json
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
-from worker_supervisor.gate import QuestionBridge, WorkerPolicy, make_gate
+from worker_supervisor.gate import (
+    QuestionBridge,
+    WorkerPolicy,
+    make_gate,
+    make_policy_hook,
+)
 
 
 def _gate(repo, policy, bridge, events, timeout=1.0, turn_id=1):
@@ -20,6 +25,13 @@ def _gate(repo, policy, bridge, events, timeout=1.0, turn_id=1):
         events=events,
         turn_id=turn_id,
         question_timeout_s=timeout,
+    )
+
+
+def _policy_hook(repo, policy, events, turn_id=1):
+    """The PreToolUse hook — the total policy point since ECA-142."""
+    return make_policy_hook(
+        worker="w1", repo_root=repo, policy=policy, events=events, turn_id=turn_id
     )
 
 
@@ -61,6 +73,7 @@ async def test_cwd_pin_catches_symlink_escape(registry, events, repo, tmp_path):
 
 
 async def test_guard_hook_deny_is_honored(registry, events, repo):
+    """Guard hooks run in the PreToolUse hook since ECA-142 — see `_policy_hook`."""
     hooks_dir = repo / ".claude" / "hooks"
     hooks_dir.mkdir(parents=True)
     guard = hooks_dir / "no-writes.sh"
@@ -69,12 +82,72 @@ async def test_guard_hook_deny_is_honored(registry, events, repo):
         'echo \'{"hookSpecificOutput": {"permissionDecision": "deny",'
         ' "message": "writes are frozen"}}\'\n'
     )
-    bridge = QuestionBridge(registry, events)
     policy = WorkerPolicy(allowed_tools=["Write"], guard_hooks={"Write": "no-writes.sh"})
-    gate = _gate(repo, policy, bridge, events)
-    res = await gate("Write", {"file_path": str(repo / "f.txt")}, None)
-    assert isinstance(res, PermissionResultDeny)
-    assert "writes are frozen" in res.message
+    res = await _policy_hook(repo, policy, events)(
+        {"tool_name": "Write", "tool_input": {"file_path": str(repo / "f.txt")}}, None, None
+    )
+    spec = res["hookSpecificOutput"]
+    assert spec["permissionDecision"] == "deny"
+    assert "writes are frozen" in spec["permissionDecisionReason"]
+
+
+async def test_pretooluse_hook_enforces_the_ceiling_the_cli_would_auto_approve(
+    registry, events, repo
+):
+    """ECA-142's core: the ceiling must bind a call that never reaches can_use_tool.
+
+    `ls` is exactly the shape the CLI auto-approves on its own (read-only, inside the
+    session cwd) — measured on CLI 2.1.220, it executes with `can_use_tool` never
+    invoked. So the ceiling can only bind it from the PreToolUse hook. A lane granted
+    `Bash(echo*)` asking for `ls` must be denied HERE, or the grant means nothing.
+    """
+    policy = WorkerPolicy(allowed_tools=["Bash(echo*)"])
+    hook = _policy_hook(repo, policy, events)
+
+    denied = await hook({"tool_name": "Bash", "tool_input": {"command": "ls -a"}}, None, None)
+    spec = denied["hookSpecificOutput"]
+    assert spec["permissionDecision"] == "deny"
+    assert "outside this worker's ceiling" in spec["permissionDecisionReason"]
+    assert any(e["event"] == "tool_denied" for e in events.read("w1"))
+
+    # The granted command is NOT decided by the hook: returning `allow` here would skip
+    # can_use_tool for everything, which is the same bug from the other side. Silence
+    # leaves the CLI's own auto-approval intact.
+    allowed = await hook({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, None, None)
+    assert allowed == {}, "the hook must express no opinion on a permitted call"
+
+
+async def test_pretooluse_hook_pins_cwd_and_ignores_ask_user_question(registry, events, repo, tmp_path):
+    """The cwd pin binds through the hook too; AskUserQuestion stays the bridge's."""
+    policy = WorkerPolicy(allowed_tools=["Read", "AskUserQuestion"])
+    hook = _policy_hook(repo, policy, events)
+
+    outside = await hook(
+        {"tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "outside.txt")}},
+        None,
+        None,
+    )
+    assert "escapes" in outside["hookSpecificOutput"]["permissionDecisionReason"]
+
+    # make_question_hook owns this tool; a second opinion here would race its park.
+    question = await hook(
+        {"tool_name": "AskUserQuestion", "tool_input": {"questions": []}}, None, None
+    )
+    assert question == {}
+
+
+async def test_pretooluse_hook_survives_a_non_dict_guard_hooks(registry, events, repo):
+    """A malformed `guard_hooks` must not raise out of the hook (ECA-141's wedge class).
+
+    ECA-141 fixes the coercion at the construction site; until then the hook must not
+    become a NEW way to wedge a lane, since an exception out of a PreToolUse hook kills
+    the same runner loop that an exception out of can_use_tool does.
+    """
+    policy = WorkerPolicy(allowed_tools=["Bash"], guard_hooks=[])  # type: ignore[arg-type]
+    res = await _policy_hook(repo, policy, events)(
+        {"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, None, None
+    )
+    assert res == {}
 
 
 async def test_question_bridge_round_trip(registry, events, repo):

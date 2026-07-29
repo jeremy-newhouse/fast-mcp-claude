@@ -34,7 +34,13 @@ from .capsule import write_capsule
 from .config import Config, Limits
 from .envbuild import build_worker_env, snapshot_boot_env
 from .events import EventLog
-from .gate import QuestionBridge, WorkerPolicy, make_gate, make_question_hook
+from .gate import (
+    QuestionBridge,
+    WorkerPolicy,
+    make_gate,
+    make_policy_hook,
+    make_question_hook,
+)
 from .names import DAEMON_KEY, require_safe_worker_name
 from .registry import Registry, WORKER_GONE
 
@@ -526,9 +532,14 @@ class Engine:
                 resume=resume_from,
                 setting_sources=["project"],
                 tools=policy.base_tools(),
-                # ADR-0005 shape: NOTHING is pre-approved, so every privileged
-                # call routes through the gate. Pre-approving AskUserQuestion
-                # would bypass can_use_tool and the tool errors headless.
+                # NOTHING is pre-approved here. That is necessary but NOT sufficient
+                # for "every privileged call routes through the gate", which is what
+                # this comment used to claim and which was false (ECA-142): the CLI
+                # auto-approves read-only Bash inside the cwd on its own, and those
+                # calls never reach can_use_tool. The total enforcement point is the
+                # PreToolUse policy hook registered below; see gate.make_policy_hook.
+                # Pre-approving AskUserQuestion would additionally bypass can_use_tool
+                # and the tool errors headless.
                 allowed_tools=[],
                 max_turns=limits.max_turns,
                 max_budget_usd=max(budget_floor, round(remaining_budget, 4)),
@@ -576,7 +587,25 @@ class Engine:
                                 )
                             ],
                             timeout=self._cfg.question_timeout_s + 120,
-                        )
+                        ),
+                        # ECA-142: the TOTAL policy point. `matcher=None` fires for
+                        # every tool call, including the ones the CLI auto-approves
+                        # and therefore never routes through can_use_tool. Registered
+                        # as its own matcher rather than folded into the one above:
+                        # matchers on an event dispatch CONCURRENTLY, so the question
+                        # bridge's long park must not gate policy for other tools.
+                        HookMatcher(
+                            matcher=None,
+                            hooks=[
+                                make_policy_hook(
+                                    worker=name,
+                                    repo_root=Path(worker["repo"]),
+                                    policy=policy,
+                                    events=self._events,
+                                    turn_id=turn_id,
+                                )
+                            ],
+                        ),
                     ]
                 },
                 stderr=stderr_tail.append,

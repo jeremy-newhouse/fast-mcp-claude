@@ -445,6 +445,122 @@ def _path_escapes(repo_root: Path, tool_input: dict[str, Any]) -> str | None:
     return None
 
 
+def _ceiling_or_cwd_denial(
+    repo_root: Path, policy: WorkerPolicy, tool_name: str, tool_input: dict[str, Any]
+) -> str | None:
+    """The two PURE policy checks, shared by the PreToolUse hook and can_use_tool.
+
+    Returns a denial reason, or None if the call passes both. Both callers evaluate
+    these because they are side-effect-free and idempotent — see `make_policy_hook`
+    for why the hook is the one that has to run, and `make_gate` for why the gate
+    keeps them anyway.
+    """
+    if not policy.ceiling_allows(tool_name, tool_input):
+        return f"tool {tool_name!r} is outside this worker's ceiling"
+    offending = _path_escapes(repo_root, tool_input)
+    if offending is not None:
+        return f"path {offending!r} escapes the worker root {str(repo_root)!r}"
+    return None
+
+
+def make_policy_hook(
+    *,
+    worker: str,
+    repo_root: Path,
+    policy: WorkerPolicy,
+    events: EventLog,
+    turn_id: int,
+):
+    """PreToolUse policy enforcement for EVERY tool call (ECA-142).
+
+    Why this exists at all. `can_use_tool` is not the total gate the ADR-0005 shape
+    assumed: the pinned SDK says so in its own contract (types.py:1929-1945, 0.2.128)
+    — it is "invoked when the CLI's permission rules evaluate to 'ask'", and never for
+    a call the CLI has already decided. The CLI decides some itself: measured on
+    2.1.220, a read-only Bash command scoped INSIDE the session cwd (`ls -a`,
+    `cat MARKER.txt`, `echo hi`) executes without the callback ever being invoked. That
+    is not configuration and cannot be switched off from here — it is unchanged by
+    `permission_mode='manual'`, by `setting_sources=[]`, and by running with an
+    isolated `CLAUDE_CONFIG_DIR` holding no user settings at all. So for that subset
+    the per-worker tool ceiling and any guard hook were simply not enforced.
+
+    Hooks fire for every tool use, which is the SDK's own documented remedy ("to
+    observe or gate *every* tool call regardless of permission rules, use a PreToolUse
+    hook"). This hook therefore carries the policy that must be total.
+
+    It returns NO decision when the call passes. That matters twice: an `allow`
+    decision would skip `can_use_tool` for everything (the same bug from the other
+    side), and staying silent leaves the CLI's own auto-approval intact, so the
+    subset above keeps executing without a prompt exactly as before — only now the
+    ceiling and the guard hooks apply to it.
+
+    AskUserQuestion is skipped here: `make_question_hook` owns that tool, and the
+    ceiling never governs it (it is in every worker's base set by construction).
+    """
+
+    async def on_pre_tool_use(hook_input: Any, tool_use_id: str | None, context: Any):
+        data = hook_input or {}
+        tool_name = data.get("tool_name") or ""
+        tool_input = data.get("tool_input") or {}
+        if tool_name == "AskUserQuestion":
+            return {}
+
+        reason = _ceiling_or_cwd_denial(repo_root, policy, tool_name, tool_input)
+        if reason is None:
+            # Guard hooks live HERE and only here, so they run exactly once per call
+            # and — unlike before — for the CLI-auto-approved subset too.
+            script = policy.guard_hooks.get(tool_name) if _is_mapping(policy.guard_hooks) else None
+            if script:
+                decision, guard_reason = await _run_guard_hook(
+                    repo_root, script, tool_name, tool_input
+                )
+                if decision == "refused":
+                    # A separate branch from the one below, because that message says
+                    # "Denied by repo guard hook" and that would be FALSE here: nothing
+                    # ran. The refusal cannot itself traverse — `script` reaches this
+                    # path only as message and record BODY, never as a path, and the
+                    # event is keyed on `worker`, which ECA-137 validates in EventLog.
+                    events.emit(
+                        worker, "tool_denied", turn_id=turn_id, tool=tool_name,
+                        reason=f"guard:refused:{guard_reason}", layer="pretooluse",
+                    )
+                    return _hook_deny(f"Denied by worker policy: {guard_reason}")
+                if decision in ("deny", "ask", "error"):
+                    events.emit(
+                        worker, "tool_denied", turn_id=turn_id, tool=tool_name,
+                        reason=f"guard:{decision}:{guard_reason}", layer="pretooluse",
+                    )
+                    return _hook_deny(
+                        f"Denied by repo guard hook ({decision}): {guard_reason or script}"
+                    )
+            return {}
+
+        events.emit(
+            worker, "tool_denied", turn_id=turn_id, tool=tool_name,
+            reason=reason, layer="pretooluse",
+        )
+        return _hook_deny(f"Denied by worker policy: {reason}")
+
+    return on_pre_tool_use
+
+
+def _hook_deny(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def _is_mapping(value: Any) -> bool:
+    """`guard_hooks` reaches here uncoerced from control-socket JSON (ECA-141 tracks
+    the real fix at the construction site). Until then, a non-dict must not raise out
+    of a hook or a gate — that wedges the lane for as long as the row exists."""
+    return hasattr(value, "get")
+
+
 def make_gate(
     *,
     worker: str,
@@ -455,7 +571,16 @@ def make_gate(
     turn_id: int,
     question_timeout_s: float,
 ) -> Callable[[str, dict[str, Any], Any], Awaitable[Any]]:
-    """Build the can_use_tool callback for ONE turn of ONE worker."""
+    """Build the can_use_tool callback for ONE turn of ONE worker.
+
+    This is NOT the total gate — see `make_policy_hook`, which is, and which runs
+    first for every call. What remains here is the AskUserQuestion escalation channel
+    plus a second, idempotent evaluation of the two pure checks: if the hook ever
+    stops firing, the calls that DO reach a permission prompt still meet the ceiling
+    and the cwd pin. Guard hooks deliberately do not run here any more — they have
+    side effects, so they must run exactly once, and the hook is the path that sees
+    every call.
+    """
 
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context: Any):
         # 1. Escalation channel: park, wait, deny-with-answer (the eck-dev bridge,
@@ -470,45 +595,19 @@ def make_gate(
                 )
             return PermissionResultDeny(message=f"The user responded: {answer}")
 
-        # 2. Tool ceiling (the base set already restricts existence; this enforces
-        #    grant matchers like Bash(uv run*) on top).
-        if not policy.ceiling_allows(tool_name, tool_input):
-            reason = f"tool {tool_name!r} is outside this worker's ceiling"
-            events.emit(worker, "tool_denied", turn_id=turn_id, tool=tool_name, reason=reason)
+        # 2/3. Tool ceiling + cwd pin, re-evaluated (the base set already restricts
+        #      existence; the ceiling enforces grant matchers like Bash(uv run*) on
+        #      top). The PreToolUse hook has already applied both to this call; both
+        #      checks are pure, so running them again costs nothing and keeps the
+        #      prompt path safe on its own. Guard hooks are NOT re-run here — see the
+        #      docstring.
+        reason = _ceiling_or_cwd_denial(repo_root, policy, tool_name, tool_input)
+        if reason is not None:
+            events.emit(
+                worker, "tool_denied", turn_id=turn_id, tool=tool_name,
+                reason=reason, layer="can_use_tool",
+            )
             return PermissionResultDeny(message=f"Denied by worker policy: {reason}")
-
-        # 3. cwd pin: path-carrying inputs must stay under the worker's repo root.
-        offending = _path_escapes(repo_root, tool_input)
-        if offending is not None:
-            reason = f"path {offending!r} escapes the worker root {str(repo_root)!r}"
-            events.emit(worker, "tool_denied", turn_id=turn_id, tool=tool_name, reason=reason)
-            return PermissionResultDeny(message=f"Denied by worker policy: {reason}")
-
-        # 4. Optional repo guard hooks (eck-dev hook-contract runner). 'ask' has no
-        #    human to ask here — MVP treats it as deny with reason (escalation of
-        #    denied calls is deferred by design).
-        script = policy.guard_hooks.get(tool_name)
-        if script:
-            decision, reason = await _run_guard_hook(repo_root, script, tool_name, tool_input)
-            if decision == "refused":
-                # A separate branch, not folded into the one below, because the message
-                # there says "Denied by repo guard hook" and that would be FALSE here:
-                # nothing ran. The refusal cannot itself traverse — `script` reaches this
-                # path only as message and record BODY, never as a path, and the event is
-                # keyed on `worker`, which ECA-137 already validates inside EventLog.path.
-                events.emit(
-                    worker, "tool_denied", turn_id=turn_id, tool=tool_name,
-                    reason=f"guard:refused:{reason}",
-                )
-                return PermissionResultDeny(message=f"Denied by worker policy: {reason}")
-            if decision in ("deny", "ask", "error"):
-                events.emit(
-                    worker, "tool_denied", turn_id=turn_id, tool=tool_name,
-                    reason=f"guard:{decision}:{reason}",
-                )
-                return PermissionResultDeny(
-                    message=f"Denied by repo guard hook ({decision}): {reason or script}"
-                )
 
         return PermissionResultAllow()
 

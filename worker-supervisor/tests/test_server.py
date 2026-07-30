@@ -17,12 +17,14 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
 from worker_supervisor.config import Config, Limits
 from worker_supervisor.engine import Engine
 from worker_supervisor.gate import (
     QuestionBridge,
     WorkerPolicy,
+    make_gate,
     redact_policy,
     redact_worker_row,
 )
@@ -215,8 +217,8 @@ async def test_spawn_still_stores_the_real_credentials(control, registry, repo):
 @pytest.mark.parametrize(
     "field,malformed,safe_default",
     [
-        ("allowed_tools", "Bash", None),  # None -> DEFAULT_ALLOWED_TOOLS, checked below
-        ("allowed_tools", [1, 2, 3], None),
+        ("allowed_tools", "Bash", []),  # a malformed ceiling must not silently widen
+        ("allowed_tools", [1, 2, 3], []),
         ("allow_env", 42, []),
         ("allow_env", "PATH", []),
         ("guard_hooks", [], {}),
@@ -229,21 +231,36 @@ async def test_spawn_still_stores_the_real_credentials(control, registry, repo):
 async def test_spawn_coerces_a_malformed_pass_through_field(
     control, registry, repo, field, malformed, safe_default
 ):
-    """ECA-141: a control-socket spawn with a wrong-shaped pass-through field must
-    not raise, and must fall back to the same default a MISSING field already gets
-    — not merely avoid an exception while persisting the bad shape for the next
-    turn to trip over. Reads the RAW stored row rather than the dispatch response,
-    since the response redacts `mcp_servers` to a name list unconditionally (ECA-133)
-    — a transform unrelated to this coercion.
-    """
-    from worker_supervisor.gate import DEFAULT_ALLOWED_TOOLS
+    """ECA-141 AC#1/#2: a control-socket spawn with a wrong-shaped pass-through
+    field must not raise, and must fall back to a safe default — not merely avoid
+    an exception while persisting the bad shape for the next turn to trip over.
+    Reads the RAW stored row rather than the dispatch response, since the response
+    redacts `mcp_servers` to a name list unconditionally (ECA-133) — a transform
+    unrelated to this coercion.
 
+    AC#3's literal wording ("the gate returns a decision") is closed below: the
+    coerced row is reloaded exactly as a turn would (`WorkerPolicy.from_json`) and
+    driven through the real `can_use_tool` gate, asserting a normal permission
+    decision comes back rather than an exception.
+    """
     name = f"probe-{field}"
     await control._dispatch("spawn", {"name": name, "repo": str(repo), field: malformed})
     row = await registry.get_worker(name)
     stored = json.loads(row["policy"])
-    expected = list(DEFAULT_ALLOWED_TOOLS) if safe_default is None else safe_default
-    assert stored[field] == expected
+    assert stored[field] == safe_default
+
+    policy = WorkerPolicy.from_json(row["policy"])
+    gate = make_gate(
+        worker=name,
+        repo_root=repo,
+        policy=policy,
+        bridge=QuestionBridge(registry, control._events),
+        events=control._events,
+        turn_id=1,
+        question_timeout_s=1.0,
+    )
+    decision = await gate("Bash", {"command": "echo hi"}, None)
+    assert isinstance(decision, (PermissionResultAllow, PermissionResultDeny))
 
 
 @pytest.mark.parametrize(

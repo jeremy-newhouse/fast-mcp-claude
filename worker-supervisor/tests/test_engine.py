@@ -2320,7 +2320,7 @@ async def test_the_transcript_watchdog_is_named(make_engine, registry, repo, mon
     assert names == [f"transcript-watchdog-w1-turn{tid}"], names
 
 
-# --- ECA-141: the other pass-through fields, wedge class closed at reload -------
+# --- ECA-141: the other pass-through fields' container types, closed at reload --
 
 
 async def test_a_persisted_row_with_every_pass_through_field_malformed_still_completes(
@@ -2360,3 +2360,41 @@ async def test_a_persisted_row_with_every_pass_through_field_malformed_still_com
 
     assert turn["state"] == "done", turn
     assert len(calls) == 1, "the malformed row must not have killed the runner loop pre-turn"
+
+
+async def test_a_persisted_row_with_a_non_numeric_budget_still_completes(
+    make_engine, registry, repo
+):
+    """Review finding on the fix above: `WorkerPolicy.coerced()` only checks that
+    `limits` itself is a dict, not what is inside it. `Limits.override` did
+    `float(spec["max_budget_usd_per_epoch"])` unguarded, called from
+    `Engine._run_turn` before the attempt-loop's own try/except exists — the same
+    pre-try wedge class as the container-type bugs above, one layer further in.
+    """
+    await registry.spawn_worker(
+        "w1", str(repo), {"limits": {"max_budget_usd_per_epoch": "free"}}
+    )
+    engine, calls = make_engine([[r("s1")]])
+    engine._ensure_runner("w1")
+    turn = await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert turn["state"] == "done", turn
+    assert len(calls) == 1
+
+
+async def test_a_persisted_row_that_is_not_a_json_object_still_completes(
+    make_engine, registry, repo
+):
+    """Review finding on the fix above: `from_json`'s `data.get(...)` calls assumed
+    the parsed JSON was an object. `registry.spawn_worker` persists whatever it is
+    given as JSON — it does not itself enforce the dict type hint — so a row can
+    legitimately hold valid-JSON-non-object, exactly what a caller that skips
+    `WorkerPolicy.coerced()` entirely (or a hand-repaired row) could produce.
+    """
+    await registry.spawn_worker("w1", str(repo), ["not", "a", "policy"])  # type: ignore[arg-type]
+    engine, calls = make_engine([[r("s1")]])
+    engine._ensure_runner("w1")
+    turn = await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert turn["state"] == "done", turn
+    assert len(calls) == 1

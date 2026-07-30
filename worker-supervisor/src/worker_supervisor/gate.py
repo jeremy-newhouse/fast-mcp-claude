@@ -428,8 +428,9 @@ class WorkerPolicy:
     # tool -> a script name inside the repo's `.claude/hooks/`. The VALUE is a plain
     # filename component, not a path: it is joined under that directory and executed, so
     # anything else is refused at derivation (ECA-140 — see `_run_guard_hook`). Typed
-    # `dict[str, str]` because that is the contract; the runtime does not enforce it,
-    # since control-socket JSON reaches this field uncoerced.
+    # `dict[str, str]` because that is the contract; `WorkerPolicy.coerced()` (ECA-141)
+    # enforces the container is a dict at both untrusted-JSON entry points, but does not
+    # check each VALUE is a str — that is still `_run_guard_hook`'s job, unconditionally.
     guard_hooks: dict[str, str] = field(default_factory=dict)
     model: str | None = None
     limits: dict[str, Any] = field(default_factory=dict)  # per-worker Limits overrides
@@ -466,7 +467,22 @@ class WorkerPolicy:
 
     @classmethod
     def from_json(cls, raw: str) -> "WorkerPolicy":
-        data = json.loads(raw or "{}")
+        """Reload a persisted policy row (`engine.py`, every turn).
+
+        The column is a JSON TEXT value with no schema enforcement below it, so
+        neither "parses" nor "parses to an object" can be assumed (ECA-141): a
+        corrupt column raises `JSONDecodeError`, and a technically-valid-JSON
+        non-object (`"nonsense"`, `["a"]`, `42`) parses fine but has no `.get`.
+        Both would otherwise raise here, before `coerced()` ever runs, in the same
+        pre-attempt-loop spot in `Engine._run_turn` the field-level coercion exists
+        to protect.
+        """
+        try:
+            data = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
         return cls.coerced(
             allowed_tools=data.get("allowed_tools", list(DEFAULT_ALLOWED_TOOLS)),
             allow_env=data.get("allow_env", []),
@@ -490,10 +506,10 @@ class WorkerPolicy:
         """Build a WorkerPolicy from already-defaulted but still-untyped control-socket
         JSON (ECA-141). The two entry points where untrusted JSON becomes a WorkerPolicy
         -- this and `server._dispatch`'s spawn branch -- both route through here so a
-        wrong-shaped field falls back to the SAME default a MISSING field already gets,
-        rather than surviving as e.g. a list or a string and raising deep inside a turn
-        (`base_tools()`, `Limits.override`, `validate_allow_env`, `mcp_servers.keys()`
-        all assume the container types below and none of them are guarded).
+        wrong-shaped field cannot survive as e.g. a list or a string and raise deep
+        inside a turn (`base_tools()`, `Limits.override`, `validate_allow_env`,
+        `mcp_servers.keys()` all assume the container types below and none of them are
+        guarded).
 
         Deliberately NOT a `__post_init__` on the dataclass itself: several tests
         construct `WorkerPolicy(...)` directly with a duck-typed-but-misbehaving
@@ -503,14 +519,30 @@ class WorkerPolicy:
 
         `guard_hooks` is included for defense in depth even though its one read site
         (`on_pre_tool_use`) already tolerates a non-dict via `_is_mapping` (ECA-142) and
-        skips-and-records rather than raising -- that stopgap is unchanged. The other
-        four fields have no such tolerance at their read sites, so this is their only
-        guard; a malformed value there is coerced silently, with no separate event, for
-        the same reason a MISSING value needs none: the fallback is exactly what an
-        absent key already produces.
+        skips-and-records rather than raising -- that stopgap is unchanged.
+
+        `allow_env`/`guard_hooks`/`limits`/`mcp_servers` fall back to the SAME empty
+        default a MISSING field already gets -- restrictive either way, so malformed
+        and absent are indistinguishable in effect. `allowed_tools` does NOT: a missing
+        key defaults to the generous `DEFAULT_ALLOWED_TOOLS` (an operator's deliberate
+        "just use the sane baseline"), but a malformed one falls back to an empty
+        ceiling instead of that same generous set -- silently WIDENING the one field
+        that grants capability, on input nobody could confirm was actually asking for
+        it, is a worse failure mode than granting nothing (`ceiling_denial`'s own
+        principle: "a ceiling that guesses is not a ceiling"). None of these four
+        fallbacks emit a separate event: the same argument ECA-142 made for
+        guard_hooks applies (a bad row is retried every turn; failing loudly here
+        would just move the wedge instead of closing it) and none of them can grant
+        more than an absent field already would.
+
+        `model` is passed through uncoerced deliberately, not by omission: a wrong
+        type reaches the SDK's argv builder INSIDE the attempt-loop's try/except
+        (`engine.py`, around the `query()` call), so it fails that turn through the
+        normal retry ladder instead of wedging the lane before the loop exists --
+        it does not share this method's failure class.
         """
         return cls(
-            allowed_tools=allowed_tools if _is_str_list(allowed_tools) else list(DEFAULT_ALLOWED_TOOLS),
+            allowed_tools=allowed_tools if _is_str_list(allowed_tools) else [],
             allow_env=allow_env if _is_str_list(allow_env) else [],
             guard_hooks=guard_hooks if isinstance(guard_hooks, dict) else {},
             model=model,
@@ -1119,14 +1151,16 @@ def _hook_deny(reason: str) -> dict[str, Any]:
 
 
 def _is_mapping(value: Any) -> bool:
-    """`guard_hooks` reaches here uncoerced from control-socket JSON (ECA-141 tracks
-    the real fix at the construction site).
+    """A `WorkerPolicy` built directly (not through `coerced()`, e.g. in a test, or by
+    any future caller that skips the two untrusted-JSON entry points) can still carry
+    a non-dict `guard_hooks` — `coerced()` (ECA-141) closes the construction site, not
+    the type itself, so this hook stays defensive regardless.
 
-    Until then a non-dict must not raise out of this hook. Note the consequence is not
-    the one ECA-135 recorded: on the pinned SDK (0.2.128) an exception here does not
-    kill the runner loop, it is swallowed into "no decision", so the failure mode is a
-    silent ALLOW rather than a loud wedge. Worse, not better — which is why the caller
-    both guards this and records the skip.
+    A non-dict must not raise out of this hook. The consequence is not the one
+    ECA-135 recorded: on the pinned SDK (0.2.128) an exception here does not kill the
+    runner loop, it is swallowed into "no decision", so the failure mode is a silent
+    ALLOW rather than a loud wedge. Worse, not better — which is why the caller both
+    guards this and records the skip.
     """
     return hasattr(value, "get")
 

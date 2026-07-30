@@ -922,6 +922,7 @@ def make_policy_hook(
     policy: WorkerPolicy,
     events: EventLog,
     turn_id: int,
+    hook_calls: list[int] | None = None,
 ):
     """PreToolUse policy enforcement for EVERY tool call (ECA-142).
 
@@ -965,6 +966,13 @@ def make_policy_hook(
     defect with no event recorded. Measured, not reasoned: with the body made to raise,
     a lane granted `Bash(echo*)` read its canary file, `can_use_tool` was never
     consulted, and no `tool_denied` was written. Hence the blanket `except` below.
+
+    `hook_calls` (ECA-145) is a single-element mutable counter the caller owns and
+    reads back after the turn: this closure's only obligation to it is to bump
+    element 0 on every invocation, unconditionally, before anything here can raise
+    or short-circuit — the counter's whole purpose is proving the hook was called
+    AT ALL, which a value read only after a successful return could not do. `None`
+    (every existing direct-call test) means "don't count", not "count wrong".
     """
 
     def _record(reason: str) -> None:
@@ -987,6 +995,8 @@ def make_policy_hook(
     tool_name_seen = [""]
 
     async def on_pre_tool_use(hook_input: Any, tool_use_id: str | None, context: Any):
+        if hook_calls is not None:
+            hook_calls[0] += 1
         try:
             data = hook_input or {}
             tool_name = data.get("tool_name") or ""

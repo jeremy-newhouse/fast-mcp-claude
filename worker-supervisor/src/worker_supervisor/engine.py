@@ -865,6 +865,11 @@ class Engine:
                 turn_id=turn_id,
                 question_timeout_s=self._cfg.question_timeout_s,
             )
+            # ECA-145: counts every PreToolUse dispatch of the policy hook this
+            # attempt, so it can be compared against outcome.tools at turn end —
+            # see Engine._check_policy_hook_gap. Reset every attempt, same as
+            # `outcome` below: a retried attempt gets its own fresh count.
+            hook_calls = [0]
             options = ClaudeAgentOptions(
                 cwd=worker["repo"],
                 resume=resume_from,
@@ -954,6 +959,7 @@ class Engine:
                                     policy=policy,
                                     events=self._events,
                                     turn_id=turn_id,
+                                    hook_calls=hook_calls,
                                 )
                             ],
                         ),
@@ -1001,6 +1007,7 @@ class Engine:
                     [resume_from], outcome=outcome,
                 )
                 self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
+                self._check_policy_hook_gap(name, turn_id, outcome, hook_calls[0])
                 await self._reg.set_worker_status(name, "idle", active=True)
                 return
             except asyncio.CancelledError:
@@ -1036,6 +1043,7 @@ class Engine:
                         no_retry="the previous epoch already ended in resume_failed and"
                         " nothing has resumed successfully since — an operator has to"
                         " look at the session store",
+                        hook_calls=hook_calls[0],
                     )
                     return
                 if dead_chain:
@@ -1074,6 +1082,7 @@ class Engine:
                         outcome=outcome,
                     )
                     self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
+                    self._check_policy_hook_gap(name, turn_id, outcome, hook_calls[0])
                     await self._reg.roll_epoch(name, "resume_failed")
                     await self._reg.enqueue_turn(
                         name, restore_prompt(worker["repo"]), kind="restore"
@@ -1097,6 +1106,7 @@ class Engine:
                     # came back 429 carried both a turn_retry row and a "not retried"
                     # reason, which is a lie in exactly the case the field exists for.
                     no_retry=no_retry if attempt == 1 else None,
+                    hook_calls=hook_calls[0],
                 )
                 return
 
@@ -1127,6 +1137,7 @@ class Engine:
                 outcome=outcome,
             )
             self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
+            self._check_policy_hook_gap(name, turn_id, outcome, hook_calls[0])
             await self._reg.set_worker_status(name, "idle", active=True)
             return
 
@@ -1134,6 +1145,7 @@ class Engine:
             await self._fail_turn(
                 name, turn_id, outcome, "stream ended without a ResultMessage",
                 options_snapshot, stderr_tail, resume_from, policy,
+                hook_calls=hook_calls[0],
             )
             return
 
@@ -1159,6 +1171,7 @@ class Engine:
             **_status_field(outcome),  # ECA-143: state="error" without an exception
         )
         self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
+        self._check_policy_hook_gap(name, turn_id, outcome, hook_calls[0])
         if outcome.session_id:
             watchdog = asyncio.create_task(
                 self._verify_transcript_persisted(
@@ -1267,6 +1280,7 @@ class Engine:
         resume_from: str | None,
         policy: WorkerPolicy,
         no_retry: str | None = None,
+        hook_calls: int = 0,
     ) -> None:
         """Terminal error after the retry: record, capsule, keep the epoch
         (keep-on-failure, Amendment A6) — the orchestrator decides what's next.
@@ -1282,6 +1296,12 @@ class Engine:
         `usage` blob (so a ResultMessage plainly HAD been observed) sitting beside
         `result_text: null`. A failure path must persist at least as much as the
         success path, not less.
+
+        `hook_calls` (ECA-145) defaults to 0: the one caller that fails a turn
+        before the attempt loop starts (an mcp config write failure) hands this an
+        `outcome` with no tools recorded either, so `required` in
+        `_check_policy_hook_gap` is trivially 0 and the default is correct, not a
+        placeholder.
         """
         await self._reg.finish_turn(
             turn_id, "error",
@@ -1305,6 +1325,7 @@ class Engine:
             [resume_from, outcome.session_id], outcome=outcome,
         )
         self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
+        self._check_policy_hook_gap(name, turn_id, outcome, hook_calls)
         await self._reg.set_worker_status(name, "idle", active=True)
 
     def _emit_mcp_diagnostics(
@@ -1329,6 +1350,50 @@ class Engine:
             mcp_init=mcp_init,
             stderr_tail=list(stderr_tail),
         )
+
+    def _check_policy_hook_gap(
+        self, name: str, turn_id: int, outcome: TurnOutcome, hook_calls: int
+    ) -> None:
+        """ECA-145: detect the PreToolUse policy hook silently ceasing to fire.
+
+        ECA-142 made this hook the TOTAL enforcement point for the subset of calls
+        the CLI auto-approves on its own (read-only Bash inside the cwd never
+        reaches `can_use_tool` at all). The hook fails closed for exceptions
+        raised INSIDE it, but nothing detected the hook simply not being
+        DISPATCHED — a future SDK/CLI change, or `matcher=None` losing its
+        documented universality — which would silently restore the exact ECA-142
+        defect. The unit suite cannot see this either: it calls the hook function
+        directly, which is the call the product was failing to make (see
+        test_live_gate.py's own rationale, and ECA-137/139/142 before it).
+
+        Every observed `ToolUseBlock` should have a matching hook dispatch — the
+        hook is registered with `matcher=None`, which fires for every tool call,
+        including AskUserQuestion (which then no-ops inside it — see
+        `make_policy_hook`). AskUserQuestion is excluded from `required` anyway,
+        as slack rather than as something proven either way: it has its own
+        dedicated escalation bridge, and being lenient about it costs nothing
+        while avoiding a false positive if some future CLI build special-cases it
+        ahead of the hook layer.
+
+        AC#3's decision, made explicitly here because this is the one place that
+        acts on it: WARN, do not fail the turn. The unpoliced call has already
+        executed by the time this runs, so failing the turn cannot undo it and
+        buys no additional security boundary. A real gap is a property of the
+        SDK/CLI pin, not of one turn — it would recur on every subsequent tool
+        call, in every concurrent lane, fleet-wide. Failing every turn would flood
+        failure capsules and burn epoch budget across the whole fleet for a
+        condition an operator fixes by re-pinning a working SDK/CLI version, not
+        by retrying turns. A distinct event name — not `tool_denied`, which means
+        something already fired and stopped a call — is what actually gets this
+        looked at; the same reasoning ECA-141's `guard:skipped` record already
+        applied to the narrower malformed-`guard_hooks` case.
+        """
+        required = sum(1 for t in outcome.tools if t != "AskUserQuestion")
+        if hook_calls < required:
+            self._events.emit(
+                name, "policy_hook_gap", turn_id=turn_id,
+                tool_uses=required, hook_invocations=hook_calls,
+            )
 
     async def _validate_worker_name(self, name: str) -> None:
         """ECA-135: a worker name becomes a FILENAME, so it has to be one.

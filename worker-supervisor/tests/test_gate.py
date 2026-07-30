@@ -496,32 +496,6 @@ async def test_pretooluse_hook_survives_a_non_dict_guard_hooks(registry, events,
     assert skips, "a configured guard was skipped with no record"
 
 
-def test_from_json_coerces_a_malformed_pass_through_field():
-    """ECA-141: a persisted policy row with a wrong-shaped field must reload to the
-    SAME default a missing field already gets, not survive as the wrong type for
-    `base_tools()` / `Limits.override` / `validate_allow_env` / `mcp_servers.keys()`
-    to crash on downstream. `from_json` runs on every turn reload (`engine.py`), so
-    an uncoerced bad row would wedge every subsequent turn, including across a
-    restart — the same failure class ECA-135/137/140 established for this daemon.
-    """
-    cases = [
-        ('{"allowed_tools": null}', "allowed_tools", list(DEFAULT_ALLOWED_TOOLS)),
-        ('{"allowed_tools": "Bash"}', "allowed_tools", list(DEFAULT_ALLOWED_TOOLS)),
-        ('{"allowed_tools": [1, 2]}', "allowed_tools", list(DEFAULT_ALLOWED_TOOLS)),
-        ('{"allow_env": 5}', "allow_env", []),
-        ('{"allow_env": null}', "allow_env", []),
-        ('{"guard_hooks": []}', "guard_hooks", {}),
-        ('{"guard_hooks": "x"}', "guard_hooks", {}),
-        ('{"limits": "oops"}', "limits", {}),
-        ('{"limits": [1, 2]}', "limits", {}),
-        ('{"mcp_servers": []}', "mcp_servers", {}),
-        ('{"mcp_servers": 3}', "mcp_servers", {}),
-    ]
-    for raw, field, expected in cases:
-        policy = WorkerPolicy.from_json(raw)
-        assert getattr(policy, field) == expected, raw
-
-
 async def test_pretooluse_hook_fails_CLOSED_when_its_own_body_raises(registry, events, repo):
     """The regression this hook could have introduced, and the reason for its blanket except.
 
@@ -691,3 +665,66 @@ def test_policy_mcp_servers_round_trip():
     assert WorkerPolicy.from_json(p.to_json()).mcp_servers == servers
     # Default (no grant) round-trips to empty, never None.
     assert WorkerPolicy.from_json(WorkerPolicy().to_json()).mcp_servers == {}
+
+
+def test_from_json_coerces_a_malformed_pass_through_field():
+    """ECA-141: a persisted policy row with a wrong-shaped field must reload without
+    raising, not survive as the wrong type for `base_tools()` / `Limits.override` /
+    `validate_allow_env` / `mcp_servers.keys()` to crash on downstream. `from_json`
+    runs on every turn reload (`engine.py`), so an uncoerced bad row would wedge
+    every subsequent turn, including across a restart — the same failure class
+    ECA-135/137/140 established for this daemon.
+
+    `allowed_tools` falls back to `[]`, not the generous `DEFAULT_ALLOWED_TOOLS` a
+    MISSING key gets — a malformed ceiling must not silently widen (review finding,
+    see `WorkerPolicy.coerced`'s docstring). Every other field's fallback matches
+    what an absent key already produces, since none of them can grant more that way.
+    """
+    cases = [
+        ('{"allowed_tools": null}', "allowed_tools", []),
+        ('{"allowed_tools": "Bash"}', "allowed_tools", []),
+        ('{"allowed_tools": [1, 2]}', "allowed_tools", []),
+        ('{"allow_env": 5}', "allow_env", []),
+        ('{"allow_env": null}', "allow_env", []),
+        ('{"guard_hooks": []}', "guard_hooks", {}),
+        ('{"guard_hooks": "x"}', "guard_hooks", {}),
+        ('{"limits": "oops"}', "limits", {}),
+        ('{"limits": [1, 2]}', "limits", {}),
+        ('{"mcp_servers": []}', "mcp_servers", {}),
+        ('{"mcp_servers": 3}', "mcp_servers", {}),
+    ]
+    for raw, field, expected in cases:
+        policy = WorkerPolicy.from_json(raw)
+        assert getattr(policy, field) == expected, raw
+
+
+def test_from_json_survives_a_row_that_is_not_a_json_object():
+    """ECA-141 review finding: `from_json`'s own `data.get(...)` calls assumed a dict
+    result from `json.loads`, which a persisted TEXT column does not guarantee —
+    valid JSON that isn't an object (`"x"`, `["a"]`, `42`, `null`) parses fine but has
+    no `.get`, and outright corrupt JSON raises `JSONDecodeError`. Both landed before
+    `coerced()` ever ran, in the exact pre-attempt-loop spot in `Engine._run_turn`
+    the field-level coercion exists to protect — so this is the same wedge class one
+    layer further out, not a new one.
+    """
+    for raw in ('"just a string"', "[1, 2, 3]", "42", "null", "not json at all", "", None):
+        policy = WorkerPolicy.from_json(raw)
+        assert policy.allowed_tools == list(DEFAULT_ALLOWED_TOOLS), raw
+        assert policy.mcp_servers == {}, raw
+
+
+def test_limits_override_drops_an_unconvertible_budget_rather_than_raising():
+    """ECA-141 review finding: `Limits.override` did `float(spec[...])` unguarded —
+    `WorkerPolicy.coerced()` only checks `limits` itself is a dict, not what is
+    inside it, so a non-numeric `max_budget_usd_per_epoch` reached this `float()`
+    call from `Engine._run_turn`, before the attempt-loop's try/except exists.
+    Verified end to end (not just here) via
+    `test_a_persisted_row_with_every_pass_through_field_malformed_still_completes`
+    in test_engine.py.
+    """
+    from worker_supervisor.config import Limits
+
+    base = Limits()
+    for bad in ("free", None, [], {}):
+        assert base.override({"max_budget_usd_per_epoch": bad}) == base
+    assert base.override({"max_budget_usd_per_epoch": "12.5"}).max_budget_usd_per_epoch == 12.5

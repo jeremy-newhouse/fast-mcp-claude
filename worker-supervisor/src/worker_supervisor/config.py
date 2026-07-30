@@ -27,17 +27,28 @@ class Limits:
     max_budget_usd_per_epoch: float = 10.0
 
     def override(self, spec: dict | None) -> "Limits":
-        """Apply per-worker spawn overrides (unknown keys rejected upstream)."""
+        """Apply per-worker spawn overrides (unknown keys rejected upstream).
+
+        `max_budget_usd_per_epoch` is coerced via `float()` rather than trusted as
+        already-numeric: this runs from `Engine._run_turn` before the attempt-loop's
+        own try/except exists (ECA-141), so a non-numeric value here would otherwise
+        raise `ValueError` straight out of turn setup and wedge the lane the same
+        way the uncoerced WorkerPolicy fields did. An unconvertible value is dropped,
+        same as if the key were absent — `WorkerPolicy.coerced()` only validates
+        that `limits` itself is a dict, not its individual values.
+        """
         if not spec:
             return self
+        budget_kwargs = {}
+        if "max_budget_usd_per_epoch" in spec:
+            try:
+                budget_kwargs["max_budget_usd_per_epoch"] = float(spec["max_budget_usd_per_epoch"])
+            except (TypeError, ValueError):
+                pass
         return replace(
             self,
             **{k: v for k, v in spec.items() if k in ("wall_clock_s", "max_turns")},
-            **(
-                {"max_budget_usd_per_epoch": float(spec["max_budget_usd_per_epoch"])}
-                if "max_budget_usd_per_epoch" in spec
-                else {}
-            ),
+            **budget_kwargs,
         )
 
 

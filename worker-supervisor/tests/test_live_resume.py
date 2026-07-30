@@ -43,6 +43,7 @@ import uuid
 import pytest
 
 from worker_supervisor import engine as engine_module
+from test_engine import capsule_paths
 from worker_supervisor.engine import Engine, session_transcript_path
 from worker_supervisor.gate import QuestionBridge
 from worker_supervisor.registry import TURN_TERMINAL, _now as registry_now
@@ -177,9 +178,7 @@ async def test_a_resume_the_real_cli_refuses_rolls_the_epoch(
         # refuses a resume BEFORE it announces the session, so "no init frame" really
         # does identify a chain that never came alive.
         capsule = json.loads(
-            sorted(cfg.capsules_dir.glob(f"liveres1-turn{turn_id}-*.json"))[-1].read_text(
-                encoding="utf-8"
-            )
+            (await capsule_paths(cfg, "liveres1", turn_id))[-1].read_text(encoding="utf-8")
         )
         diag = capsule["result_diagnostics"]
         assert diag["saw_init"] is False and diag["frames"] == 0, (

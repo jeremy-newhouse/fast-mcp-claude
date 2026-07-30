@@ -234,6 +234,32 @@ async def terminal_turn(registry, turn_id: int, timeout: float = 5.0):
     return await wait_until(_check, timeout)
 
 
+async def capsule_paths(cfg, worker: str, turn_id: int | None = None, timeout: float = 5.0):
+    """Capsule files for `worker`, WAITED for rather than globbed (ECA-150).
+
+    `terminal_turn` returns the instant `finish_turn` commits, and every failure
+    path writes its capsule after that — so globbing straight afterwards races the
+    runner and, under full-suite load, finds an empty directory. Same window
+    ECA-148 traced (observing a row before `_run_turn`'s tail finishes), different
+    victim. Measured at roughly 2 runs in 10 before this helper existed.
+    """
+    pattern = (
+        f"{worker}-turn{turn_id}-*.json" if turn_id is not None else f"{worker}-turn*.json"
+    )
+
+    async def _found():
+        return sorted(cfg.capsules_dir.glob(pattern)) or None
+
+    try:
+        return await wait_until(_found, timeout)
+    except (asyncio.TimeoutError, TimeoutError):
+        raise AssertionError(
+            f"no capsule matching {pattern!r} appeared within {timeout}s "
+            f"in {cfg.capsules_dir}"
+        ) from None
+
+
+
 async def test_happy_turn_persists_session_and_telemetry(make_engine, registry, repo):
     engine, calls = make_engine([[a("Read", "Bash"), r("s1", cost=0.05)]])
     await engine.spawn("w1", str(repo))
@@ -277,7 +303,7 @@ async def test_second_failure_is_terminal_with_capsule(make_engine, registry, re
     tid = await engine.prompt("w1", "doomed")
     turn = await terminal_turn(registry, tid)
     assert turn["state"] == "error" and "boom 2" in turn["error"]
-    capsules = list(cfg.capsules_dir.glob("w1-turn*.json"))
+    capsules = await capsule_paths(cfg, "w1")
     assert capsules, "failure capsule missing (Amendment A6)"
     epoch = await registry.current_epoch("w1")
     assert epoch["seq"] == 1 and epoch["ended_at"] is None  # keep-on-failure
@@ -312,7 +338,7 @@ async def test_api_error_failure_keeps_the_clis_own_account_of_it(
     assert turn["num_turns"] == 1
 
     capsule = json.loads(
-        sorted(cfg.capsules_dir.glob("w1-turn*.json"))[-1].read_text(encoding="utf-8")
+        (await capsule_paths(cfg, "w1"))[-1].read_text(encoding="utf-8")
     )
     diag = capsule["result_diagnostics"]
     assert diag["api_error_status"] == 429  # the field that makes the failure a diagnosis
@@ -355,7 +381,7 @@ async def test_failure_with_no_result_frame_says_so_rather_than_inventing_a_stat
     assert turn["state"] == "error"
 
     capsule = json.loads(
-        sorted(cfg.capsules_dir.glob("w1-turn*.json"))[-1].read_text(encoding="utf-8")
+        (await capsule_paths(cfg, "w1"))[-1].read_text(encoding="utf-8")
     )
     diag = capsule["result_diagnostics"]
     assert diag is not None, "the key must exist, or the reader assumes an old capsule"
@@ -384,7 +410,7 @@ async def test_timeout_path_keeps_the_result_it_had_observed(
     assert turn["result_text"] == "You've hit your monthly spend limit"
     assert turn["is_error"] == 1 and turn["num_turns"] == 1
     capsule = json.loads(
-        sorted(cfg.capsules_dir.glob(f"w1-turn{tid}-*.json"))[-1].read_text(encoding="utf-8")
+        (await capsule_paths(cfg, "w1", tid))[-1].read_text(encoding="utf-8")
     )
     assert capsule["result_diagnostics"]["api_error_status"] == 429
 
@@ -454,7 +480,7 @@ async def test_resume_failed_capsule_says_the_session_never_started(
     # CLI's own words are in stderr, and the exit code is all the exception carries.
     assert "ProcessError" in turn2["error"] and "exit=1" in turn2["error"]
     capsule = json.loads(
-        sorted(cfg.capsules_dir.glob(f"w1-turn{t2}-*.json"))[-1].read_text(encoding="utf-8")
+        (await capsule_paths(cfg, "w1", t2))[-1].read_text(encoding="utf-8")
     )
     diag = capsule["result_diagnostics"]
     assert diag["saw_init"] is False and diag["frames"] == 0
@@ -506,7 +532,7 @@ async def test_capsule_bounds_the_clis_error_list(make_engine, registry, repo, c
     await terminal_turn(registry, tid)
 
     capsule = json.loads(
-        sorted(cfg.capsules_dir.glob("w1-turn*.json"))[-1].read_text(encoding="utf-8")
+        (await capsule_paths(cfg, "w1"))[-1].read_text(encoding="utf-8")
     )
     errors = capsule["result_diagnostics"]["errors"]
     assert len(errors) == 10
@@ -548,7 +574,7 @@ async def test_a_string_errors_field_is_not_split_into_characters(
     await terminal_turn(registry, tid)
 
     capsule = json.loads(
-        sorted(cfg.capsules_dir.glob("w1-turn*.json"))[-1].read_text(encoding="utf-8")
+        (await capsule_paths(cfg, "w1"))[-1].read_text(encoding="utf-8")
     )
     assert capsule["result_diagnostics"]["errors"] == ["monthly spend cap"]
 
@@ -619,7 +645,7 @@ async def test_resume_failure_rolls_epoch_and_enqueues_restore(
     # ECA-143: this capsule carries the diagnostics block too. Here the CLI died
     # before any result frame, so the honest content is "there was none".
     capsule = json.loads(
-        sorted(cfg.capsules_dir.glob(f"w1-turn{t2}-*.json"))[-1].read_text(encoding="utf-8")
+        (await capsule_paths(cfg, "w1", t2))[-1].read_text(encoding="utf-8")
     )
     assert capsule["result_diagnostics"]["saw_result"] is False
 
@@ -1573,7 +1599,7 @@ async def test_mcp_config_write_failure_fails_the_turn_instead_of_wedging_the_la
     assert calls == [], "the CLI must never have been spawned"
     assert (await registry.get_worker("w1"))["status"] == "idle"
     assert [e for e in events.read("w1") if e["event"] == "turn_error"]
-    assert list(cfg.capsules_dir.glob("w1-turn*.json")), "failure capsule missing"
+    assert await capsule_paths(cfg, "w1"), "failure capsule missing"
     # NB: this is a cheap smoke check, NOT the guard against the wedge — terminal_turn
     # returns before the loop's finally, so it can pass with the runner already dying.
     # test_a_failing_turn_end_purge_cannot_kill_the_worker_loop is the one that bites
@@ -1961,7 +1987,7 @@ async def test_a_legal_lane_still_gets_its_own_log_and_capsule(
     assert turn["state"] == "error"
     assert (cfg.logs_dir / "ultra-2.jsonl").exists()
     assert not any(e.get("log_key_refused") for e in events.read("ultra-2"))
-    capsules = list(cfg.capsules_dir.glob("ultra-2-turn*.json"))
+    capsules = await capsule_paths(cfg, "ultra-2")
     assert len(capsules) == 1, f"expected one capsule, got {capsules}"
 
 
@@ -2071,6 +2097,15 @@ async def test_stop_gives_up_loudly_on_a_task_cancellation_cannot_reach(
     What is asserted is therefore not "it recovers" — it does not — but that the
     daemon still finishes shutting down and NAMES what it abandoned, instead of
     waiting on it forever.
+
+    Deliberately NOT written with `asyncio.wait_for(engine.stop(), ...)`, and the
+    reason is this defect's own moral. Review round measured it: with only the
+    bound reverted, `wait_for`'s timeout cancels `stop()`, that cancellation
+    propagates into the task that ignores cancellation, and the test runs forever
+    — "3 passed ... 240.08s", released by SIGINT. The test written to close
+    ECA-146 reintroduced it. `asyncio.wait` never cancels what it waits on, and
+    the wedged task is released BEFORE anything is asserted, so a regression here
+    fails in bounded time instead of hanging.
     """
     monkeypatch.setattr("worker_supervisor.engine.STOP_GRACE_S", 0.2)
     engine, _ = make_engine([])
@@ -2085,14 +2120,18 @@ async def test_stop_gives_up_loudly_on_a_task_cancellation_cannot_reach(
 
     stuck = asyncio.create_task(unreachable(), name="wedged-close")
     engine._watchdogs.add(stuck)
-    try:
-        await asyncio.wait_for(engine.stop(), timeout=10)
-        abandoned = [e for e in events.read(DAEMON_KEY) if e["event"] == "stop_incomplete"]
-        assert [e["abandoned"] for e in abandoned] == [["wedged-close"]], abandoned
-        assert not stuck.done()
-    finally:
-        release.set()
-        await asyncio.wait_for(stuck, timeout=5)
+    stopper = asyncio.create_task(engine.stop(), name="stopper")
+    done, _ = await asyncio.wait({stopper}, timeout=10)
+    still_wedged = not stuck.done()
+
+    release.set()  # unconditional, and BEFORE any assert
+    await asyncio.wait_for(stuck, timeout=5)
+    await asyncio.wait_for(stopper, timeout=5)
+
+    assert stopper in done, "stop() waited past its own grace on an unreachable task"
+    assert still_wedged, "the probe task was not actually unreachable"
+    abandoned = [e for e in events.read(DAEMON_KEY) if e["event"] == "stop_incomplete"]
+    assert [e["abandoned"] for e in abandoned] == [["wedged-close"]], abandoned
 
 
 async def test_stop_in_the_window_just_after_a_turn_finishes(
@@ -2131,3 +2170,72 @@ async def test_stop_in_the_window_just_after_a_turn_finishes(
     await asyncio.wait_for(engine.stop(), timeout=STOP_GRACE_S * 3)
 
     assert not [e for e in events.read(DAEMON_KEY) if e["event"] == "stop_incomplete"]
+    # And it must not CLAIM an interruption here. Review round: the first version
+    # emitted `turn_interrupted` unconditionally, so this very window — the widest
+    # one — produced an event promising a redelivery for a turn that was already
+    # `done`. Nothing is owed; nothing should be announced.
+    assert not [e for e in events.read("w1") if e["event"] == "turn_interrupted"]
+
+
+async def test_stop_lets_after_turn_finish_chaining_the_epoch(
+    make_engine, registry, repo, monkeypatch
+):
+    """ECA-148 review round: `_after_turn` must not be torn in half by shutdown.
+
+    A `cycle_handover` rolls the epoch and THEN enqueues the restore turn. Those
+    are two awaits, and `boot_reconcile` cannot heal a cancel between them: it
+    requeues claimed/running TURNS, and the lost restore was never a turn row.
+    The lane would come back on a fresh epoch with an empty queue and no handover
+    restore — silently amnesiac, and with no event saying so.
+
+    The patched `roll_epoch` sleeps AFTER delegating, so the cancel lands in
+    exactly that gap. Without the shield at the call site this leaves `seq == 2`
+    and an empty queue; the queued `restore` is the discriminator.
+    """
+    original = registry.roll_epoch
+    rolled = asyncio.Event()
+
+    async def slow_roll(*a, **k):
+        result = await original(*a, **k)
+        rolled.set()
+        await asyncio.sleep(0.5)
+        return result
+
+    monkeypatch.setattr(registry, "roll_epoch", slow_roll)
+    engine, _ = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo))
+    await engine.cycle("w1")
+    await asyncio.wait_for(rolled.wait(), timeout=10)
+
+    await asyncio.wait_for(engine.stop(), timeout=STOP_GRACE_S * 3)
+
+    assert (await registry.current_epoch("w1"))["seq"] == 2
+    queued = await registry.next_queued_turn("w1")
+    assert queued is not None and queued["kind"] == "restore", (
+        "the epoch rolled but the restore turn was never enqueued — the lane would "
+        "come back cycled and ungrounded"
+    )
+
+
+async def test_the_transcript_watchdog_is_named(make_engine, registry, repo, monkeypatch):
+    """`stop_incomplete.abandoned` exists to say WHAT shutdown gave up on.
+
+    Review round: the transcript watchdogs were created unnamed, so half the
+    population that event can name reported as "Task-23" — nothing, in the one
+    field whose entire job is identification.
+    """
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def blocking(self, *a, **k):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(Engine, "_verify_transcript_persisted", blocking)
+    engine, _ = make_engine([[r("s1")]])
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "work")
+    await asyncio.wait_for(started.wait(), timeout=10)
+    names = sorted(t.get_name() for t in engine._watchdogs)
+    release.set()
+
+    assert names == [f"transcript-watchdog-w1-turn{tid}"], names

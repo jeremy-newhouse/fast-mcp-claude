@@ -44,7 +44,7 @@ from .gate import (
     make_question_hook,
 )
 from .names import DAEMON_KEY, require_safe_worker_name
-from .registry import Registry, WORKER_GONE
+from .registry import Registry, TURN_TERMINAL, WORKER_GONE
 
 # ECA-137: the validator and its pattern moved to `names.py` so that `events.py` and
 # `capsule.py` — which this module imports, and which derive filenames from a name too
@@ -78,10 +78,22 @@ ERROR_ITEM_CHARS = 500
 # ECA-148: how long `stop()` waits for cancelled runners/watchdogs before it gives
 # up on them and says so. A backstop for an await cancellation cannot reach (the
 # SDK's shielded, explicitly unbounded `Query.close()`), not a tuning knob — so it
-# is a constant rather than a config key, and deliberately shorter than any
-# plausible operator patience. Under pm2 the effective ceiling is `kill_timeout`
-# (default 1600ms) regardless; this grace is for a hand-run daemon and for tests.
-STOP_GRACE_S = 10.0
+# is a constant rather than a config key.
+#
+# Sized ABOVE the SDK's own worst case, not below it: `SubprocessCLITransport.close()`
+# documents "every await in this scope is bounded (~20s worst case)" — 5s for the
+# write lock, then 5s each for the graceful wait, the post-SIGTERM wait and the
+# post-SIGKILL wait. A grace under that would abandon a teardown that was about to
+# finish on its own, and `stop_incomplete` would then mean "slow" rather than
+# "wedged", which is the one thing it must not mean. Review round: it was 10.0.
+# Under pm2 the effective ceiling is `kill_timeout` (unset -> 1600ms default)
+# regardless; this grace is for a hand-run daemon and for tests.
+STOP_GRACE_S = 25.0
+
+# How long a stopping runner lets `_after_turn` finish. It chains lifecycle state
+# across several awaits and is a handful of DB writes, so it is worth waiting out;
+# see the call site for why cancelling halfway is unrecoverable.
+AFTER_TURN_GRACE_S = 5.0
 
 
 def _self_cancelled() -> bool:
@@ -710,16 +722,26 @@ class Engine:
                     # `stop()`'s await never returned. Ask whether WE were cancelled
                     # instead; that is true only on the `stop()` path.
                     if _self_cancelled():
-                        # Leave the turn row `running` on purpose. `boot_reconcile`
-                        # resets claimed/running turns to queued (redeliveries + 1),
-                        # so the interrupted work is redelivered on the next boot
-                        # rather than silently dropped — the same at-least-once
-                        # contract a crash already has. Emitted so the gap in
-                        # `workers events` is explained rather than mysterious.
-                        self._events.emit(
-                            name, "turn_interrupted", turn_id=turn["id"],
-                            reason="daemon stop",
-                        )
+                        # Leave the turn row wherever it is on purpose: if it is
+                        # still claimed/running, `boot_reconcile` resets it to
+                        # queued (redeliveries + 1) and the interrupted work is
+                        # redelivered on the next boot — the same at-least-once
+                        # contract a crash already has.
+                        #
+                        # RE-READ the row before saying so. Review round: this
+                        # emitted unconditionally, and the widest window for a
+                        # cancel to land here is the tail of `_run_turn` AFTER
+                        # `finish_turn` has committed — so the common case was an
+                        # event claiming a redelivery for a turn that was already
+                        # `done` and would never be requeued. An event that lies
+                        # about durability is worse than no event.
+                        with suppress(asyncio.CancelledError, Exception):
+                            row = await self._reg.get_turn(turn["id"])
+                            if row is not None and row["state"] not in TURN_TERMINAL:
+                                self._events.emit(
+                                    name, "turn_interrupted", turn_id=turn["id"],
+                                    state=row["state"], reason="daemon stop",
+                                )
                         raise
                     if task.cancelled():
                         continue  # the turn was killed; loop decides via status
@@ -735,7 +757,35 @@ class Engine:
                     # being transient, and a file that outlived `kill` would have traded
                     # a turn-scoped exposure for a permanent one.
                     self._purge_mcp_config(name)
-            await self._after_turn(name, turn["id"])
+            # ECA-148 review round: let this FINISH even when the daemon is stopping.
+            # `_after_turn` chains lifecycle state across several awaits — a
+            # `cycle_handover` rolls the epoch and THEN enqueues the restore turn —
+            # and `boot_reconcile` cannot heal a tear between them: it requeues
+            # claimed/running TURNS, and the lost restore was never a turn row at all.
+            # A lane cancelled in that gap comes back on a fresh epoch with an empty
+            # queue and no handover restore, i.e. silently amnesiac. It is a handful of
+            # DB writes, so it is worth waiting out; `stop()`'s own grace is the outer
+            # bound, and this inner one keeps a wedged registry from eating it.
+            after = asyncio.ensure_future(self._after_turn(name, turn["id"]))
+            try:
+                await asyncio.shield(after)
+            except asyncio.CancelledError:
+                if not _self_cancelled():
+                    after.cancel()
+                    raise
+                # `shield` only detached US from it; `after` is still running.
+                # `asyncio.wait` never cancels what it waits on.
+                await asyncio.wait({after}, timeout=AFTER_TURN_GRACE_S)
+                if not after.done():
+                    after.cancel()
+                    self._events.emit(
+                        name, "after_turn_abandoned", turn_id=turn["id"],
+                        grace_s=AFTER_TURN_GRACE_S,
+                    )
+                else:
+                    with suppress(asyncio.CancelledError, Exception):
+                        after.exception()
+                raise
 
     async def _run_turn(self, name: str, turn_id: int) -> None:
         worker = await self._reg.get_worker(name)
@@ -1113,7 +1163,11 @@ class Engine:
             watchdog = asyncio.create_task(
                 self._verify_transcript_persisted(
                     name, worker["repo"], outcome.session_id, turn_id
-                )
+                ),
+                # ECA-148 review round: named, because `stop_incomplete.abandoned`
+                # exists to say WHAT was abandoned and an unnamed task reports as
+                # "Task-23" — useless in the one event whose whole job is naming.
+                name=f"transcript-watchdog-{name}-turn{turn_id}",
             )
             self._watchdogs.add(watchdog)
             watchdog.add_done_callback(self._watchdogs.discard)

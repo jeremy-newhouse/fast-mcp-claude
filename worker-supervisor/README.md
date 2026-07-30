@@ -135,18 +135,29 @@ Safe, and it no longer needs a `workers status` busy-lane check first. Until
 ECA-148 a restart with a turn in flight was a genuine trap: `Engine.stop()` never
 returned (the runner swallowed its own cancellation), so the daemon logged
 `shutting down` and then sat there — **measured at >60s after SIGTERM, with the
-CLI subprocess already reaped**. It is now ~7s, `rc=0`; the 7s is the SDK's own
-bounded transport teardown (stdin close → SIGTERM → SIGKILL), not a wait on us.
+CLI subprocess already reaped**. It is now ~6-7s to `rc=0`, with the CLI child gone
+afterwards (measured on mini2, 2026-07-29: 7.09s and 6.37s).
+
+Where those ~6-7s go is NOT established. The obvious guess — the SDK's
+terminate/kill escalation — is contradicted by the SDK's own source:
+`SubprocessCLITransport.close()` documents that its anyio shield "only defers
+cancellation that *originates from an anyio cancel scope*", and that a raw
+`task.cancel()` like ours is still delivered inside it, so "the escalation below
+would be skipped". The likelier path is simply stdin EOF: the CLI in stream-json
+mode exits on it. Recorded as an open question rather than a mechanism, because
+the number is measured and the explanation is not.
 
 Two consequences worth knowing:
 
 - **pm2 SIGKILLs before that finishes.** `kill_timeout` is unset on this app, so
-  pm2's 1600ms default applies and the tree is killed at 1.6s. Nothing is lost —
-  `treekill` reaps the CLI child, and `boot_reconcile` resets `claimed`/`running`
-  turns to `queued` (`redeliveries + 1`) on the next boot — but the graceful path
-  does not complete under pm2 today. Raise `kill_timeout` to ~15000 if you want
-  it to (ECA-149).
-- **The interrupted turn is redelivered, not lost.** It stays `running` on
-  purpose and `boot_reconcile` requeues it, the same at-least-once contract a
-  crash has. `workers events` records it as `turn_interrupted` so the gap is
-  explained rather than mysterious.
+  pm2's 1600ms default applies and the tree is killed at 1.6s. Little is lost —
+  `treekill` is enabled, and `boot_reconcile` resets `claimed`/`running` turns to
+  `queued` (`redeliveries + 1`) on the next boot — but the graceful path does not
+  complete under pm2 today. Raise `kill_timeout` to ~15000 if you want it to
+  (ECA-149).
+- **A turn interrupted mid-flight is redelivered, not lost.** It stays
+  `claimed`/`running` and `boot_reconcile` requeues it, the same at-least-once
+  contract a crash has, and `workers events` records a `turn_interrupted` naming
+  the state it was left in. Note the scope: that covers a turn still in flight.
+  A turn cancelled in the tail after its result was already committed is simply
+  `done`, and emits nothing — there is nothing to redeliver.

@@ -112,6 +112,7 @@ async def _seed_finished_turn(registry, worker: str, session_id: str) -> None:
     await registry.db.commit()
 
 
+@pytest.mark.timeout(240)
 async def test_a_resume_the_real_cli_refuses_rolls_the_epoch(
     cfg, registry, events, repo, monkeypatch
 ):

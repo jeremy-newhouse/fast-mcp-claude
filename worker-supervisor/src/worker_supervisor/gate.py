@@ -402,6 +402,10 @@ def _glob_matches(pattern: str, text: str) -> bool:
     return p == len(pattern)
 
 
+def _is_str_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
 DEFAULT_ALLOWED_TOOLS = [
     "Read",
     "Write",
@@ -463,13 +467,55 @@ class WorkerPolicy:
     @classmethod
     def from_json(cls, raw: str) -> "WorkerPolicy":
         data = json.loads(raw or "{}")
-        return cls(
+        return cls.coerced(
             allowed_tools=data.get("allowed_tools", list(DEFAULT_ALLOWED_TOOLS)),
             allow_env=data.get("allow_env", []),
             guard_hooks=data.get("guard_hooks", {}),
             model=data.get("model"),
             limits=data.get("limits", {}),
             mcp_servers=data.get("mcp_servers", {}),
+        )
+
+    @classmethod
+    def coerced(
+        cls,
+        *,
+        allowed_tools: Any,
+        allow_env: Any,
+        guard_hooks: Any,
+        model: Any,
+        limits: Any,
+        mcp_servers: Any,
+    ) -> "WorkerPolicy":
+        """Build a WorkerPolicy from already-defaulted but still-untyped control-socket
+        JSON (ECA-141). The two entry points where untrusted JSON becomes a WorkerPolicy
+        -- this and `server._dispatch`'s spawn branch -- both route through here so a
+        wrong-shaped field falls back to the SAME default a MISSING field already gets,
+        rather than surviving as e.g. a list or a string and raising deep inside a turn
+        (`base_tools()`, `Limits.override`, `validate_allow_env`, `mcp_servers.keys()`
+        all assume the container types below and none of them are guarded).
+
+        Deliberately NOT a `__post_init__` on the dataclass itself: several tests
+        construct `WorkerPolicy(...)` directly with a duck-typed-but-misbehaving
+        `guard_hooks` (e.g. an object with a `.get` that raises) to exercise defense
+        further downstream in `on_pre_tool_use`. Coercing at the bare constructor would
+        silently neuter that. This only guards the untrusted-JSON boundary.
+
+        `guard_hooks` is included for defense in depth even though its one read site
+        (`on_pre_tool_use`) already tolerates a non-dict via `_is_mapping` (ECA-142) and
+        skips-and-records rather than raising -- that stopgap is unchanged. The other
+        four fields have no such tolerance at their read sites, so this is their only
+        guard; a malformed value there is coerced silently, with no separate event, for
+        the same reason a MISSING value needs none: the fallback is exactly what an
+        absent key already produces.
+        """
+        return cls(
+            allowed_tools=allowed_tools if _is_str_list(allowed_tools) else list(DEFAULT_ALLOWED_TOOLS),
+            allow_env=allow_env if _is_str_list(allow_env) else [],
+            guard_hooks=guard_hooks if isinstance(guard_hooks, dict) else {},
+            model=model,
+            limits=limits if isinstance(limits, dict) else {},
+            mcp_servers=mcp_servers if isinstance(mcp_servers, dict) else {},
         )
 
     def to_json(self) -> str:

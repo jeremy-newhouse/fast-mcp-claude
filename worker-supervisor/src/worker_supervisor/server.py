@@ -121,7 +121,7 @@ class ControlServer:
             return {"version": __version__}
         if verb == "spawn":
             defaults = WorkerPolicy()
-            policy = WorkerPolicy(
+            policy = WorkerPolicy.coerced(
                 allowed_tools=args.get("allowed_tools") or defaults.allowed_tools,
                 allow_env=args.get("allow_env", []),
                 guard_hooks=args.get("guard_hooks", {}),

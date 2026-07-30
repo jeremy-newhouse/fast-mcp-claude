@@ -2318,3 +2318,45 @@ async def test_the_transcript_watchdog_is_named(make_engine, registry, repo, mon
     release.set()
 
     assert names == [f"transcript-watchdog-w1-turn{tid}"], names
+
+
+# --- ECA-141: the other pass-through fields, wedge class closed at reload -------
+
+
+async def test_a_persisted_row_with_every_pass_through_field_malformed_still_completes(
+    make_engine, registry, repo
+):
+    """The wedge ECA-141 was filed for, driven end to end: a policy row with every
+    uncoerced pass-through field wrong-shaped, exactly as a control-socket caller (or
+    a row surviving from before this fix) could persist it.
+
+    Pre-fix, `Engine._run_turn` crashed synchronously and unguarded while building
+    `options_snapshot` — `policy.base_tools()` (allowed_tools), then
+    `self._cfg.limits.override(policy.limits)`, then `policy.mcp_servers.keys()` —
+    all BEFORE the attempt-loop's own try/except exists. `_worker_loop` only catches
+    `asyncio.CancelledError` around the turn task, so any of those escaped silently:
+    no `turn_retry` event, no `_fail_turn`, the turn stuck `claimed` and the worker
+    stuck `running` forever. `allow_env`'s crash (`validate_allow_env`, not iterable)
+    is the same class, slightly later, inside `ClaudeAgentOptions` construction.
+
+    Bypasses `Engine.spawn` on purpose (`registry.spawn_worker` directly), the same
+    way a row from before this fix — or written by any future caller that skips
+    `WorkerPolicy.coerced()` — would reach `from_json` on reload. The claim under
+    test is that `from_json` alone is sufficient: the turn must reach `done`, not
+    merely avoid raising into an unrelated failure path.
+    """
+    hostile_policy = {
+        "allowed_tools": None,
+        "allow_env": 42,
+        "guard_hooks": [],
+        "limits": "not-a-dict",
+        "mcp_servers": [1, 2, 3],
+    }
+    await registry.spawn_worker("w1", str(repo), hostile_policy)  # bypasses Engine.spawn
+
+    engine, calls = make_engine([[r("s1")]])
+    engine._ensure_runner("w1")
+    turn = await terminal_turn(registry, await engine.prompt("w1", "go"))
+
+    assert turn["state"] == "done", turn
+    assert len(calls) == 1, "the malformed row must not have killed the runner loop pre-turn"

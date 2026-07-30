@@ -13,15 +13,17 @@ exactly why supervisor lanes have had no working MCP access until now).
 Sources (never printed):
   - MCP_API_KEY (jira + confluence, localhost)     <- ~/repos/fast-mcp-claude/.env
   - langfuse Authorization (Basic pk/sk, AWS dev)  <- ~/.claude.json project scope
-  - greptile Authorization (Bearer API key)        <- ~/.worker-supervisor/secrets/greptile.token
 
 Servers granted (ECA-100 AC#2, feasible set):
-  jira, confluence (localhost, one bearer), langfuse (AWS-dev http, Basic), greptile
-  (api.greptile.com http, Bearer — operator key, NOT the built-in plugin), context7 (stdio npx).
+  jira, confluence (localhost, one bearer), langfuse (AWS-dev http, Basic), context7 (stdio npx).
 Deferred (documented): playwright (flaky npx stdio + unused by any evolv-ultra skill —
   browser-test is Bash/CLI-driven; disabled per operator 2026-07-11); fast-mcp-claude-channel
   (per-session sidecar, not attachable to a supervisor lane); teams direct-send (lanes report
   to ultra0, the Teams bridge).
+Dropped: greptile (api.greptile.com) — operator key permanently dead (initialize/tools-list
+  return 200 but every real data call 401s "Invalid API key"; no fresher key exists anywhere
+  on mbpm2 — see ECA-100 AC#3 notes). `gh api` already covers greptile's role in /pr-review
+  (see ECA-100's 2026-07-11 acceptance run), so dropping it is not a capability loss.
 """
 
 from __future__ import annotations
@@ -36,7 +38,6 @@ from urllib.parse import urlsplit, urlunsplit
 HOME = os.path.expanduser("~")
 FMC_ENV = os.path.join(HOME, "repos/fast-mcp-claude/.env")
 CLAUDE_JSON = os.path.join(HOME, ".claude.json")
-GREPTILE_TOKEN_FILE = os.path.join(HOME, ".worker-supervisor/secrets/greptile.token")
 OUT_DIR = os.path.join(HOME, ".worker-supervisor/mcp-configs")
 OUT = os.path.join(OUT_DIR, "evolv-ultra.json")
 
@@ -104,21 +105,6 @@ def main() -> int:
         if langfuse.get("url"):
             langfuse["url"] = collapse_path_slashes(langfuse["url"])
         servers["langfuse"] = langfuse
-
-    # greptile: use the operator-provided API key (0600 secrets file), NOT the
-    # built-in greptile plugin (its OAuth expired). Direct api.greptile.com MCP.
-    if os.path.exists(GREPTILE_TOKEN_FILE):
-        with open(GREPTILE_TOKEN_FILE, encoding="utf-8") as f:
-            gkey = f.read().strip()
-        servers["greptile"] = {
-            "type": "http",
-            "url": "https://api.greptile.com/mcp",
-            "headers": {"Authorization": f"Bearer {gkey}"},
-        }
-    else:
-        warnings.append(
-            f"greptile: {GREPTILE_TOKEN_FILE} missing — omitted (write the API key there, 0600)"
-        )
 
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(OUT, "w", encoding="utf-8") as f:

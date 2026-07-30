@@ -30,8 +30,9 @@
 # supervisor lane can attach to; teams (:8326) direct-send is omitted on purpose — lanes report
 # to ultra0 (the Teams/channel bridge) via the supervisor.
 #
-# greptile uses the operator API key at ~/.worker-supervisor/secrets/greptile.token (0600),
-# NOT the built-in greptile plugin (its OAuth expired).
+# DROPPED (see ECA-100): greptile — the operator API key is permanently dead (initialize/
+# tools-list return 200 but every real data call 401s); /pr-review already covers greptile's
+# role via `gh api` (proven live 2026-07-11), so this is not a capability loss.
 #
 # bash 3.2 (macOS default) — NO associative arrays (ECA-97). case + indexed args only.
 set -euo pipefail
@@ -46,7 +47,7 @@ BUDGET=1000000
 # Budget is uncapped (ECA-99), so max-turns + wall-clock + context_pct are the backstops.
 MAX_TURNS=150
 WALL_CLOCK=3600
-TOOLS="Read,Write,Edit,Glob,Grep,Bash,Skill,Task,mcp__jira__*,mcp__confluence__*,mcp__langfuse__*,mcp__greptile__*,mcp__context7__*"
+TOOLS="Read,Write,Edit,Glob,Grep,Bash,Skill,Task,mcp__jira__*,mcp__confluence__*,mcp__langfuse__*,mcp__context7__*"
 
 ALL_LANES="ultra1 ultra2 ultra3 ultra4 ultra5 ultra6"
 LANES="${*:-$ALL_LANES}"

@@ -967,12 +967,14 @@ def make_policy_hook(
     a lane granted `Bash(echo*)` read its canary file, `can_use_tool` was never
     consulted, and no `tool_denied` was written. Hence the blanket `except` below.
 
-    `hook_calls` (ECA-145) is a single-element mutable counter the caller owns and
-    reads back after the turn: this closure's only obligation to it is to bump
-    element 0 on every invocation, unconditionally, before anything here can raise
-    or short-circuit — the counter's whole purpose is proving the hook was called
-    AT ALL, which a value read only after a successful return could not do. `None`
-    (every existing direct-call test) means "don't count", not "count wrong".
+    `hook_calls` (ECA-145) is a 2-element mutable counter the caller owns and reads
+    back after the turn: element 0 is bumped on every invocation, unconditionally,
+    before anything here can raise or short-circuit — the counter's whole purpose
+    is proving the hook was called AT ALL, which a value read only after a
+    successful return could not do. Element 1 is bumped only in the
+    AskUserQuestion branch below; see the comment there for why the caller cannot
+    just subtract AskUserQuestion tool uses on its own. `None` (every existing
+    direct-call test) means "don't count", not "count wrong".
     """
 
     def _record(reason: str) -> None:
@@ -1003,6 +1005,19 @@ def make_policy_hook(
             tool_input = data.get("tool_input") or {}
             tool_name_seen[0] = tool_name
             if tool_name == "AskUserQuestion":
+                # ECA-145 review round: `matcher=None` dispatches this hook for an
+                # AskUserQuestion call too (measured: the CLI's all-SDK-callback
+                # PreToolUse path awaits every registered hook regardless of tool
+                # name), so element 1 has to be bumped HERE, not left for the
+                # caller to infer from `outcome.tools`. Getting this wrong is not
+                # cosmetic: a flat "total dispatches >= required" comparison at the
+                # caller would let each AskUserQuestion call in a turn absorb one
+                # un-dispatched call to a DIFFERENT tool for free — two questions
+                # would silently forgive two unpoliced Bash calls. See
+                # `Engine._check_policy_hook_gap`, which subtracts this count
+                # rather than assuming AskUserQuestion accounts for itself.
+                if hook_calls is not None:
+                    hook_calls[1] += 1
                 return {}
 
             reason = _ceiling_or_cwd_denial(repo_root, policy, tool_name, tool_input)

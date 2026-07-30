@@ -865,11 +865,11 @@ class Engine:
                 turn_id=turn_id,
                 question_timeout_s=self._cfg.question_timeout_s,
             )
-            # ECA-145: counts every PreToolUse dispatch of the policy hook this
-            # attempt, so it can be compared against outcome.tools at turn end —
-            # see Engine._check_policy_hook_gap. Reset every attempt, same as
+            # ECA-145: [total dispatches, AskUserQuestion-classified dispatches] —
+            # compared against outcome.tools at turn end by
+            # Engine._check_policy_hook_gap. Reset every attempt, same as
             # `outcome` below: a retried attempt gets its own fresh count.
-            hook_calls = [0]
+            hook_calls = [0, 0]
             options = ClaudeAgentOptions(
                 cwd=worker["repo"],
                 resume=resume_from,
@@ -1007,7 +1007,6 @@ class Engine:
                     [resume_from], outcome=outcome,
                 )
                 self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
-                self._check_policy_hook_gap(name, turn_id, outcome, hook_calls[0])
                 await self._reg.set_worker_status(name, "idle", active=True)
                 return
             except asyncio.CancelledError:
@@ -1043,7 +1042,6 @@ class Engine:
                         no_retry="the previous epoch already ended in resume_failed and"
                         " nothing has resumed successfully since — an operator has to"
                         " look at the session store",
-                        hook_calls=hook_calls[0],
                     )
                     return
                 if dead_chain:
@@ -1082,7 +1080,6 @@ class Engine:
                         outcome=outcome,
                     )
                     self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
-                    self._check_policy_hook_gap(name, turn_id, outcome, hook_calls[0])
                     await self._reg.roll_epoch(name, "resume_failed")
                     await self._reg.enqueue_turn(
                         name, restore_prompt(worker["repo"]), kind="restore"
@@ -1106,7 +1103,6 @@ class Engine:
                     # came back 429 carried both a turn_retry row and a "not retried"
                     # reason, which is a lie in exactly the case the field exists for.
                     no_retry=no_retry if attempt == 1 else None,
-                    hook_calls=hook_calls[0],
                 )
                 return
 
@@ -1137,7 +1133,6 @@ class Engine:
                 outcome=outcome,
             )
             self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
-            self._check_policy_hook_gap(name, turn_id, outcome, hook_calls[0])
             await self._reg.set_worker_status(name, "idle", active=True)
             return
 
@@ -1145,7 +1140,6 @@ class Engine:
             await self._fail_turn(
                 name, turn_id, outcome, "stream ended without a ResultMessage",
                 options_snapshot, stderr_tail, resume_from, policy,
-                hook_calls=hook_calls[0],
             )
             return
 
@@ -1171,7 +1165,21 @@ class Engine:
             **_status_field(outcome),  # ECA-143: state="error" without an exception
         )
         self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
-        self._check_policy_hook_gap(name, turn_id, outcome, hook_calls[0])
+        # ECA-145 review round: checked ONLY here, not on every terminal branch
+        # `_emit_mcp_diagnostics` also covers. A turn that timed out, died mid-
+        # stream, or hit a question timeout may have STREAMED an assistant
+        # message with several queued tool uses before the interruption reached
+        # it — `_observe` records every `ToolUseBlock` the instant the message
+        # arrives, but the CLI dispatches this hook to each tool right before
+        # THAT tool executes, one at a time. A turn cut short between "message
+        # observed" and "every queued tool actually ran" would show a "gap" that
+        # is really just "didn't get there yet", not a dispatch regression. Only
+        # a stream that reached its own natural end (this branch — `done` or a
+        # reported `error`, either way the CLI finished processing everything it
+        # queued) can tell the two apart. Detection is deferred, not lost: the
+        # threat model (ECA-145) is a persistent SDK/CLI regression, which shows
+        # up on the many turns that DO complete normally, not a one-off.
+        self._check_policy_hook_gap(name, turn_id, outcome, (hook_calls[0], hook_calls[1]))
         if outcome.session_id:
             watchdog = asyncio.create_task(
                 self._verify_transcript_persisted(
@@ -1280,7 +1288,6 @@ class Engine:
         resume_from: str | None,
         policy: WorkerPolicy,
         no_retry: str | None = None,
-        hook_calls: int = 0,
     ) -> None:
         """Terminal error after the retry: record, capsule, keep the epoch
         (keep-on-failure, Amendment A6) — the orchestrator decides what's next.
@@ -1297,11 +1304,11 @@ class Engine:
         `result_text: null`. A failure path must persist at least as much as the
         success path, not less.
 
-        `hook_calls` (ECA-145) defaults to 0: the one caller that fails a turn
-        before the attempt loop starts (an mcp config write failure) hands this an
-        `outcome` with no tools recorded either, so `required` in
-        `_check_policy_hook_gap` is trivially 0 and the default is correct, not a
-        placeholder.
+        No `Engine._check_policy_hook_gap` call here (ECA-145 review round): every
+        caller of this method is, by definition, an interrupted or abnormal
+        termination, which is exactly where that check cannot tell "a queued tool
+        never got its turn to be dispatched" apart from a real dispatch regression
+        — see the comment at this engine's one call site for the full reasoning.
         """
         await self._reg.finish_turn(
             turn_id, "error",
@@ -1325,7 +1332,6 @@ class Engine:
             [resume_from, outcome.session_id], outcome=outcome,
         )
         self._emit_mcp_diagnostics(name, turn_id, policy, outcome.mcp_init, stderr_tail)
-        self._check_policy_hook_gap(name, turn_id, outcome, hook_calls)
         await self._reg.set_worker_status(name, "idle", active=True)
 
     def _emit_mcp_diagnostics(
@@ -1352,7 +1358,7 @@ class Engine:
         )
 
     def _check_policy_hook_gap(
-        self, name: str, turn_id: int, outcome: TurnOutcome, hook_calls: int
+        self, name: str, turn_id: int, outcome: TurnOutcome, hook_calls: tuple[int, int]
     ) -> None:
         """ECA-145: detect the PreToolUse policy hook silently ceasing to fire.
 
@@ -1366,14 +1372,18 @@ class Engine:
         directly, which is the call the product was failing to make (see
         test_live_gate.py's own rationale, and ECA-137/139/142 before it).
 
-        Every observed `ToolUseBlock` should have a matching hook dispatch — the
-        hook is registered with `matcher=None`, which fires for every tool call,
-        including AskUserQuestion (which then no-ops inside it — see
-        `make_policy_hook`). AskUserQuestion is excluded from `required` anyway,
-        as slack rather than as something proven either way: it has its own
-        dedicated escalation bridge, and being lenient about it costs nothing
-        while avoiding a false positive if some future CLI build special-cases it
-        ahead of the hook layer.
+        `hook_calls` is `(total dispatches, dispatches classified as
+        AskUserQuestion)`. Every observed `ToolUseBlock` should have a matching
+        dispatch — the hook is registered with `matcher=None`, which fires for
+        every tool call, including AskUserQuestion (which then no-ops inside it —
+        see `make_policy_hook`). AskUserQuestion tool uses are excluded from
+        `required` below because that tool has its own dedicated escalation
+        bridge, but a naive `total >= required_excluding_askq` comparison would be
+        WRONG (review round finding): each AskUserQuestion dispatch would silently
+        forgive one un-dispatched call to a completely different tool, since both
+        just increment the same total. Subtracting the classified count first —
+        `total - askq_calls` — compares dispatches for the tools this check
+        actually cares about against `required`, one for one.
 
         AC#3's decision, made explicitly here because this is the one place that
         acts on it: WARN, do not fail the turn. The unpoliced call has already
@@ -1387,12 +1397,28 @@ class Engine:
         something already fired and stopped a call — is what actually gets this
         looked at; the same reasoning ECA-141's `guard:skipped` record already
         applied to the narrower malformed-`guard_hooks` case.
+
+        Disclosed residual (review round): the CLI rejects a schema-invalid
+        `tool_input` (a Zod `safeParse`/`validateInput` failure) before this hook
+        is ever dispatched for that call, and the `ToolUseBlock` is still counted
+        in `outcome.tools` — a genuinely malformed tool call from the model, on an
+        otherwise normal turn, can therefore read as a gap with nothing actually
+        wrong. Distinguishing "never dispatched because rejected pre-hook" from
+        "never dispatched because the SDK/CLI stopped calling this hook" is not
+        possible from this daemon's side without depending on undocumented CLI
+        internals — exactly what this codebase otherwise refuses to do (see
+        `_split_command_segments`'s own docstring). WARN-only makes this a cheap
+        false alarm rather than a wrongly-failed turn: an operator who checks a
+        `policy_hook_gap` against a `done` turn with no other symptom can dismiss
+        it as this residual rather than a real regression.
         """
+        total, askq_calls = hook_calls
         required = sum(1 for t in outcome.tools if t != "AskUserQuestion")
-        if hook_calls < required:
+        non_askq_calls = total - askq_calls
+        if non_askq_calls < required:
             self._events.emit(
                 name, "policy_hook_gap", turn_id=turn_id,
-                tool_uses=required, hook_invocations=hook_calls,
+                tool_uses=required, hook_invocations=non_askq_calls,
             )
 
     async def _validate_worker_name(self, name: str) -> None:

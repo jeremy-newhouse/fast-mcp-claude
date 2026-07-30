@@ -13,7 +13,7 @@ This is deployment config, not supervisor code — it lives here only because mb
 | Budget | uncapped (`--budget 1000000`; daemon `SUPERVISOR_MAX_BUDGET_USD_PER_EPOCH` also high) — `context_pct` is the only binding cycle constraint (subscription billing; ECA-99 #5) |
 | Limits | `--max-turns 150 --wall-clock 3600` (pr-review ran 70 SDK turns / ~10 min live; these are now the runaway backstops since budget is uncapped) |
 | cwd | `~/worker-repos/<lane>/evolv-ultra` (repo root → project `/pr-review` skill loads; be/fe siblings at `../`) |
-| Tools | `Read,Write,Edit,Glob,Grep,Bash,Skill,Task` + MCP `jira, confluence, langfuse, greptile, context7` (`Task` = pr-review's subagent fan-out) |
+| Tools | `Read,Write,Edit,Glob,Grep,Bash,Skill,Task` + MCP `jira, confluence, langfuse, context7` (`Task` = pr-review's subagent fan-out) |
 | MCP creds | materialised at runtime into `~/.worker-supervisor/mcp-configs/evolv-ultra.json` (0600, **not committed**); each server's creds in its own headers block — worker process env stays scrubbed (envbuild A3) |
 | MCP creds — exposure | **A3 is about env inheritance only; it is not containment.** These lanes grant bare `Bash`, and a lane runs as the same uid as the daemon, so any granted lane can read these credentials, and so can any UN-granted lane on the same box — from the daemon's per-turn config file and, durably, from `state.db`. ECA-135 took them out of the CLI's argv, which is what a stray `ps aux` used to scoop up by accident; ECA-136 then took the whole supervisor home to 0700/0600 (swept at boot), turned on `secure_delete`, reclaimed pages freed before it, and made `workers remove` checkpoint the WAL — without that last part a revoked grant stayed `grep`-able out of `state.db-wal` for the daemon's whole uptime, because `secure_delete` only zeroes the *new* page image. **Both require a `pm2 restart worker-supervisor`**: every one of those changes lives inside the daemon, so a `git pull` alone changes nothing on disk. Neither built a lane-to-lane boundary and there is none — every lane is this uid. Grant a server to a lane only if you would hand that lane the credential directly. **Backups are outside all of that:** on mbpm2 `~/.worker-supervisor` is `[Included]` in an active Time Machine destination, so cleartext policies for grants already made persist in existing snapshots regardless. |
 
@@ -42,8 +42,6 @@ and copying `evolv-ultra-be/.env` from an existing lane before running the scrip
 - `MCP_API_KEY` in `~/repos/fast-mcp-claude/.env` (jira/confluence localhost bearer).
 - `langfuse` server def in a `~/.claude.json` project scope (Basic pk/sk auth; the AWS-dev
   hosted MCP — wake the dev env if it 503s).
-- `~/.worker-supervisor/secrets/greptile.token` (0600) — the greptile **API key** (Bearer).
-  This is the operator-provided key, NOT the built-in greptile plugin (its OAuth expired).
 
 ## Deferred / out of scope
 
@@ -55,3 +53,7 @@ and copying `evolv-ultra-be/.env` from an existing lane before running the scrip
   identity — not a standalone server a supervisor lane can point at. Lanes report to **ultra0**
   (the Teams/channel orchestrator) via the supervisor, so they don't need it.
 - **teams** (`:8326`) direct-send: intentionally omitted (least-privilege; ultra0 is the bridge).
+- **greptile** (ECA-100): DROPPED, not just deferred. The operator API key is permanently
+  dead — `initialize`/`tools-list` return HTTP 200 but every real data call 401s "Invalid
+  API key", and no fresher key exists anywhere on mbpm2. Not a capability loss: pr-review's
+  2026-07-11 acceptance run already proved it covers greptile's role via `gh api` instead.

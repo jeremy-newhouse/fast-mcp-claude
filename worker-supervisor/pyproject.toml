@@ -14,6 +14,7 @@ dependencies = [
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
     "ruff>=0.6",
 ]
 
@@ -31,6 +32,12 @@ packages = ["src/worker_supervisor"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# ECA-146 AC#2: a hang must never read as a pass. The default suite runs in
+# under 10s and every scripted test is bounded by its own wall_clock_s (<=5s in
+# the shared `cfg` fixture), so 30s is generous slack, not a tight fit — a test
+# that needs longer (a real CLI turn) marks itself with
+# @pytest.mark.timeout(N) rather than raising this default for everyone.
+timeout = 30
 
 [tool.ruff]
 line-length = 100

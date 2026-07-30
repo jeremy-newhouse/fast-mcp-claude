@@ -29,10 +29,11 @@ def _gate(repo, policy, bridge, events, timeout=1.0, turn_id=1):
     )
 
 
-def _policy_hook(repo, policy, events, turn_id=1):
+def _policy_hook(repo, policy, events, turn_id=1, hook_calls=None):
     """The PreToolUse hook — the total policy point since ECA-142."""
     return make_policy_hook(
-        worker="w1", repo_root=repo, policy=policy, events=events, turn_id=turn_id
+        worker="w1", repo_root=repo, policy=policy, events=events, turn_id=turn_id,
+        hook_calls=hook_calls,
     )
 
 
@@ -521,6 +522,45 @@ async def test_pretooluse_hook_fails_CLOSED_when_its_own_body_raises(registry, e
     assert "policy hook failed" in spec["permissionDecisionReason"]
     assert "RuntimeError" in spec["permissionDecisionReason"]
     assert any("policy hook failed" in e.get("reason", "") for e in events.read("w1"))
+
+
+# --- ECA-145: the hook_calls counter, plumbed into Engine._check_policy_hook_gap ---
+
+
+async def test_hook_calls_counter_increments_on_allow_deny_and_ask_user_question(
+    registry, events, repo
+):
+    """The counter's whole point is proving the hook was DISPATCHED, independent of
+    what it decided — so every shape of call must bump it, including the
+    AskUserQuestion no-op (matcher=None fires for it too; see `make_policy_hook`)."""
+    policy = WorkerPolicy(allowed_tools=["Bash(echo*)"])
+    hook_calls = [0]
+    hook = _policy_hook(repo, policy, events, hook_calls=hook_calls)
+
+    await hook({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, None, None)  # allow
+    assert hook_calls[0] == 1
+    await hook({"tool_name": "Bash", "tool_input": {"command": "ls -a"}}, None, None)  # deny
+    assert hook_calls[0] == 2
+    await hook({"tool_name": "AskUserQuestion", "tool_input": {}}, None, None)  # no-op
+    assert hook_calls[0] == 3
+
+
+async def test_hook_calls_counter_increments_even_when_the_hook_raises(registry, events, repo):
+    """The counter must be bumped BEFORE anything that can raise or short-circuit —
+    a call that reaches the hook and then fails inside it was still DISPATCHED, which
+    is the only fact this counter exists to record (see `_check_policy_hook_gap`:
+    comparing invocations to tool uses must not undercount a hook that fired and then
+    errored, only a hook that never fired at all)."""
+
+    class Exploding:
+        def get(self, _key):
+            raise RuntimeError("boom")
+
+    policy = WorkerPolicy(allowed_tools=["Bash"], guard_hooks=Exploding())  # type: ignore[arg-type]
+    hook_calls = [0]
+    hook = _policy_hook(repo, policy, events, hook_calls=hook_calls)
+    await hook({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, None, None)
+    assert hook_calls[0] == 1
 
 
 async def test_a_broken_event_log_still_denies(registry, events, repo, cfg, monkeypatch):

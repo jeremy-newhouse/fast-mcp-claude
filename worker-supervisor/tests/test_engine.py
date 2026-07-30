@@ -1223,6 +1223,49 @@ async def test_turn_mcp_diagnostics_absent_without_mcp_grant(make_engine, regist
     assert not any(e["event"] == "turn_mcp_diagnostics" for e in events.read("w1"))
 
 
+# --- ECA-145: Engine._check_policy_hook_gap, exercised through a real _run_turn --
+#
+# `make_engine`'s fake `query` never dispatches a hook at all (it just yields a
+# scripted message list), so `hook_calls` stays 0 for every one of these turns
+# regardless of what tools were "used". That is why every test below either
+# scripts zero non-AskUserQuestion tool uses, or deliberately asserts the event
+# it causes — this file cannot prove a real turn's hook actually fires (that
+# needs a real CLI dispatching a real hook), only that the wiring and arithmetic
+# in Engine._run_turn / _check_policy_hook_gap are correct. The REAL proof that a
+# suppressed hook is caught end to end is
+# test_live_gate.py::test_a_suppressed_policy_hook_is_detected_in_a_real_turn.
+
+
+async def test_policy_hook_gap_fires_when_a_tool_ran_with_no_hook_dispatch(
+    make_engine, registry, repo, events
+):
+    """A scripted tool use with zero matching hook dispatch IS a gap — this is the
+    fake harness's own blind spot (see module note above) standing in for the real
+    regression: the arithmetic must still catch it and the turn must still finish
+    normally (WARN, not FAIL — AC#3)."""
+    engine, calls = make_engine([[a("Bash"), r("s1")]])
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "do the thing")
+    turn = await terminal_turn(registry, tid)
+    assert turn["state"] == "done", "a detected gap must not fail the turn"
+
+    gaps = [e for e in events.read("w1") if e["event"] == "policy_hook_gap"]
+    assert len(gaps) == 1
+    assert gaps[0]["tool_uses"] == 1
+    assert gaps[0]["hook_invocations"] == 0
+
+
+async def test_policy_hook_gap_excludes_ask_user_question(make_engine, registry, repo, events):
+    """AskUserQuestion is deliberately excluded from `required` — its own bridge
+    owns it, so a turn that only ever used it must not read as a policy-hook gap
+    even though (like every fake-query test) hook_calls is 0."""
+    engine, calls = make_engine([[a("AskUserQuestion"), r("s1")]])
+    await engine.spawn("w1", str(repo))
+    tid = await engine.prompt("w1", "do the thing")
+    await terminal_turn(registry, tid)
+    assert not any(e["event"] == "policy_hook_gap" for e in events.read("w1"))
+
+
 async def test_mcp_startup_grace_delays_prompt_only_when_servers_granted(
     cfg, registry, events, monkeypatch, repo
 ):

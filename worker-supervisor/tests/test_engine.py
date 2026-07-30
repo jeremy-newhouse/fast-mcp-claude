@@ -1226,14 +1226,19 @@ async def test_turn_mcp_diagnostics_absent_without_mcp_grant(make_engine, regist
 # --- ECA-145: Engine._check_policy_hook_gap, exercised through a real _run_turn --
 #
 # `make_engine`'s fake `query` never dispatches a hook at all (it just yields a
-# scripted message list), so `hook_calls` stays 0 for every one of these turns
-# regardless of what tools were "used". That is why every test below either
-# scripts zero non-AskUserQuestion tool uses, or deliberately asserts the event
-# it causes — this file cannot prove a real turn's hook actually fires (that
-# needs a real CLI dispatching a real hook), only that the wiring and arithmetic
-# in Engine._run_turn / _check_policy_hook_gap are correct. The REAL proof that a
-# suppressed hook is caught end to end is
+# scripted message list), so `hook_calls` stays (0, 0) for every one of these
+# turns regardless of what tools were "used". That is why the two turn-level
+# tests below either script zero non-AskUserQuestion tool uses, or deliberately
+# assert the event it causes — this file cannot prove a real turn's hook
+# actually fires (that needs a real CLI dispatching a real hook), only that the
+# wiring in Engine._run_turn is correct. The REAL proof that a suppressed hook
+# is caught end to end is
 # test_live_gate.py::test_a_suppressed_policy_hook_is_detected_in_a_real_turn.
+#
+# The arithmetic itself — specifically, that an AskUserQuestion dispatch cannot
+# mask a gap in a DIFFERENT tool's dispatch, which the fake-query turns above
+# cannot exercise since they can't produce a controlled (total, askq) split —
+# is tested directly below.
 
 
 async def test_policy_hook_gap_fires_when_a_tool_ran_with_no_hook_dispatch(
@@ -1264,6 +1269,37 @@ async def test_policy_hook_gap_excludes_ask_user_question(make_engine, registry,
     tid = await engine.prompt("w1", "do the thing")
     await terminal_turn(registry, tid)
     assert not any(e["event"] == "policy_hook_gap" for e in events.read("w1"))
+
+
+async def test_policy_hook_gap_an_ask_user_question_dispatch_cannot_mask_a_bash_gap(
+    cfg, registry, events
+):
+    """Review-round regression test: a flat `total dispatches >= required` compare
+    (the first cut of this check) let each AskUserQuestion dispatch forgive one
+    un-dispatched call to a DIFFERENT tool, since both simply incremented the same
+    counter. A turn that asked one question (hook fired once, correctly) and ran
+    one Bash command with the hook suppressed must still be flagged — `hook_calls`
+    of `(1, 1)` (one total dispatch, and it WAS the AskUserQuestion one) leaves
+    zero real coverage for the Bash call.
+
+    Calls `_check_policy_hook_gap` directly because `make_engine`'s fake `query`
+    cannot produce a controlled split between "total" and "AskUserQuestion"
+    dispatches — see the module note above.
+    """
+    bridge = QuestionBridge(registry, events)
+    engine = Engine(cfg, registry, events, bridge)
+    outcome = TurnOutcome(tools=["AskUserQuestion", "Bash"])
+
+    engine._check_policy_hook_gap("w1", 1, outcome, (1, 1))
+    gaps = [e for e in events.read("w1") if e["event"] == "policy_hook_gap"]
+    assert gaps, "the AskUserQuestion dispatch masked the missing Bash dispatch"
+    assert gaps[0]["tool_uses"] == 1
+    assert gaps[0]["hook_invocations"] == 0
+
+    # Both tools actually covered (a different worker key, so a fresh event log):
+    # no gap.
+    engine._check_policy_hook_gap("w2", 1, outcome, (2, 1))
+    assert not any(e["event"] == "policy_hook_gap" for e in events.read("w2"))
 
 
 async def test_mcp_startup_grace_delays_prompt_only_when_servers_granted(

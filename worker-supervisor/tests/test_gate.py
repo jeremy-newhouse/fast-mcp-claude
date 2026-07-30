@@ -531,18 +531,21 @@ async def test_hook_calls_counter_increments_on_allow_deny_and_ask_user_question
     registry, events, repo
 ):
     """The counter's whole point is proving the hook was DISPATCHED, independent of
-    what it decided — so every shape of call must bump it, including the
-    AskUserQuestion no-op (matcher=None fires for it too; see `make_policy_hook`)."""
+    what it decided — so every shape of call must bump element 0, including the
+    AskUserQuestion no-op (matcher=None fires for it too; see `make_policy_hook`).
+    Element 1 must bump ONLY for the AskUserQuestion call — see
+    `Engine._check_policy_hook_gap` for why the caller needs that split rather than
+    inferring it from `outcome.tools`."""
     policy = WorkerPolicy(allowed_tools=["Bash(echo*)"])
-    hook_calls = [0]
+    hook_calls = [0, 0]
     hook = _policy_hook(repo, policy, events, hook_calls=hook_calls)
 
     await hook({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, None, None)  # allow
-    assert hook_calls[0] == 1
+    assert hook_calls == [1, 0]
     await hook({"tool_name": "Bash", "tool_input": {"command": "ls -a"}}, None, None)  # deny
-    assert hook_calls[0] == 2
+    assert hook_calls == [2, 0]
     await hook({"tool_name": "AskUserQuestion", "tool_input": {}}, None, None)  # no-op
-    assert hook_calls[0] == 3
+    assert hook_calls == [3, 1]
 
 
 async def test_hook_calls_counter_increments_even_when_the_hook_raises(registry, events, repo):
@@ -557,10 +560,10 @@ async def test_hook_calls_counter_increments_even_when_the_hook_raises(registry,
             raise RuntimeError("boom")
 
     policy = WorkerPolicy(allowed_tools=["Bash"], guard_hooks=Exploding())  # type: ignore[arg-type]
-    hook_calls = [0]
+    hook_calls = [0, 0]
     hook = _policy_hook(repo, policy, events, hook_calls=hook_calls)
     await hook({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, None, None)
-    assert hook_calls[0] == 1
+    assert hook_calls == [1, 0]
 
 
 async def test_a_broken_event_log_still_denies(registry, events, repo, cfg, monkeypatch):

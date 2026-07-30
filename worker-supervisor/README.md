@@ -149,12 +149,12 @@ the number is measured and the explanation is not.
 
 Two consequences worth knowing:
 
-- **pm2 SIGKILLs before that finishes.** `kill_timeout` is unset on this app, so
-  pm2's 1600ms default applies and the tree is killed at 1.6s. Little is lost —
-  `treekill` is enabled, and `boot_reconcile` resets `claimed`/`running` turns to
-  `queued` (`redeliveries + 1`) on the next boot — but the graceful path does not
-  complete under pm2 today. Raise `kill_timeout` to ~15000 if you want it to
-  (ECA-149).
+- **`kill_timeout` is 15000ms on this app** (`start.sh`, ECA-149) so the graceful
+  path above has room to finish under pm2 instead of hitting pm2's 1600ms default
+  SIGKILL. Before ECA-149, the tree was killed at 1.6s — little was lost even then
+  (`treekill` is enabled, and `boot_reconcile` resets `claimed`/`running` turns to
+  `queued` (`redeliveries + 1`) on the next boot), but the graceful path never got
+  to complete.
 - **A turn interrupted mid-flight is redelivered, not lost.** It stays
   `claimed`/`running` and `boot_reconcile` requeues it, the same at-least-once
   contract a crash has, and `workers events` records a `turn_interrupted` naming

@@ -12,5 +12,6 @@ pm2 start "uv run worker-supervisor" \
   --cwd "$SCRIPT_DIR" \
   --log "$SCRIPT_DIR/logs/daemon.log" \
   --time \
-  --merge-logs
+  --merge-logs \
+  --kill-timeout 15000
 pm2 save

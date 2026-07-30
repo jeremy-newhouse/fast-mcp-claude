@@ -10,6 +10,7 @@ import time
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
 from worker_supervisor.gate import (
+    DEFAULT_ALLOWED_TOOLS,
     QuestionBridge,
     WorkerPolicy,
     make_gate,
@@ -478,10 +479,13 @@ async def test_pretooluse_hook_pins_cwd_and_ignores_ask_user_question(registry, 
 async def test_pretooluse_hook_survives_a_non_dict_guard_hooks(registry, events, repo):
     """A malformed `guard_hooks` must not raise out of the hook (ECA-141's wedge class).
 
-    ECA-141 fixes the coercion at the construction site. Until then the hook must not
-    raise — but skipping a configured security control silently is its own defect, so
-    the skip is recorded. It is not a deny: the malformed value grants nothing, and
-    denying every call over a bad policy row would wedge the lane a different way.
+    ECA-141 also coerces at the construction site (`WorkerPolicy.coerced`, used by
+    `from_json` and the spawn dispatch) — but this hook stays defensive regardless,
+    since a `WorkerPolicy` built directly (as here, and by any future caller that
+    skips those two entry points) still reaches it uncoerced. Skipping a configured
+    security control silently is its own defect, so the skip is recorded. It is not
+    a deny: the malformed value grants nothing, and denying every call over a bad
+    policy row would wedge the lane a different way.
     """
     policy = WorkerPolicy(allowed_tools=["Bash"], guard_hooks=[])  # type: ignore[arg-type]
     res = await _policy_hook(repo, policy, events)(
@@ -490,6 +494,32 @@ async def test_pretooluse_hook_survives_a_non_dict_guard_hooks(registry, events,
     assert res == {}
     skips = [e for e in events.read("w1") if "guard:skipped" in e.get("reason", "")]
     assert skips, "a configured guard was skipped with no record"
+
+
+def test_from_json_coerces_a_malformed_pass_through_field():
+    """ECA-141: a persisted policy row with a wrong-shaped field must reload to the
+    SAME default a missing field already gets, not survive as the wrong type for
+    `base_tools()` / `Limits.override` / `validate_allow_env` / `mcp_servers.keys()`
+    to crash on downstream. `from_json` runs on every turn reload (`engine.py`), so
+    an uncoerced bad row would wedge every subsequent turn, including across a
+    restart — the same failure class ECA-135/137/140 established for this daemon.
+    """
+    cases = [
+        ('{"allowed_tools": null}', "allowed_tools", list(DEFAULT_ALLOWED_TOOLS)),
+        ('{"allowed_tools": "Bash"}', "allowed_tools", list(DEFAULT_ALLOWED_TOOLS)),
+        ('{"allowed_tools": [1, 2]}', "allowed_tools", list(DEFAULT_ALLOWED_TOOLS)),
+        ('{"allow_env": 5}', "allow_env", []),
+        ('{"allow_env": null}', "allow_env", []),
+        ('{"guard_hooks": []}', "guard_hooks", {}),
+        ('{"guard_hooks": "x"}', "guard_hooks", {}),
+        ('{"limits": "oops"}', "limits", {}),
+        ('{"limits": [1, 2]}', "limits", {}),
+        ('{"mcp_servers": []}', "mcp_servers", {}),
+        ('{"mcp_servers": 3}', "mcp_servers", {}),
+    ]
+    for raw, field, expected in cases:
+        policy = WorkerPolicy.from_json(raw)
+        assert getattr(policy, field) == expected, raw
 
 
 async def test_pretooluse_hook_fails_CLOSED_when_its_own_body_raises(registry, events, repo):

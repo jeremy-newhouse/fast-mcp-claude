@@ -213,6 +213,40 @@ async def test_spawn_still_stores_the_real_credentials(control, registry, repo):
 
 
 @pytest.mark.parametrize(
+    "field,malformed,safe_default",
+    [
+        ("allowed_tools", "Bash", None),  # None -> DEFAULT_ALLOWED_TOOLS, checked below
+        ("allowed_tools", [1, 2, 3], None),
+        ("allow_env", 42, []),
+        ("allow_env", "PATH", []),
+        ("guard_hooks", [], {}),
+        ("limits", "not-a-dict", {}),
+        ("limits", ["wall_clock_s", 5], {}),
+        ("mcp_servers", [1, 2, 3], {}),
+        ("mcp_servers", "jira", {}),
+    ],
+)
+async def test_spawn_coerces_a_malformed_pass_through_field(
+    control, registry, repo, field, malformed, safe_default
+):
+    """ECA-141: a control-socket spawn with a wrong-shaped pass-through field must
+    not raise, and must fall back to the same default a MISSING field already gets
+    — not merely avoid an exception while persisting the bad shape for the next
+    turn to trip over. Reads the RAW stored row rather than the dispatch response,
+    since the response redacts `mcp_servers` to a name list unconditionally (ECA-133)
+    — a transform unrelated to this coercion.
+    """
+    from worker_supervisor.gate import DEFAULT_ALLOWED_TOOLS
+
+    name = f"probe-{field}"
+    await control._dispatch("spawn", {"name": name, "repo": str(repo), field: malformed})
+    row = await registry.get_worker(name)
+    stored = json.loads(row["policy"])
+    expected = list(DEFAULT_ALLOWED_TOOLS) if safe_default is None else safe_default
+    assert stored[field] == expected
+
+
+@pytest.mark.parametrize(
     "verb",
     ["status", "events", "history", "questions", "get"],
 )

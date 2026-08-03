@@ -7,6 +7,7 @@ which blocks traversal outside allowed roots (including via symlinks).
 import os
 from typing import Annotated, Any
 
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ..errors import PermissionDeniedError, ValidationError, format_error_response
@@ -26,7 +27,8 @@ logger = get_logger(__name__)
     description=(
         "[Controller] List entries in a directory on this peer. The path must be "
         "absolute and lie under one of the server's WORKSPACE_ROOTS."
-    )
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def list_files(
     path: Annotated[str, Field(description="Absolute directory path within WORKSPACE_ROOTS")],
@@ -78,7 +80,8 @@ async def list_files(
 @mcp.tool(
     description=(
         "[Controller] Read a text file from this peer's workspace. Refuses files larger than ~10MB."
-    )
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def read_file(
     path: Annotated[str, Field(description="Absolute file path within WORKSPACE_ROOTS")],

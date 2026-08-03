@@ -10,6 +10,7 @@ in turn (this server does NOT replicate to other peers).
 
 from typing import Annotated, Any
 
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ..errors import ValidationError, format_error_response
@@ -57,7 +58,8 @@ async def publish(
         "[Any] Long-poll for new messages on a channel published after `after_id`. "
         "Returns the next batch (oldest first) and the new high-water id. On timeout "
         "returns an empty list — call again with the same after_id to keep waiting."
-    )
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def subscribe(
     channel: Annotated[str, Field(description="Channel name to listen on")],

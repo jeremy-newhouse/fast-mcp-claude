@@ -17,6 +17,7 @@ relay queue. See the brain's TeamsOutboxWatcher.
 
 from typing import Annotated, Any
 
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ..errors import NotFoundError, ValidationError, format_error_response
@@ -162,7 +163,8 @@ async def complete_teams_send(
     description=(
         "[Channel] Long-poll for the hub's result on a Teams-send request. Returns the record "
         "with ok/detail once the hub completes it, or {ready:false} on timeout — call again."
-    )
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def await_teams_send(
     request_id: Annotated[str, Field(description="ID from request_teams_send")],

@@ -23,6 +23,7 @@ are opaque JSON to this server — the hub interprets them. This server is just 
 
 from typing import Annotated, Any
 
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ..errors import NotFoundError, ValidationError, format_error_response
@@ -141,7 +142,8 @@ async def complete_session_op(
     description=(
         "[Session] Long-poll for the hub's result on a session-relay op. Returns the record with "
         "ok/result once the hub completes it, or {ready:false} on timeout — call again."
-    )
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def await_session_op(
     request_id: Annotated[str, Field(description="ID from request_session_op")],

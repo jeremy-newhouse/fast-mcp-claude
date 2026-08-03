@@ -83,6 +83,20 @@ async def some_tool(
 
 Always validate inputs first. Always return `{"success": bool, ...}`. Always catch `ValidationError` separately (it produces a 400-style response with `field`).
 
+### Tool annotations: `readOnlyHint`
+
+Every new tool must be classified as read-only or mutating based on whether it writes to the store (`INSERT`/`UPDATE`/`DELETE` in `services/store.py`) — **not** on whether it merely blocks. If it's read-only, declare that via FastMCP's `annotations` param so MCP clients with a least-privilege approval mode (e.g. Codex CLI's `default_tools_approval_mode="auto"`) can auto-approve it without also auto-approving mutating tools:
+
+```python
+from mcp.types import ToolAnnotations
+
+@mcp.tool(description="...", annotations=ToolAnnotations(readOnlyHint=True))
+async def some_read_only_tool(...) -> dict[str, Any]:
+    ...
+```
+
+Leave mutating tools unannotated. Two easy-to-miss traps: a tool that reads and *waits* is not automatically read-only (`wait_for_instruction` claims a message via an `UPDATE ... SET status=delivered`; `consume_interrupt` is a `DELETE`), and a tool whose name mirrors a read-only sibling isn't automatically read-only either — `wait_for_pending_teams_send`/`wait_for_pending_session_ops` look like `wait_for_pending_approval` but atomically claim rows (`pending`→`claimed`) to prevent double-drain, so they must stay unannotated. Trace into `store.py` for every new tool rather than guessing from its name or docstring.
+
 ### Long-poll pattern
 
 All blocking tools use `Notifier.wait_for(key, check, timeout)` from `services/store.py`:

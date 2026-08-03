@@ -11,6 +11,7 @@ Two roles use these tools:
 from typing import Annotated, Any
 
 from fastmcp.server.dependencies import get_access_token
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from .. import __version__
@@ -116,7 +117,8 @@ async def send_prompt(
         "[Controller] Long-poll for the worker's reply to a message_id. Returns the "
         "full message record (with response field set) when the worker calls reply(), "
         "or {success:true, ready:false} on timeout — call again to keep waiting."
-    )
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def wait_for_completion(
     message_id: Annotated[str, Field(description="ID returned from send_prompt")],
@@ -153,7 +155,8 @@ async def wait_for_completion(
     description=(
         "[Controller / Worker] Report this peer's identity, version, and live counts "
         "(queued messages, pending approvals)."
-    )
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def get_status() -> dict[str, Any]:
     try:
@@ -227,7 +230,8 @@ async def cancel(
     description=(
         "[Controller / Worker] List recent messages on this peer. Useful for "
         "observability / debugging the queue."
-    )
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def list_messages(
     status: Annotated[

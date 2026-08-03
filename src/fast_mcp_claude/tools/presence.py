@@ -15,6 +15,7 @@ via stale_seconds so dead peers drop off without any explicit unregister.
 
 from typing import Annotated, Any
 
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ..errors import ValidationError, format_error_response
@@ -120,7 +121,8 @@ async def forget(
         "the returned `identity` values as recipient_session in send_prompt to "
         "message a specific peer. stale_seconds drops peers whose last heartbeat "
         "is older than that (default: ~3 heartbeats)."
-    )
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def who(
     stale_seconds: Annotated[

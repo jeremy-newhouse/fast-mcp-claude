@@ -13,6 +13,7 @@ Flow:
 
 from typing import Annotated, Any
 
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ..errors import NotFoundError, ValidationError, format_error_response
@@ -68,7 +69,8 @@ async def request_approval(
         "[Hook-internal] Long-poll for a controller's decision on approval_id. Returns "
         "the approval record once decided, or {ready:false} on timeout (the hook can "
         "retry or default to deny)."
-    )
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def await_decision(
     approval_id: Annotated[str, Field(description="ID returned by request_approval")],
@@ -98,7 +100,8 @@ async def await_decision(
     description=(
         "[Controller] List pending permission requests on this peer. The controller "
         "calls this on the worker's server, evaluates each, then calls approve_tool()."
-    )
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def pending_approvals(
     limit: Annotated[int, Field(description="Max rows (1-200)")] = 50,
@@ -121,7 +124,8 @@ async def pending_approvals(
     description=(
         "[Controller] Long-poll until at least one pending approval exists, then "
         "return them. Use instead of pending_approvals() to avoid busy-polling."
-    )
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def wait_for_pending_approval(
     timeout: Annotated[

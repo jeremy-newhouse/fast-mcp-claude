@@ -1697,5 +1697,533 @@ class TestSelftestEndToEnd:
         assert res.armed is False
         assert res.cli_failed is True
 
+
+# ==================================================================== FMC-19: Codex engine
+
+
+def _fake_codex_cfg(tmp_path: Path, **overrides) -> L.LauncherConfig:
+    cwd = tmp_path / "repo"
+    cwd.mkdir(exist_ok=True)
+    base = dict(
+        cwd_allowlist=[cwd.resolve()],
+        engines_enabled=frozenset({"claude", "codex"}),
+    )
+    base.update(overrides)
+    return _cfg(**base)
+
+
+# ------------------------------------------------------- engine/codex_sandbox envelope
+
+
+def test_envelope_engine_defaults_to_claude(tmp_path):
+    cfg = _cfg(cwd_allowlist=[tmp_path.resolve()])
+    env = L.parse_envelope(json.dumps({"task": "x", "cwd": str(tmp_path)}), cfg)
+    assert env.engine == "claude"
+    assert env.codex_sandbox == ""
+
+
+def test_envelope_engine_codex_allowed_when_enabled(tmp_path):
+    cfg = _cfg(cwd_allowlist=[tmp_path.resolve()], engines_enabled=frozenset({"claude", "codex"}))
+    env = L.parse_envelope(json.dumps({"task": "x", "cwd": str(tmp_path), "engine": "codex"}), cfg)
+    assert env.engine == "codex"
+    assert env.codex_sandbox == cfg.codex_sandbox_ceiling
+
+
+def test_envelope_engine_codex_rejected_when_not_enabled(tmp_path):
+    cfg = _cfg(cwd_allowlist=[tmp_path.resolve()], engines_enabled=frozenset({"claude"}))
+    with pytest.raises(L.EnvelopeError) as ei:
+        L.parse_envelope(json.dumps({"task": "x", "cwd": str(tmp_path), "engine": "codex"}), cfg)
+    assert ei.value.payload["error"] == "engine_not_allowed"
+    assert ei.value.payload["enabled"] == ["claude"]
+
+
+def test_envelope_engine_unknown_value_rejected(tmp_path):
+    cfg = _cfg(cwd_allowlist=[tmp_path.resolve()])
+    with pytest.raises(L.EnvelopeError) as ei:
+        L.parse_envelope(json.dumps({"task": "x", "cwd": str(tmp_path), "engine": "gpt5"}), cfg)
+    assert ei.value.payload["error"] == "bad_envelope"
+
+
+def test_envelope_codex_sandbox_omitted_uses_ceiling(tmp_path):
+    cfg = _cfg(
+        cwd_allowlist=[tmp_path.resolve()],
+        engines_enabled=frozenset({"claude", "codex"}),
+        codex_sandbox_ceiling="workspace-write",
+    )
+    env = L.parse_envelope(json.dumps({"task": "x", "cwd": str(tmp_path), "engine": "codex"}), cfg)
+    assert env.codex_sandbox == "workspace-write"
+
+
+def test_envelope_codex_sandbox_below_ceiling_kept(tmp_path):
+    cfg = _cfg(
+        cwd_allowlist=[tmp_path.resolve()],
+        engines_enabled=frozenset({"claude", "codex"}),
+        codex_sandbox_ceiling="danger-full-access",
+    )
+    env = L.parse_envelope(
+        json.dumps(
+            {"task": "x", "cwd": str(tmp_path), "engine": "codex", "codex_sandbox": "read-only"}
+        ),
+        cfg,
+    )
+    assert env.codex_sandbox == "read-only"
+
+
+def test_envelope_codex_sandbox_exceeding_ceiling_rejected(tmp_path):
+    cfg = _cfg(
+        cwd_allowlist=[tmp_path.resolve()],
+        engines_enabled=frozenset({"claude", "codex"}),
+        codex_sandbox_ceiling="read-only",
+    )
+    with pytest.raises(L.EnvelopeError) as ei:
+        L.parse_envelope(
+            json.dumps(
+                {
+                    "task": "x",
+                    "cwd": str(tmp_path),
+                    "engine": "codex",
+                    "codex_sandbox": "danger-full-access",
+                }
+            ),
+            cfg,
+        )
+    assert ei.value.payload["error"] == "codex_sandbox_exceeds_ceiling"
+
+
+def test_envelope_codex_sandbox_invalid_value_rejected(tmp_path):
+    cfg = _cfg(cwd_allowlist=[tmp_path.resolve()], engines_enabled=frozenset({"claude", "codex"}))
+    with pytest.raises(L.EnvelopeError) as ei:
+        L.parse_envelope(
+            json.dumps(
+                {"task": "x", "cwd": str(tmp_path), "engine": "codex", "codex_sandbox": "yolo"}
+            ),
+            cfg,
+        )
+    assert ei.value.payload["error"] == "bad_envelope"
+
+
+def test_envelope_codex_sandbox_with_claude_engine_rejected(tmp_path):
+    cfg = _cfg(cwd_allowlist=[tmp_path.resolve()])
+    with pytest.raises(L.EnvelopeError) as ei:
+        L.parse_envelope(
+            json.dumps({"task": "x", "cwd": str(tmp_path), "codex_sandbox": "read-only"}), cfg
+        )
+    assert ei.value.payload["error"] == "bad_envelope"
+
+
+def test_envelope_allowed_tools_with_codex_engine_rejected(tmp_path):
+    """allowed_tools is a Claude-engine concept; silently ignoring it for a codex
+    task would be exactly the class of silent-wrong-config bug this codebase
+    refuses elsewhere (cf. parse_envelope's own docstring)."""
+    cfg = _cfg(cwd_allowlist=[tmp_path.resolve()], engines_enabled=frozenset({"claude", "codex"}))
+    with pytest.raises(L.EnvelopeError) as ei:
+        L.parse_envelope(
+            json.dumps(
+                {"task": "x", "cwd": str(tmp_path), "engine": "codex", "allowed_tools": ["Bash"]}
+            ),
+            cfg,
+        )
+    assert ei.value.payload["error"] == "bad_envelope"
+
+
+# ------------------------------------------------------------------- _build_codex_cmd
+
+
+def test_build_codex_cmd_shape():
+    cfg = _cfg(engines_enabled=frozenset({"claude", "codex"}), codex_bin="codex")
+    env = L.TaskEnvelope(
+        task="do x",
+        cwd="/tmp/repo",
+        allowed_tools=[],
+        model=None,
+        timeout_s=60.0,
+        engine="codex",
+        codex_sandbox="workspace-write",
+    )
+    argv = L._build_codex_cmd(env, cfg)
+    assert argv[0] == "codex"
+    assert argv[1] == "exec"
+    assert argv[2] == "do x"
+    assert "--json" in argv
+    assert _flag_value(argv, "--sandbox") == "workspace-write"
+    assert _flag_value(argv, "-C") == "/tmp/repo"
+    assert "--skip-git-repo-check" in argv
+    assert "--ephemeral" in argv
+    assert "--ignore-user-config" in argv
+    # exec has no approval-prompt surface to bypass -- these must never appear.
+    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
+    assert "--dangerously-bypass-hook-trust" not in argv
+
+
+def test_build_codex_cmd_passes_model_when_given():
+    cfg = _cfg(engines_enabled=frozenset({"claude", "codex"}))
+    env = L.TaskEnvelope(
+        task="x",
+        cwd="/tmp",
+        allowed_tools=[],
+        model="o3",
+        timeout_s=60.0,
+        engine="codex",
+        codex_sandbox="read-only",
+    )
+    argv = L._build_codex_cmd(env, cfg)
+    assert _flag_value(argv, "-m") == "o3"
+
+
+def test_build_codex_cmd_never_puts_mesh_bearer_on_worker_argv():
+    """REGRESSION (mirrors the Claude engine's own test): the mesh bearer must never
+    appear in the Codex worker's argv either."""
+    cfg = _cfg(
+        engines_enabled=frozenset({"claude", "codex"}),
+        api_key="SECRET-MESH-BEARER-9f8e",
+        local_url="http://127.0.0.1:5499/mcp",
+    )
+    env = L.TaskEnvelope(
+        task="x",
+        cwd="/tmp",
+        allowed_tools=[],
+        model=None,
+        timeout_s=60.0,
+        engine="codex",
+        codex_sandbox="read-only",
+    )
+    joined = "\x00".join(L._build_codex_cmd(env, cfg))
+    assert "SECRET-MESH-BEARER-9f8e" not in joined
+    assert "MCP_API_KEY" not in joined
+
+
+# ------------------------------------------------------------------- parse_codex_jsonl
+
+
+def _codex_line(obj: dict) -> str:
+    return json.dumps(obj)
+
+
+def test_parse_codex_jsonl_success():
+    stream = "\n".join(
+        [
+            _codex_line({"type": "thread.started", "thread_id": "th-abc"}),
+            _codex_line({"type": "turn.started"}),
+            _codex_line(
+                {
+                    "item": {"id": "item_0", "type": "agent_message", "text": "hello"},
+                    "type": "item.completed",
+                }
+            ),
+            _codex_line(
+                {
+                    "item": {"id": "item_1", "type": "command_execution", "exit_code": 0},
+                    "type": "item.completed",
+                }
+            ),
+            _codex_line(
+                {
+                    "item": {"id": "item_2", "type": "agent_message", "text": "DONE"},
+                    "type": "item.completed",
+                }
+            ),
+            _codex_line({"type": "turn.completed", "usage": {"input_tokens": 10}}),
+        ]
+    )
+    p = L.parse_codex_jsonl(stream)
+    assert p["is_error"] is False
+    assert p["result"] == "DONE"  # LAST agent_message, not the first
+    assert p["session_id"] == "th-abc"
+    assert p["total_cost_usd"] is None
+    assert p["num_turns"] == 3  # 3 item.completed events
+
+
+def test_parse_codex_jsonl_turn_failed_marks_error():
+    stream = "\n".join(
+        [
+            _codex_line({"type": "thread.started", "thread_id": "th-fail"}),
+            _codex_line({"type": "turn.started"}),
+            _codex_line({"type": "error", "message": "bad model"}),
+            _codex_line({"type": "turn.failed", "error": {"message": "bad model"}}),
+        ]
+    )
+    p = L.parse_codex_jsonl(stream)
+    assert p["is_error"] is True
+    assert p["session_id"] == "th-fail"
+    assert "bad model" in p["result"]
+
+
+def test_parse_codex_jsonl_garbage_marks_error():
+    p = L.parse_codex_jsonl("not jsonl at all")
+    assert p["is_error"] is True
+    assert p["session_id"] is None
+    assert "not jsonl" in p["result"]
+
+
+def test_parse_codex_jsonl_no_turn_completed_marks_error():
+    """A stream that ends mid-turn (crash/timeout truncation) with no turn.completed
+    and no turn.failed is still is_error=True -- 'did the turn structurally complete'
+    is the signal, not the presence of an explicit failure event."""
+    stream = "\n".join(
+        [
+            _codex_line({"type": "thread.started", "thread_id": "th-cut"}),
+            _codex_line({"type": "turn.started"}),
+        ]
+    )
+    p = L.parse_codex_jsonl(stream)
+    assert p["is_error"] is True
+    assert p["session_id"] == "th-cut"
+
+
+# --------------------------------------------------------------- fake codex spawn
+
+
+FAKE_CODEX_SUCCESS = """
+import json, sys
+print(json.dumps({"type": "thread.started", "thread_id": "th-live"}))
+print(json.dumps({"type": "turn.started"}))
+print(json.dumps({"item": {"id": "item_0", "type": "agent_message", "text": "answer: 4"},
+                   "type": "item.completed"}))
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5}}))
+sys.exit(0)
+"""
+
+FAKE_CODEX_NONZERO = """
+import sys
+sys.stderr.write("codex boom on stderr\\n")
+sys.exit(1)
+"""
+
+FAKE_CODEX_SLEEP = """
+import time
+time.sleep(60)
+"""
+
+FAKE_CODEX_STDIN_PROBE = """
+import sys, json, select
+readable, _, _ = select.select([sys.stdin], [], [], 2.0)
+status = "NOT_READABLE"
+if readable:
+    data = sys.stdin.read()
+    status = "EOF" if data == "" else "DATA"
+print(json.dumps({"type": "thread.started", "thread_id": "th-stdin"}))
+print(json.dumps({"type": "turn.started"}))
+print(json.dumps({"item": {"id": "item_0", "type": "agent_message", "text": status},
+                   "type": "item.completed"}))
+print(json.dumps({"type": "turn.completed", "usage": {}}))
+sys.exit(0)
+"""
+
+
+def _write_fake_codex(tmp_path: Path, body: str) -> str:
+    p = tmp_path / "codex"
+    p.write_text("#!/usr/bin/env python3\n" + body)
+    p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IRWXU)
+    return str(p)
+
+
+async def test_codex_spawn_success(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    codex = _write_fake_codex(bin_dir, FAKE_CODEX_SUCCESS)
+    cfg = _fake_codex_cfg(tmp_path, codex_bin=codex)
+    client = FakeClient()
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+    msg = {
+        "id": "c" * 32,
+        "prompt": json.dumps(
+            {"task": "what is 2+2", "cwd": str(cfg.cwd_allowlist[0]), "engine": "codex"}
+        ),
+    }
+    await L._handle_task(client, msg, cfg, sem, set(), L._Counter(), set())
+    assert len(client.replies) == 1
+    r = json.loads(client.replies[0]["response"])
+    assert r["ok"] is True
+    assert r["exit_code"] == 0
+    assert r["claude_session_id"] == "th-live"  # repurposed field carries the thread_id
+    assert r["cost_usd"] is None
+    assert r["num_turns"] == 1
+    assert "answer: 4" in r["result"]
+
+
+async def test_codex_spawn_nonzero_exit(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    codex = _write_fake_codex(bin_dir, FAKE_CODEX_NONZERO)
+    cfg = _fake_codex_cfg(tmp_path, codex_bin=codex)
+    client = FakeClient()
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+    msg = {
+        "id": "d" * 32,
+        "prompt": json.dumps({"task": "fail", "cwd": str(cfg.cwd_allowlist[0]), "engine": "codex"}),
+    }
+    await L._handle_task(client, msg, cfg, sem, set(), L._Counter(), set())
+    r = json.loads(client.replies[0]["response"])
+    assert r["ok"] is False
+    assert r["exit_code"] == 1
+    assert "codex boom on stderr" in r["stderr_tail"]
+
+
+async def test_codex_spawn_timeout_kills_group(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    codex = _write_fake_codex(bin_dir, FAKE_CODEX_SLEEP)
+    cfg = _fake_codex_cfg(tmp_path, codex_bin=codex)
+    import fast_mcp_claude.launcher as mod
+
+    old_grace = mod.KILL_GRACE_S
+    mod.KILL_GRACE_S = 0.5
+    try:
+        env = L.TaskEnvelope(
+            task="sleep",
+            cwd=str(cfg.cwd_allowlist[0]),
+            allowed_tools=[],
+            model=None,
+            timeout_s=0.5,
+            engine="codex",
+            codex_sandbox="read-only",
+        )
+        live: set = set()
+        run = await L._run_codex(env, cfg, live)
+    finally:
+        mod.KILL_GRACE_S = old_grace
+    assert run.timed_out is True
+    assert run.exit_code is not None
+    assert live == set()
+
+
+async def test_codex_spawn_missing_binary_replies_spawn_failed(tmp_path):
+    cfg = _fake_codex_cfg(tmp_path, codex_bin=str(tmp_path / "nope" / "codex"))
+    client = FakeClient()
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+    msg = {
+        "id": "e" * 32,
+        "prompt": json.dumps({"task": "x", "cwd": str(cfg.cwd_allowlist[0]), "engine": "codex"}),
+    }
+    await L._handle_task(client, msg, cfg, sem, set(), L._Counter(), set())
+    r = json.loads(client.replies[0]["response"])
+    assert r["error"] == "spawn_failed"
+
+
+async def test_codex_run_uses_devnull_stdin_real_subprocess(tmp_path):
+    """codex exec reads stdin whenever it is not a TTY -- even when a prompt is ALSO
+    given as an argument (verified live against codex-cli 0.145.0, --help documents
+    the <stdin> append behavior). _run_codex must pin stdin to DEVNULL so this can
+    never block on an EOF that never comes; this test proves an immediately-EOF'd
+    stdin is what the fake codex process actually observes."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    codex = _write_fake_codex(bin_dir, FAKE_CODEX_STDIN_PROBE)
+    cfg = _fake_codex_cfg(tmp_path, codex_bin=codex)
+    env = L.TaskEnvelope(
+        task="probe stdin",
+        cwd=str(cfg.cwd_allowlist[0]),
+        allowed_tools=[],
+        model=None,
+        timeout_s=10.0,
+        engine="codex",
+        codex_sandbox="read-only",
+    )
+    live: set = set()
+    run = await L._run_codex(env, cfg, live)
+    parsed = L.parse_codex_jsonl(run.stdout)
+    assert parsed["result"] == "EOF"
+
+
+class _CapturingFakeProc:
+    """Minimal fake asyncio subprocess: reports one canned JSONL line, exits 0."""
+
+    def __init__(self):
+        self.pid = 999999999  # not a real pid -- os.getpgid() on it raises, handled
+        self.returncode = 0
+        self._sent = False
+
+    class _Stream:
+        def __init__(self, data: bytes):
+            self._data = data
+            self._sent = False
+
+        async def read(self, n):
+            if self._sent:
+                return b""
+            self._sent = True
+            return self._data
+
+    @property
+    def stdout(self):
+        return self._Stream(b'{"type": "turn.completed", "usage": {}}\n')
+
+    @property
+    def stderr(self):
+        return self._Stream(b"")
+
+    async def wait(self):
+        return 0
+
+
+async def test_run_codex_passes_devnull_stdin_kwarg(monkeypatch, tmp_path):
+    """Deterministic, environment-independent proof (complements the real-subprocess
+    probe above): _run_codex's create_subprocess_exec call always carries
+    stdin=DEVNULL, regardless of whatever the test runner's own stdin looks like."""
+    captured: dict = {}
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured.update(kwargs)
+        return _CapturingFakeProc()
+
+    monkeypatch.setattr(L.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    cfg = _fake_codex_cfg(tmp_path)
+    env = L.TaskEnvelope(
+        task="x",
+        cwd=str(cfg.cwd_allowlist[0]),
+        allowed_tools=[],
+        model=None,
+        timeout_s=5.0,
+        engine="codex",
+        codex_sandbox="read-only",
+    )
+    live: set = set()
+    run = await L._run_codex(env, cfg, live)
+    assert captured.get("stdin") == L.asyncio.subprocess.DEVNULL
+    assert run.exit_code == 0
+
+
+# ------------------------------------------------------------- engines_enabled config
+
+
+def test_resolve_config_engines_enabled_defaults_to_claude_only(env, fake_settings):
+    fake_settings(launcher_engines_enabled="claude")
+    cfg = L._resolve_config([])
+    assert cfg.engines_enabled == frozenset({"claude"})
+
+
+def test_resolve_config_engines_enabled_includes_codex_when_binary_present(
+    env, fake_settings, monkeypatch
+):
+    fake_settings(launcher_engines_enabled="claude,codex", launcher_codex_bin="codex")
+    monkeypatch.setattr(L.shutil, "which", lambda name: f"/usr/bin/{name}")
+    cfg = L._resolve_config([])
+    assert cfg.engines_enabled == frozenset({"claude", "codex"})
+
+
+def test_resolve_config_drops_codex_when_binary_missing(env, fake_settings, monkeypatch):
+    """A machine that never installed codex-cli must not lose the Claude engine --
+    'codex' is dropped from the effective set rather than idling the whole launcher."""
+    fake_settings(launcher_engines_enabled="claude,codex", launcher_codex_bin="codex")
+    monkeypatch.setattr(L.shutil, "which", lambda name: None)
+    cfg = L._resolve_config([])
+    assert cfg.engines_enabled == frozenset({"claude"})
+
+
+def test_resolve_config_blank_engines_enabled_falls_back_to_claude(env, fake_settings):
+    fake_settings(launcher_engines_enabled="")
+    cfg = L._resolve_config([])
+    assert cfg.engines_enabled == frozenset({"claude"})
+
+
+def test_announce_metadata_includes_engines_enabled():
+    cfg = _cfg(engines_enabled=frozenset({"claude", "codex"}))
+    meta = L._announce_metadata(cfg)
+    assert meta["engines_enabled"] == ["claude", "codex"]
+
+
 # Reference os/sys so static checkers don't flag the imports used only in fakes.
 _ = (os, sys)

@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-03 01:04'
-updated_date: '2026-08-03 14:33'
+updated_date: '2026-08-03 15:05'
 labels:
   - codex
   - launcher
@@ -216,6 +216,66 @@ test files in the full suite; test_launcher.py alone has never hung in any
 isolated run). Not something FMC-19 introduced or is required to fix; flagging
 here as a candidate for a separate backlog issue if the campaign wants to
 pursue it, per scope discipline (do not silently expand this task).
+
+Adversarial subagent review (per this campaign's established practice for
+security-sensitive launcher.py changes, matching FMC-9/11/12/13/15/16) found
+3 real issues, all fixed in a follow-up commit on this branch:
+
+1. BLOCKING: the "no known fix" claim for the login-shell dotfile leak (my
+   earlier AC#4 finding) was WRONG -- there IS a fix. Verified live (synthetic
+   canary secret only, no real secrets touched in this re-verification):
+   setting ZDOTDIR on the spawned codex subprocess's env to an empty,
+   launcher-owned directory fully suppresses the leak (zsh looks for its
+   startup files under $ZDOTDIR, defaulting to $HOME only when ZDOTDIR is
+   unset). Added _codex_worker_env() (_scrubbed_env() + ZDOTDIR override),
+   used by _run_codex instead of the bare _scrubbed_env(). This CLOSES the
+   residual risk rather than just documenting it; docs updated accordingly
+   in launcher.py/README.md/CLAUDE.md.
+
+2. BLOCKING: _preflight/_serve's claude-binary gate ignored engines_enabled --
+   a launcher configured for Codex only (engines_enabled=codex, excluding
+   claude) would idle forever if the claude CLI wasn't ALSO installed, even
+   though it doesn't need it. Fixed: _preflight returns ok=True immediately
+   when "claude" not in engines_enabled (mirrors the existing symmetric
+   codex-binary-missing handling in _resolve_config); the approval-hook
+   self-test (a Claude-only gate) is now also skipped when claude isn't
+   enabled, for the same reason.
+
+3. BLOCKING: _build_codex_cmd placed env.task as a bare positional BEFORE
+   other flags, with no `--` separator -- verified live that codex's clap
+   parser matches a `--`-shaped task string against known flags first (e.g.
+   `codex exec "--help" --json ...` printed codex's own help instead of
+   treating "--help" as the prompt). Since `task` is fully controlled by
+   whoever can send_prompt to this launcher's mailbox, a task starting with
+   `--dangerously-bypass-approvals-and-sandbox` would have been parsed as
+   that flag, bypassing codex_sandbox_ceiling entirely -- exactly the
+   guarantee AC#1/AC#3 are supposed to provide. Fixed: task is now the LAST
+   argv element, preceded by a literal `--`, forcing positional treatment
+   regardless of its content. Verified live both ways (broken order printed
+   help; `--`-guarded order treated "--help" as literal text).
+
+2 non-blocking suggestions (sandbox-ceiling config validation, extra test
+coverage) were noted but left as-is -- low severity, matches this file's
+existing loose-string-Settings convention elsewhere.
+
+IMPORTANT INCIDENT: the review subagent's own verification steps ran a
+command against the operator's real ~/.zshrc that printed several additional
+real credentials into its tool transcript (ATLASSIAN_API_TOKEN,
+GREPTILE_API_KEY, 2 GitHub tokens, UV_PUBLISH_TOKEN, LINEAR_API_KEY,
+NGROK_AUTHTOKEN, plus MCP_API_KEY again) -- a broader exposure than my own
+earlier one. The operator was told immediately and clearly, and advised to
+rotate ALL of those credentials, not just MCP_API_KEY. All my own
+re-verification of the ZDOTDIR/argv-injection fixes after this point used
+ONLY synthetic canary secrets in throwaway temp directories -- no further
+real secrets were touched or displayed.
+
+Added 8 new regression tests for the 3 fixes (test_launcher.py: 124 total,
+up from 118) plus fixed one pre-existing new test whose fixed-position argv
+assertion (argv[2] == task) no longer held after the "--" reordering.
+Verified: `uv run pytest tests/test_launcher.py -q` 124 passed; full suite
+rerun clean (subject to the already-documented pre-existing flakiness, not
+a new issue -- reproduced the same intermittent slow/hang pattern on this
+run too, consistent with the earlier git-stash control experiment).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

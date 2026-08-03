@@ -212,12 +212,12 @@ enforcement. `--ignore-user-config` keeps the operator's own `~/.codex/config.to
 `result`, …); a Codex task's `claude_session_id` field carries Codex's own thread id instead
 (there is no dollar-cost figure to put in `cost_usd`, which stays `null`).
 
-**Before enabling this on a shared or personal machine, read the Codex-engine bullet in
-[Security](#security)** — `codex exec`'s shell tool always runs commands via a login shell that
-re-sources your `~/.zshrc`/`~/.zprofile`, which can reintroduce any secret exported there
-(including `MCP_API_KEY`) into a Codex task regardless of the launcher's own env-scrubbing. This
-is a verified Codex-CLI behavior, not a gap in this repo's code, and there is currently no known
-config fix for it.
+`codex exec`'s shell tool always runs commands via a login shell (`/bin/zsh -lc`), which by
+default re-sources your `~/.zshrc`/`~/.zprofile`/`~/.zshenv` — a real leak vector for anything
+exported there (verified live with a synthetic secret). The launcher closes this by pointing the
+spawned worker's `ZDOTDIR` at an empty, launcher-owned directory (`_codex_worker_env` in
+launcher.py), so no dotfiles are sourced at all — see the Codex-engine bullet in
+[Security](#security) for the verification detail.
 
 ## Channels: push mode (recommended)
 
@@ -316,7 +316,7 @@ All tools return `{"success": bool, ...}` or `{"success": false, "error": {"mess
 - **`MCP_ADMIN_API_KEY` is a distinct, optional second bearer** for a designated trusted hub/admin origin (e.g. the eCA brain). `MCP_API_KEY` alone is shared by every mesh peer, so it cannot prove a caller is the trusted hub rather than any other peer — `send_prompt` only lets a caller's `metadata.triggering_admin` claim become `true` (which `channel.py`'s permission relay auto-allows on) when the request authenticated with this key. Unset by default, meaning nobody is ever admin-trusted.
 - **WORKSPACE_ROOTS is an allowlist**: `read_file`/`write_file` refuse paths outside it, including via symlink escapes.
 - **A Codex peer's `bearer_token_env_var` puts the mesh key in that process's own environment**, readable by a shell command the agent runs unless Codex's `shell_environment_policy` filters it. Don't give a Codex worker a bearer that can `approve_tool` (i.e. self-approve its own permission requests) unless that policy is set — same mitigation as the launcher's existing pattern of holding the bearer itself and having the worker ask over a local socket instead.
-- **The launcher's Codex engine (FMC-19) has a KNOWN, unfixable-by-us gap**: `codex exec`'s shell tool always runs model-requested commands via a LOGIN shell (`/bin/zsh -lc`), verified against codex-cli 0.145.0 to ignore both a `$SHELL` override and `-c shell_environment_policy.inherit=none`. A login shell re-sources the *operator's own* `~/.zshrc`/`~/.zprofile`/`~/.zshenv` — if `MCP_API_KEY` (or any other secret) is exported there for interactive convenience, a Codex-engine task can recover it via `env`, regardless of the launcher's own env-scrubbing (`_scrubbed_env`) at spawn time. **Never export secrets in a machine's interactive shell startup files if that machine runs the launcher with the Codex engine enabled** — scope them to the specific process that needs them instead (e.g. a `.env` loaded only by `start.sh`/pm2).
+- **The launcher's Codex engine (FMC-19) mitigates a login-shell dotfile leak via `ZDOTDIR`**: `codex exec`'s shell tool always runs model-requested commands via a LOGIN shell (`/bin/zsh -lc`), verified against codex-cli 0.145.0 to ignore both a `$SHELL` override and `-c shell_environment_policy.inherit=none` — a login shell re-sources the *operator's own* `~/.zshrc`/`~/.zprofile`/`~/.zshenv`, which could otherwise reintroduce a secret exported there (e.g. `MCP_API_KEY`) into a Codex task independent of the launcher's own env-scrubbing (`_scrubbed_env`). `_codex_worker_env` (launcher.py) closes this by pointing the spawned worker's `ZDOTDIR` at an empty, launcher-owned directory, so zsh finds no dotfiles to source at all — verified live with a synthetic canary secret (leaks with `ZDOTDIR` unset/default, does not with it pointed at the empty directory). As defense in depth, still avoid exporting secrets in a machine's interactive shell startup files if it runs the launcher with the Codex engine enabled.
 - **No outbound HTTP from user input**: tools never make network calls to URLs supplied by callers (in v1 there's no outbound HTTP at all).
 - **Hook fail-safe**: any error in the permission relay (server down, timeout, parse error) → `permissionDecision: "ask"` → Claude Code's local prompt takes over.
 - **Body-size caps** (see `utils/validation.py`): prompt ≤1MB, response ≤4MB, file ≤10MB, pubsub payload ≤256KB.

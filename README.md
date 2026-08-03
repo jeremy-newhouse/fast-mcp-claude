@@ -129,6 +129,61 @@ Please ask the laptop to summarize what's in ~/repos/notes/today.md
 
 The session will call `claude-peer-laptop:send_prompt`, then `wait_for_completion`, and surface the result.
 
+## Wire up Codex CLI
+
+[OpenAI Codex CLI](https://github.com/openai/codex) can join the mesh with **zero server-side
+changes** — the mesh is a plain streamable-HTTP MCP server with bearer auth, and Codex is a
+competent MCP client. Register it in `~/.codex/config.toml` (verified against `codex-cli
+0.145.0`):
+
+```toml
+[mcp_servers.fmc]
+url = "http://localhost:5473/mcp"
+bearer_token_env_var = "MCP_API_KEY"
+default_tools_approval_mode = "approve"
+tool_timeout_sec = 120
+
+[mcp_servers.fmc-peer-laptop]
+url = "http://10.0.0.20:5473/mcp"
+bearer_token_env_var = "PEER_LAPTOP_KEY"
+default_tools_approval_mode = "approve"
+tool_timeout_sec = 120
+```
+
+(Equivalent one-liner: `codex mcp add fmc --url http://localhost:5473/mcp --bearer-token-env-var MCP_API_KEY`, then add the two extra keys under `[mcp_servers.fmc]` by hand — `codex mcp add` doesn't take flags for them.)
+
+Three traps, all verified empirically rather than assumed from Codex's docs:
+
+- **`default_tools_approval_mode = "approve"` is mandatory for headless Codex.** With `auto`,
+  `writes`, or `prompt`, every mesh tool call silently auto-denies as `user cancelled MCP tool
+  call` before it ever reaches the server — the failure looks like a mesh problem but is purely
+  local config.
+- **Codex allows up to `tool_timeout_sec` (default 300s) per tool call**, far above Claude
+  Code's ~30s stdio idle ceiling. A long-poll wait doesn't need Claude's `POLL_MAX_WAIT_S≤25`
+  chunking — one call can cover most of `CRM_DECISION_TIMEOUT`/`CRM_REPLY_TIMEOUT`.
+- **`bearer_token_env_var` keeps the mesh key in the Codex process's own environment**, where a
+  shell tool the agent runs can read it back out unless `shell_environment_policy` filters it.
+  Don't put a bearer with real trust weight (e.g. one whose peer can `approve_tool`) into a
+  worker's env unless that policy is set — see Security below.
+
+`mcp add`/`config.toml` server names get their hyphens replaced with underscores in the tool
+prefix Codex exposes to the model: a server named `fmc-peer-laptop` calls as
+`mcp__fmc_peer_laptop__send_prompt`, not `mcp__fmc-peer-laptop__send_prompt`.
+
+Two Codex-native skills mirror `/worker` and `/control` and are auto-discovered straight out of
+this repo — Codex (0.145.0, confirmed empirically) picks up project-level `.codex/skills/`, in
+contrast to `.codex/hooks.json`, which it does **not** discover project-locally:
+
+- [`.codex/skills/codex-worker/SKILL.md`](.codex/skills/codex-worker/SKILL.md) — long-polls
+  `wait_for_instruction` and replies, same pull-mode contract as `/worker`'s loop fallback.
+  (Codex has no push/channel equivalent yet — see CLAUDE.md's Architecture section.)
+- [`.codex/skills/codex-control/SKILL.md`](.codex/skills/codex-control/SKILL.md) — drives a
+  remote Claude or Codex worker via `send_prompt`/`wait_for_completion`/`approve_tool`, same
+  contract as `/control`.
+
+Ask a Codex session to "run as a fast-mcp-claude worker" or "control the `<peer>` mesh session"
+and it will find and load the matching skill on its own.
+
 ## Channels: push mode (recommended)
 
 [Claude Code Channels](https://code.claude.com/docs/en/channels) (research preview, requires Claude Code ≥ v2.1.80) let an MCP server **push** events into a live session instead of the session polling for them. `fast-mcp-claude-channel` is a tiny stdio adapter that bridges your local server's inbox into the running worker session — so a remote controller's `send_prompt` surfaces automatically, with **no `/worker` priming and no MCP idle-timeout**.
@@ -225,6 +280,7 @@ All tools return `{"success": bool, ...}` or `{"success": false, "error": {"mess
 - **Always set `MCP_API_KEY`** for any non-localhost deployment. The server logs a `WARNING` on startup if it's unset.
 - **`MCP_ADMIN_API_KEY` is a distinct, optional second bearer** for a designated trusted hub/admin origin (e.g. the eCA brain). `MCP_API_KEY` alone is shared by every mesh peer, so it cannot prove a caller is the trusted hub rather than any other peer — `send_prompt` only lets a caller's `metadata.triggering_admin` claim become `true` (which `channel.py`'s permission relay auto-allows on) when the request authenticated with this key. Unset by default, meaning nobody is ever admin-trusted.
 - **WORKSPACE_ROOTS is an allowlist**: `read_file`/`write_file` refuse paths outside it, including via symlink escapes.
+- **A Codex peer's `bearer_token_env_var` puts the mesh key in that process's own environment**, readable by a shell command the agent runs unless Codex's `shell_environment_policy` filters it. Don't give a Codex worker a bearer that can `approve_tool` (i.e. self-approve its own permission requests) unless that policy is set — same mitigation as the launcher's existing pattern of holding the bearer itself and having the worker ask over a local socket instead.
 - **No outbound HTTP from user input**: tools never make network calls to URLs supplied by callers (in v1 there's no outbound HTTP at all).
 - **Hook fail-safe**: any error in the permission relay (server down, timeout, parse error) → `permissionDecision: "ask"` → Claude Code's local prompt takes over.
 - **Body-size caps** (see `utils/validation.py`): prompt ≤1MB, response ≤4MB, file ≤10MB, pubsub payload ≤256KB.

@@ -213,6 +213,26 @@ class Settings(BaseSettings):
     # missing — a claim we can't run would be lost work).
     launcher_claude_bin: str = "claude"
 
+    # FMC-19: pluggable headless-worker engines. Comma-separated set of engines this
+    # launcher instance will run ("claude", "codex"). Default "claude" ONLY preserves
+    # pre-FMC-19 behavior for every existing deployment: a task envelope's omitted
+    # `engine` field (every envelope sent before this task) always resolves to
+    # "claude", which is always enabled by default — upgrading to this version
+    # requires no config change to keep working exactly as before.
+    launcher_engines_enabled: str = "claude"
+    # The MOST PERMISSIVE `codex exec --sandbox` mode any task may request
+    # (read-only < workspace-write < danger-full-access). An envelope's omitted
+    # codex_sandbox uses this value; an explicit one may not exceed it. Default
+    # read-only mirrors launcher_tools_ceiling's "nothing by default" posture —
+    # an operator must explicitly opt up to let Codex workers write or run
+    # unsandboxed.
+    launcher_codex_sandbox_ceiling: str = "read-only"
+    # The codex CLI binary; resolved via shutil.which at startup ONLY if "codex" is
+    # in launcher_engines_enabled — a machine that never opted into the Codex engine
+    # must not fail Claude-engine startup over a binary it doesn't need (see
+    # launcher.py's _resolve_config).
+    launcher_codex_bin: str = "codex"
+
     # Logging
     log_level: str = "INFO"
     log_format: str = "console"

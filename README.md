@@ -184,6 +184,41 @@ contrast to `.codex/hooks.json`, which it does **not** discover project-locally:
 Ask a Codex session to "run as a fast-mcp-claude worker" or "control the `<peer>` mesh session"
 and it will find and load the matching skill on its own.
 
+### Headless Codex workers via the launcher (FMC-19)
+
+`fast-mcp-claude-launcher` (see [Standalone tooling](#standalone-tooling) below) can spawn a
+task as `codex exec` instead of `claude -p`, verified against **codex-cli 0.145.0**. Enable it
+in `.env`:
+
+```bash
+LAUNCHER_ENGINES_ENABLED=claude,codex   # default is "claude" only — opt in explicitly
+LAUNCHER_CODEX_SANDBOX_CEILING=read-only # most permissive --sandbox any task may request
+LAUNCHER_CODEX_BIN=codex                 # default; override if not on PATH under this name
+```
+
+A controller selects the engine per task via the JSON envelope's `send_prompt` prompt:
+`{"task": "...", "cwd": "...", "engine": "codex", "codex_sandbox": "workspace-write"}` (both new
+fields optional — omitted `engine` stays `"claude"`; omitted `codex_sandbox` uses the ceiling
+above). If the launcher hasn't opted into `codex` — or `codex` isn't on `PATH` — a codex-engine
+request fails fast with `engine_not_allowed`, the same class of clean rejection as
+`cwd_not_allowed`, never a hang.
+
+`codex exec`'s tool-ceiling equivalent is `--sandbox`, not `--allowedTools`: verified that `codex
+exec --help` (0.145.0) exposes no `-a/--ask-for-approval` flag at all — unlike the interactive
+`codex` command, exec has no TTY to escalate to, so the sandbox boundary is the entire
+enforcement. `--ignore-user-config` keeps the operator's own `~/.codex/config.toml` (e.g. the
+`[mcp_servers.fmc]` entry from the section above) from ever reaching the spawned worker, mirroring
+`claude`'s `--strict-mcp-config`. The reply shape is identical across engines (`ok`, `exit_code`,
+`result`, …); a Codex task's `claude_session_id` field carries Codex's own thread id instead
+(there is no dollar-cost figure to put in `cost_usd`, which stays `null`).
+
+**Before enabling this on a shared or personal machine, read the Codex-engine bullet in
+[Security](#security)** — `codex exec`'s shell tool always runs commands via a login shell that
+re-sources your `~/.zshrc`/`~/.zprofile`, which can reintroduce any secret exported there
+(including `MCP_API_KEY`) into a Codex task regardless of the launcher's own env-scrubbing. This
+is a verified Codex-CLI behavior, not a gap in this repo's code, and there is currently no known
+config fix for it.
+
 ## Channels: push mode (recommended)
 
 [Claude Code Channels](https://code.claude.com/docs/en/channels) (research preview, requires Claude Code ≥ v2.1.80) let an MCP server **push** events into a live session instead of the session polling for them. `fast-mcp-claude-channel` is a tiny stdio adapter that bridges your local server's inbox into the running worker session — so a remote controller's `send_prompt` surfaces automatically, with **no `/worker` priming and no MCP idle-timeout**.
@@ -281,6 +316,7 @@ All tools return `{"success": bool, ...}` or `{"success": false, "error": {"mess
 - **`MCP_ADMIN_API_KEY` is a distinct, optional second bearer** for a designated trusted hub/admin origin (e.g. the eCA brain). `MCP_API_KEY` alone is shared by every mesh peer, so it cannot prove a caller is the trusted hub rather than any other peer — `send_prompt` only lets a caller's `metadata.triggering_admin` claim become `true` (which `channel.py`'s permission relay auto-allows on) when the request authenticated with this key. Unset by default, meaning nobody is ever admin-trusted.
 - **WORKSPACE_ROOTS is an allowlist**: `read_file`/`write_file` refuse paths outside it, including via symlink escapes.
 - **A Codex peer's `bearer_token_env_var` puts the mesh key in that process's own environment**, readable by a shell command the agent runs unless Codex's `shell_environment_policy` filters it. Don't give a Codex worker a bearer that can `approve_tool` (i.e. self-approve its own permission requests) unless that policy is set — same mitigation as the launcher's existing pattern of holding the bearer itself and having the worker ask over a local socket instead.
+- **The launcher's Codex engine (FMC-19) has a KNOWN, unfixable-by-us gap**: `codex exec`'s shell tool always runs model-requested commands via a LOGIN shell (`/bin/zsh -lc`), verified against codex-cli 0.145.0 to ignore both a `$SHELL` override and `-c shell_environment_policy.inherit=none`. A login shell re-sources the *operator's own* `~/.zshrc`/`~/.zprofile`/`~/.zshenv` — if `MCP_API_KEY` (or any other secret) is exported there for interactive convenience, a Codex-engine task can recover it via `env`, regardless of the launcher's own env-scrubbing (`_scrubbed_env`) at spawn time. **Never export secrets in a machine's interactive shell startup files if that machine runs the launcher with the Codex engine enabled** — scope them to the specific process that needs them instead (e.g. a `.env` loaded only by `start.sh`/pm2).
 - **No outbound HTTP from user input**: tools never make network calls to URLs supplied by callers (in v1 there's no outbound HTTP at all).
 - **Hook fail-safe**: any error in the permission relay (server down, timeout, parse error) → `permissionDecision: "ask"` → Claude Code's local prompt takes over.
 - **Body-size caps** (see `utils/validation.py`): prompt ≤1MB, response ≤4MB, file ≤10MB, pubsub payload ≤256KB.

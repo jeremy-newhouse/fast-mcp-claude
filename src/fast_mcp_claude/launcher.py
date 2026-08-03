@@ -8,6 +8,23 @@ the existing `reply` tool. It mirrors channel.py's structure (fastmcp Client to 
 LOCAL server, reconnect-with-backoff, announce heartbeat, CLI>env>Settings precedence,
 strict opt-in inertness) but the leg is *exec* instead of *push*.
 
+FMC-19: the launcher is a PLUGGABLE-ENGINE exec leg, not just a Claude one. A task
+envelope's `engine` field ("claude", the default, or "codex") selects which headless
+CLI runs the task; `launcher_engines_enabled` (Settings, default "claude" only) gates
+which engines THIS launcher instance will accept — an `engine="codex"` request against
+an instance that hasn't opted in fails fast with `engine_not_allowed` (a normal
+envelope-reject, same class as `cwd_not_allowed`), never a hang. Every invariant below
+(scrubbed env, own process group, bounded output, group-wide kill, always-reply)
+applies identically to both engines — see `_run_codex`/`_build_codex_cmd`, which reuse
+the same standalone helpers `_run_claude` does rather than duplicating their logic.
+Codex's tool-ceiling equivalent is `--sandbox` (`launcher_codex_sandbox_ceiling`,
+default "read-only"): `codex exec --help` (verified on codex-cli 0.145.0) exposes no
+`-a/--ask-for-approval` flag at all, unlike the interactive `codex` command — exec has
+no TTY to escalate to, so the sandbox boundary IS the enforcement, with no
+`--allowedTools`-style auto-approve layer needed on top. See doc-3 (Codex CLI mesh
+support feasibility research) for the full component mapping this implements Phase 1
+of.
+
 Why a separate process (the evolv-coder-agent daemon lesson): the server stays zero-exec —
 no tool ever spawns a subprocess. All execution lives here, behind a strict opt-in,
 an allowlisted cwd, and a tools ceiling, so the MCP server's network surface keeps no
@@ -61,6 +78,19 @@ Config (CLI flag, else env, else Settings/.env default):
     --poll       / CRM_POLL_S        long-poll seconds per wait_for_instruction (default 25)
     --heartbeat  / CRM_HEARTBEAT_S   presence heartbeat seconds (default 20)
                    CRM_LAUNCHER_DEBUG set to "0" to silence stderr diagnostics
+
+Settings-only (.env), no CLI/env override (matches cwd_allowlist/tools_ceiling/etc):
+    launcher_engines_enabled          comma-separated engine allowlist, e.g.
+                                     "claude,codex" (default "claude" only — a
+                                     machine that never sets this keeps pre-FMC-19
+                                     behavior exactly)
+    launcher_codex_sandbox_ceiling   most permissive `codex exec --sandbox` mode any
+                                     task may request (default "read-only")
+    launcher_codex_bin               the codex CLI binary (default "codex"); resolved
+                                     via shutil.which ONLY if "codex" is in
+                                     launcher_engines_enabled, so a machine without
+                                     codex-cli installed never fails Claude-engine
+                                     startup over it — see _resolve_config
 """
 
 import argparse
@@ -185,6 +215,12 @@ class LauncherConfig:
     # server's duplicate-identity guard can refuse a second launcher reusing this identity. Blank
     # keeps pre-ECA-71 behavior (tokenless announces are never refused). Set once at startup.
     announce_token: str = ""
+    # FMC-19: pluggable headless-worker engines. engines_enabled gates which `engine` values
+    # a task envelope may request (see parse_envelope); codex_bin/codex_sandbox_ceiling are
+    # only consulted for engine=="codex" tasks. See _build_codex_cmd/_run_codex.
+    codex_bin: str = "codex"
+    engines_enabled: frozenset[str] = frozenset({"claude"})
+    codex_sandbox_ceiling: str = "read-only"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -211,6 +247,18 @@ def _parse_tools_ceiling(raw: str) -> list[str]:
     commas), trim whitespace, and drop empties.
     """
     return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def _parse_engines_enabled(raw: str) -> frozenset[str]:
+    """Comma-separated headless-worker engine allowlist, e.g. 'claude,codex'.
+
+    Blank/unset falls back to {"claude"}, NEVER to an empty set — an empty set would
+    make every pre-FMC-19 task envelope (none of which ever send an `engine` field,
+    so it always resolves to "claude") fail with engine_not_allowed, breaking every
+    existing deployment that upgrades without also setting this new config key.
+    """
+    vals = {v.strip().lower() for v in raw.split(",") if v.strip()}
+    return frozenset(vals) if vals else frozenset({"claude"})
 
 
 def _resolve_config(argv: list[str]) -> LauncherConfig:
@@ -250,6 +298,11 @@ def _resolve_config(argv: list[str]) -> LauncherConfig:
     # Safe defaults for the auth guard: assume auth-ON so a missing-Settings boot does
     # NOT accidentally pass the unauthenticated-mesh guard and arm.
     mcp_auth_enabled = True
+    # FMC-19 defaults: "claude" only (pre-FMC-19 behavior), read-only Codex sandbox
+    # ceiling, and the bare "codex" binary name.
+    engines_enabled_raw = "claude"
+    codex_sandbox_ceiling = "read-only"
+    codex_bin = "codex"
     try:
         from .config import get_settings
 
@@ -273,8 +326,25 @@ def _resolve_config(argv: list[str]) -> LauncherConfig:
         approval_hook_selftest = bool(s.launcher_approval_hook_selftest)
         approval_socket_path = s.launcher_approval_socket_path
         mcp_auth_enabled = bool(s.mcp_auth_enabled)
+        engines_enabled_raw = s.launcher_engines_enabled
+        codex_sandbox_ceiling = s.launcher_codex_sandbox_ceiling
+        codex_bin = s.launcher_codex_bin
     except Exception as e:  # bad/missing .env shouldn't crash the launcher boot
         _log(f"settings unavailable, using bare defaults: {e}")
+
+    engines_enabled = _parse_engines_enabled(engines_enabled_raw)
+    if "codex" in engines_enabled and shutil.which(codex_bin) is None:
+        # A machine that never installed codex-cli must not lose the Claude engine
+        # over it — drop "codex" from the effective set (any codex-engine envelope
+        # then fails fast with engine_not_allowed, a normal envelope-reject, not
+        # lost work) rather than idling the whole launcher.
+        _log(
+            f"launcher_engines_enabled includes 'codex' but {codex_bin!r} is not on "
+            "PATH; disabling the Codex engine for this launcher instance (Claude "
+            "engine unaffected). Install codex-cli or fix launcher_codex_bin, then "
+            "restart to re-enable."
+        )
+        engines_enabled = engines_enabled - {"codex"}
 
     # Precedence (highest first): CLI flag > env var > Settings default.
     identity = (
@@ -331,6 +401,9 @@ def _resolve_config(argv: list[str]) -> LauncherConfig:
         approval_hook_selftest=approval_hook_selftest,
         approval_socket_path=approval_socket_path,
         announce_token=f"{os.getpid()}:{os.urandom(6).hex()}",
+        codex_bin=codex_bin,
+        engines_enabled=engines_enabled,
+        codex_sandbox_ceiling=codex_sandbox_ceiling,
     )
 
 
@@ -391,6 +464,10 @@ class TaskEnvelope:
     allowed_tools: list[str]
     model: str | None
     timeout_s: float
+    # FMC-19: "claude" (default) or "codex". codex_sandbox is only meaningful (and
+    # only ever non-"") when engine == "codex" — see parse_envelope.
+    engine: str = "claude"
+    codex_sandbox: str = ""
 
 
 def parse_envelope(prompt: str, cfg: LauncherConfig) -> TaskEnvelope:
@@ -424,7 +501,31 @@ def parse_envelope(prompt: str, cfg: LauncherConfig) -> TaskEnvelope:
 
     resolved_cwd = _resolve_cwd(cwd, cfg.cwd_allowlist)
 
-    allowed_tools = _resolve_allowed_tools(obj.get("allowed_tools"), cfg.tools_ceiling)
+    engine = _resolve_engine(obj.get("engine"), cfg.engines_enabled)
+
+    if engine == "codex":
+        if obj.get("allowed_tools") is not None:
+            raise EnvelopeError(
+                {
+                    "ok": False,
+                    "error": "bad_envelope",
+                    "detail": "'allowed_tools' is a Claude-engine concept and has no "
+                    "effect on engine='codex'; use 'codex_sandbox' instead",
+                }
+            )
+        allowed_tools: list[str] = []
+        codex_sandbox = _resolve_codex_sandbox(obj.get("codex_sandbox"), cfg.codex_sandbox_ceiling)
+    else:
+        allowed_tools = _resolve_allowed_tools(obj.get("allowed_tools"), cfg.tools_ceiling)
+        if obj.get("codex_sandbox") is not None:
+            raise EnvelopeError(
+                {
+                    "ok": False,
+                    "error": "bad_envelope",
+                    "detail": "'codex_sandbox' is only valid when engine='codex'",
+                }
+            )
+        codex_sandbox = ""
 
     model = obj.get("model")
     if model is not None and not isinstance(model, str):
@@ -440,6 +541,8 @@ def parse_envelope(prompt: str, cfg: LauncherConfig) -> TaskEnvelope:
         allowed_tools=allowed_tools,
         model=model,
         timeout_s=timeout_s,
+        engine=engine,
+        codex_sandbox=codex_sandbox,
     )
 
 
@@ -507,6 +610,67 @@ def _resolve_allowed_tools(raw: Any, ceiling: list[str]) -> list[str]:
             }
         )
     return requested
+
+
+_VALID_ENGINES = ("claude", "codex")
+
+# Sandbox modes ordered least -> most permissive. A task's requested codex_sandbox
+# may not exceed the launcher instance's codex_sandbox_ceiling (a linear scale,
+# unlike allowed_tools' subset-of-ceiling check).
+_CODEX_SANDBOX_ORDER = {"read-only": 0, "workspace-write": 1, "danger-full-access": 2}
+
+
+def _resolve_engine(raw: Any, enabled: frozenset[str]) -> str:
+    """An omitted `engine` defaults to "claude" (every pre-FMC-19 envelope). The
+    requested engine must both be a recognized name AND be in this launcher
+    instance's enabled set (see LauncherConfig.engines_enabled)."""
+    if raw is None:
+        engine = "claude"
+    elif isinstance(raw, str) and raw in _VALID_ENGINES:
+        engine = raw
+    else:
+        raise EnvelopeError(
+            {
+                "ok": False,
+                "error": "bad_envelope",
+                "detail": f"'engine' must be one of {list(_VALID_ENGINES)}",
+            }
+        )
+    if engine not in enabled:
+        raise EnvelopeError(
+            {
+                "ok": False,
+                "error": "engine_not_allowed",
+                "requested": engine,
+                "enabled": sorted(enabled),
+            }
+        )
+    return engine
+
+
+def _resolve_codex_sandbox(raw: Any, ceiling: str) -> str:
+    """An omitted codex_sandbox uses the launcher instance's ceiling; an explicit one
+    may not exceed it (read-only < workspace-write < danger-full-access)."""
+    if raw is None:
+        return ceiling
+    if not isinstance(raw, str) or raw not in _CODEX_SANDBOX_ORDER:
+        raise EnvelopeError(
+            {
+                "ok": False,
+                "error": "bad_envelope",
+                "detail": f"'codex_sandbox' must be one of {list(_CODEX_SANDBOX_ORDER)}",
+            }
+        )
+    if _CODEX_SANDBOX_ORDER[raw] > _CODEX_SANDBOX_ORDER[ceiling]:
+        raise EnvelopeError(
+            {
+                "ok": False,
+                "error": "codex_sandbox_exceeds_ceiling",
+                "ceiling": ceiling,
+                "requested": raw,
+            }
+        )
+    return raw
 
 
 def _resolve_timeout(raw: Any, cap: float) -> float:
@@ -641,11 +805,131 @@ def parse_claude_json(stdout: str) -> dict[str, Any]:
     }
 
 
+def parse_codex_jsonl(stdout: str) -> dict[str, Any]:
+    """Parse `codex exec --json` stdout (one JSON object PER LINE — JSONL, unlike
+    claude's single-object `--output-format json`).
+
+    Returns the SAME key shape as parse_claude_json (result/session_id/
+    total_cost_usd/is_error/num_turns/_parsed) so shape_reply/_handle_task need no
+    engine-specific branching downstream of this call (AC#2) — only the parsing
+    differs. Field mapping is documented here because none of it is 1:1 (mirrors
+    AC#3's tool-ceiling mapping, which has the same caveat):
+
+      * session_id  <- the `thread.started` event's thread_id. Codex has no separate
+        "session_id" concept; the CLAUDE-named field is repurposed to carry it so the
+        reply SHAPE stays identical across engines, at the cost of the field being
+        engine-specific in meaning — documented here rather than silently reused.
+      * total_cost_usd  <- always None. Codex's JSONL reports token usage
+        (`turn.completed.usage`), never a dollar cost — a real, permanent gap, not a
+        bug.
+      * num_turns  <- count of `item.completed` events within the ONE codex "turn"
+        this exec invocation ran (agent messages + tool calls). Codex's "turn" spans
+        the whole non-interactive exchange as a single unit, unlike claude's
+        num_turns (which counts each individual round trip within one `-p`
+        invocation) — this is a step count within one turn, not a turn count. There
+        is no smaller unit codex reports that would mean the same thing claude's
+        num_turns means.
+      * is_error  <- True if a `turn.failed` event appears, or the stream never
+        reaches `turn.completed` at all (crash/timeout/garbage output); False
+        otherwise. Codex has no per-item error flag equivalent to claude's top-level
+        `is_error` — this is the closest analog: "did the turn structurally
+        complete."
+      * result  <- the LAST `agent_message` item's text (the model's final reply —
+        equivalent to `-o/--output-last-message`, read from the already-captured,
+        bounded stdout instead of writing a second file per task). On failure, the
+        `turn.failed`/top-level `error` event's message if present, else a tail of
+        the raw stream (mirrors parse_claude_json's garbage fallback).
+
+    Verified empirically against codex-cli 0.145.0 (see FMC-19 task notes for the
+    probe transcripts): thread.started/turn.started/item.completed/turn.completed on
+    success; item.completed(type=error) + top-level error + turn.failed on failure.
+    """
+    thread_id: str | None = None
+    last_message: str | None = None
+    item_count = 0
+    saw_turn_completed = False
+    error_detail: str | None = None
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(evt, dict):
+            continue
+        etype = evt.get("type")
+        if etype == "thread.started":
+            tid = evt.get("thread_id")
+            if isinstance(tid, str):
+                thread_id = tid
+        elif etype == "item.completed":
+            item_count += 1
+            item = evt.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str):
+                    last_message = text
+        elif etype == "turn.completed":
+            saw_turn_completed = True
+        elif etype == "turn.failed":
+            err = evt.get("error")
+            if isinstance(err, dict):
+                error_detail = str(err.get("message") or "")
+            elif err is not None:
+                error_detail = str(err)
+        elif etype == "error" and error_detail is None:
+            error_detail = str(evt.get("message") or "")
+
+    if saw_turn_completed:
+        return {
+            "result": last_message or "",
+            "session_id": thread_id,
+            "total_cost_usd": None,
+            "is_error": False,
+            "num_turns": item_count,
+            "_parsed": True,
+        }
+
+    tail, _ = _truncate_middle(error_detail or stdout.strip(), 8192)
+    return {
+        "result": tail,
+        "session_id": thread_id,
+        "total_cost_usd": None,
+        "is_error": True,
+        "num_turns": item_count or None,
+        "_parsed": False,
+    }
+
+
 # ----------------------------------------------------------------- subprocess
 
 
 def _scrubbed_env() -> dict[str, str]:
-    """os.environ minus the mesh bearer (MCP_API_KEY) and CRM_* vars; HOME/PATH kept."""
+    """os.environ minus the mesh bearer (MCP_API_KEY) and CRM_* vars; HOME/PATH kept.
+
+    FMC-19 KNOWN RESIDUAL RISK (Codex engine only, verified live against codex-cli
+    0.145.0): this controls the env dict handed to `create_subprocess_exec`, which is
+    the WHOLE story for the Claude engine (`claude -p`'s Bash tool does not invoke a
+    login shell -- verified side-by-side). `codex exec`'s own command-execution
+    mechanism, however, ALWAYS runs model-requested shell commands via
+    `/bin/zsh -lc '<command>'` -- a LOGIN shell -- regardless of this process's own
+    $SHELL (tested: overriding SHELL=/bin/sh made no difference) and regardless of
+    `-c shell_environment_policy.inherit=none` (tested: also made no difference). A
+    login shell re-sources the OPERATOR's own ~/.zshrc / ~/.zprofile / ~/.zshenv,
+    which can reintroduce MCP_API_KEY (and anything else exported there) into a
+    Codex-engine task's sandboxed shell commands independent of anything scrubbed
+    here. There is no config surface (of the two tested) that suppresses it -- it
+    appears to be a hardcoded property of codex exec's shell tool. This is NOT a bug
+    in this function; it is a real, currently-unfixable-by-us gap specific to the
+    Codex engine. Operator mitigation: never export secrets (MCP_API_KEY or otherwise)
+    in a machine's INTERACTIVE shell startup files if that machine runs the launcher
+    with the Codex engine enabled -- scope such secrets to the specific process that
+    needs them (e.g. a `.env` loaded only by start.sh/pm2), not the operator's personal
+    login shell. See README's Security section and the launcher's Codex-lane docs.
+    """
     out: dict[str, str] = {}
     for k, v in os.environ.items():
         if k in _SCRUB_ENV_EXACT:
@@ -736,6 +1020,51 @@ def _build_cmd(env: TaskEnvelope, cfg: LauncherConfig) -> list[str]:
         # Arm the launcher-controlled approval hook via the INDEPENDENT --settings flag
         # (additive to --setting-sources "", which stays empty so NO repo hooks load).
         cmd += ["--settings", _approval_hook_settings(cfg)]
+    return cmd
+
+
+def _build_codex_cmd(env: TaskEnvelope, cfg: LauncherConfig) -> list[str]:
+    """Build the `codex exec` argv for a Codex-engine task (FMC-19).
+
+    Mirrors _build_cmd's security invariants with Codex's own flags:
+      * --ignore-user-config: the operator's ~/.codex/config.toml (which may register
+        the mesh itself as an MCP server — see README's "Wire up Codex CLI" section)
+        never reaches the worker. Parity with claude's --strict-mcp-config.
+      * --sandbox is the REAL ceiling (parity with claude's --tools, which is the
+        existence restriction rather than an auto-approve list). `codex exec --help`
+        (verified on 0.145.0) has NO -a/--ask-for-approval flag at all — unlike the
+        interactive `codex` command, exec is structurally non-interactive: there is
+        no TTY to escalate to, so an action beyond the sandbox boundary fails/reports
+        back to the model immediately rather than pausing. No auto-approve
+        equivalent to --allowedTools is needed or possible.
+      * --skip-git-repo-check: cwd need not be a git repo, matching claude (which has
+        no such requirement either).
+      * --ephemeral: no session state persists across tasks — matches the launcher's
+        existing per-task, no-continuity design (the Claude engine doesn't resume
+        sessions across tasks either).
+      * --json: JSONL event stream on stdout, parsed by parse_codex_jsonl.
+    Never emits --dangerously-bypass-approvals-and-sandbox or
+    --dangerously-bypass-hook-trust — there is no config surface for either.
+
+    Mesh-bearer isolation for this argv is handled by `_scrubbed_env()` at spawn time
+    in `_run_codex` — see that function's docstring for a KNOWN RESIDUAL RISK specific
+    to Codex (a login-shell dotfile re-sourcing gap that env scrubbing cannot close).
+    """
+    cmd = [
+        cfg.codex_bin,
+        "exec",
+        env.task,
+        "--json",
+        "--sandbox",
+        env.codex_sandbox or cfg.codex_sandbox_ceiling,
+        "-C",
+        env.cwd,
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+    ]
+    if env.model:
+        cmd += ["-m", env.model]
     return cmd
 
 
@@ -848,6 +1177,73 @@ async def _run_claude(
             await _kill_group(lp)
             # _kill_group guarantees no process remains in the group; reap the leader
             # (bounded defensively) so proc.returncode is populated.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_READ_DRAIN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                pass
+        stdout_b, stderr_b = await _drain_capped(stdout_task, stderr_task)
+    finally:
+        live.discard(lp)
+
+    duration = time.monotonic() - started
+    return RunResult(
+        exit_code=proc.returncode,
+        timed_out=timed_out,
+        duration_s=duration,
+        stdout=stdout_b.decode("utf-8", "replace"),
+        stderr=stderr_b.decode("utf-8", "replace"),
+    )
+
+
+async def _run_codex(
+    env: TaskEnvelope,
+    cfg: LauncherConfig,
+    live: set["_LiveProc"],
+) -> RunResult:
+    """Spawn `codex exec` in its own process group (FMC-19). Mirrors _run_claude's
+    lifecycle exactly — own process group, wall-clock timeout, _read_capped/
+    _drain_capped bounded streaming, _kill_group group-wide SIGTERM/SIGKILL — by
+    reusing those same standalone helpers, so every FMC-15/FMC-16 invariant applies
+    to both engines identically. _run_claude's own body is untouched (AC#5: zero
+    regression risk to the Claude engine).
+
+    stdin is explicitly DEVNULL: verified live that `codex exec` reads stdin whenever
+    it is not a TTY — even when a prompt is ALSO given as an argument, it is appended
+    as a `<stdin>` block (per `codex exec --help`) — a codex-specific behavior
+    `claude -p` never required handling for, since its prompt is argv-only. An
+    inherited, still-open stdin here could otherwise block a task on an EOF that
+    never comes.
+    """
+    cmd = _build_codex_cmd(env, cfg)
+    started = time.monotonic()
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=env.cwd,
+        start_new_session=True,  # own process group, so killpg reaches children
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=_scrubbed_env(),
+    )
+    try:
+        pgid: int | None = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        pgid = None
+    lp = _LiveProc(proc=proc, pgid=pgid)
+    live.add(lp)
+    _log(f"spawned codex pid={proc.pid} pgid={pgid} cwd={env.cwd} timeout={env.timeout_s}s")
+
+    stdout_task = asyncio.ensure_future(_read_capped(proc.stdout, MAX_SUBPROCESS_OUTPUT_BYTES))
+    stderr_task = asyncio.ensure_future(_read_capped(proc.stderr, MAX_SUBPROCESS_OUTPUT_BYTES))
+
+    timed_out = False
+    try:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=env.timeout_s)
+        except asyncio.TimeoutError:
+            timed_out = True
+            _log(f"pid={proc.pid} (codex) timed out after {env.timeout_s}s; killing process group")
+            await _kill_group(lp)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=_READ_DRAIN_TIMEOUT_S)
             except asyncio.TimeoutError:
@@ -1017,7 +1413,10 @@ async def _handle_task(
             return
 
         try:
-            run = await _run_claude(env, cfg, live)
+            if env.engine == "codex":
+                run = await _run_codex(env, cfg, live)
+            else:
+                run = await _run_claude(env, cfg, live)
         except FileNotFoundError as e:
             await _send_reply(
                 client,
@@ -1033,7 +1432,11 @@ async def _handle_task(
             )
             return
 
-        parsed = parse_claude_json(run.stdout)
+        parsed = (
+            parse_codex_jsonl(run.stdout)
+            if env.engine == "codex"
+            else parse_claude_json(run.stdout)
+        )
         is_error = parsed.get("is_error")
         ok = (run.exit_code == 0) and (not run.timed_out) and (is_error is not True)
         stderr_tail = run.stderr[-STDERR_TAIL_BYTES:] if run.stderr else ""
@@ -1131,6 +1534,9 @@ def _announce_metadata(cfg: LauncherConfig) -> dict[str, Any]:
         "cwd_allowlist": [str(p) for p in cfg.cwd_allowlist],
         "tools_ceiling": list(cfg.tools_ceiling),
         "max_concurrent": cfg.max_concurrent,
+        # FMC-19: which headless-worker engines this instance will run, so a
+        # controller can tell whether it may send engine="codex" tasks here.
+        "engines_enabled": sorted(cfg.engines_enabled),
         # ECA-71 owner-token: identifies THIS launcher process to the server's identity guard.
         "announce_token": cfg.announce_token or None,
     }

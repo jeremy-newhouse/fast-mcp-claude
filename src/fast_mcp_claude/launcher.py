@@ -910,25 +910,10 @@ def parse_codex_jsonl(stdout: str) -> dict[str, Any]:
 def _scrubbed_env() -> dict[str, str]:
     """os.environ minus the mesh bearer (MCP_API_KEY) and CRM_* vars; HOME/PATH kept.
 
-    FMC-19 KNOWN RESIDUAL RISK (Codex engine only, verified live against codex-cli
-    0.145.0): this controls the env dict handed to `create_subprocess_exec`, which is
-    the WHOLE story for the Claude engine (`claude -p`'s Bash tool does not invoke a
-    login shell -- verified side-by-side). `codex exec`'s own command-execution
-    mechanism, however, ALWAYS runs model-requested shell commands via
-    `/bin/zsh -lc '<command>'` -- a LOGIN shell -- regardless of this process's own
-    $SHELL (tested: overriding SHELL=/bin/sh made no difference) and regardless of
-    `-c shell_environment_policy.inherit=none` (tested: also made no difference). A
-    login shell re-sources the OPERATOR's own ~/.zshrc / ~/.zprofile / ~/.zshenv,
-    which can reintroduce MCP_API_KEY (and anything else exported there) into a
-    Codex-engine task's sandboxed shell commands independent of anything scrubbed
-    here. There is no config surface (of the two tested) that suppresses it -- it
-    appears to be a hardcoded property of codex exec's shell tool. This is NOT a bug
-    in this function; it is a real, currently-unfixable-by-us gap specific to the
-    Codex engine. Operator mitigation: never export secrets (MCP_API_KEY or otherwise)
-    in a machine's INTERACTIVE shell startup files if that machine runs the launcher
-    with the Codex engine enabled -- scope such secrets to the specific process that
-    needs them (e.g. a `.env` loaded only by start.sh/pm2), not the operator's personal
-    login shell. See README's Security section and the launcher's Codex-lane docs.
+    This is complete protection for the Claude engine (`claude -p`'s Bash tool does
+    not invoke a login shell -- verified live, side-by-side with Codex). It is NOT
+    complete on its own for the Codex engine -- see `_codex_worker_env`, which layers
+    a login-shell dotfile mitigation on top of this for `_run_codex`.
     """
     out: dict[str, str] = {}
     for k, v in os.environ.items():
@@ -938,6 +923,36 @@ def _scrubbed_env() -> dict[str, str]:
             continue
         out[k] = v
     return out
+
+
+# Empty, launcher-owned zsh startup-file directory (FMC-19) -- see _codex_worker_env.
+_CODEX_EMPTY_ZDOTDIR = os.path.expanduser("~/.fast-mcp-claude/launcher-empty-zdotdir")
+
+
+def _codex_worker_env() -> dict[str, str]:
+    """`_scrubbed_env()` plus a launcher-controlled, empty `ZDOTDIR` for Codex tasks.
+
+    FMC-19 finding, verified live against codex-cli 0.145.0: `codex exec`'s shell tool
+    always runs model-requested commands via a LOGIN zsh (`/bin/zsh -lc`), regardless
+    of a `$SHELL` override or `-c shell_environment_policy.inherit=none` (both tested;
+    neither prevents it). A login zsh sources `$ZDOTDIR/.zshenv`, `.zprofile`,
+    `.zshrc`, `.zlogin` -- defaulting to `$HOME` when `ZDOTDIR` is unset -- so it
+    re-sources the OPERATOR's own dotfiles, reintroducing any secret exported there
+    (e.g. MCP_API_KEY) independent of `_scrubbed_env()`'s process-env scrubbing above.
+
+    Pointing `ZDOTDIR` at an empty, launcher-owned directory closes this: zsh then
+    finds no dotfiles to source at all. Verified live with a synthetic canary secret:
+    an unset/default `ZDOTDIR` leaks the canary into a Codex task's shell output;
+    `ZDOTDIR` pointed at this empty directory does not (confirmed the directory
+    itself is honored -- pointing it at a directory that DOES have a canary-bearing
+    `.zshrc`/`.zshenv` still leaks, ruling out a no-op). The directory is created
+    on demand (idempotent) rather than shipped in the repo, since it must contain
+    nothing.
+    """
+    Path(_CODEX_EMPTY_ZDOTDIR).mkdir(parents=True, exist_ok=True)
+    env = _scrubbed_env()
+    env["ZDOTDIR"] = _CODEX_EMPTY_ZDOTDIR
+    return env
 
 
 def _base_tool_names(grants: list[str]) -> list[str]:
@@ -1046,14 +1061,25 @@ def _build_codex_cmd(env: TaskEnvelope, cfg: LauncherConfig) -> list[str]:
     Never emits --dangerously-bypass-approvals-and-sandbox or
     --dangerously-bypass-hook-trust — there is no config surface for either.
 
-    Mesh-bearer isolation for this argv is handled by `_scrubbed_env()` at spawn time
-    in `_run_codex` — see that function's docstring for a KNOWN RESIDUAL RISK specific
-    to Codex (a login-shell dotfile re-sourcing gap that env scrubbing cannot close).
+    ARGV-INJECTION GUARD: env.task is placed LAST, after a `--` separator, not
+    interspersed before the other flags. codex exec's clap-based parser matches
+    `--`-shaped tokens against known flags BEFORE assigning the PROMPT positional —
+    verified live that `codex exec "--help" --json ...` prints codex's own help text
+    instead of treating "--help" as the prompt, and that a real flag like
+    `--dangerously-bypass-approvals-and-sandbox` as `task` would be parsed as that
+    flag, not literal text (a mesh caller controls `task`, so this would have let an
+    envelope silently disable the whole sandbox regardless of codex_sandbox_ceiling).
+    `--` forces every token after it to be positional, closing this class of bug for
+    ANY task text, not just the two flags tested.
+
+    Mesh-bearer isolation for this argv is handled by `_scrubbed_env()` PLUS a
+    launcher-controlled ZDOTDIR at spawn time in `_run_codex` — see that function's
+    docstring for why ZDOTDIR is necessary (codex's shell tool always runs commands
+    via a login zsh, which re-sources the operator's own dotfiles otherwise).
     """
     cmd = [
         cfg.codex_bin,
         "exec",
-        env.task,
         "--json",
         "--sandbox",
         env.codex_sandbox or cfg.codex_sandbox_ceiling,
@@ -1065,6 +1091,7 @@ def _build_codex_cmd(env: TaskEnvelope, cfg: LauncherConfig) -> list[str]:
     ]
     if env.model:
         cmd += ["-m", env.model]
+    cmd += ["--", env.task]
     return cmd
 
 
@@ -1213,6 +1240,10 @@ async def _run_codex(
     `claude -p` never required handling for, since its prompt is argv-only. An
     inherited, still-open stdin here could otherwise block a task on an EOF that
     never comes.
+
+    env is `_codex_worker_env()`, not the bare `_scrubbed_env()` `_run_claude` uses —
+    see that function's docstring for why Codex needs the additional ZDOTDIR
+    mitigation.
     """
     cmd = _build_codex_cmd(env, cfg)
     started = time.monotonic()
@@ -1223,7 +1254,7 @@ async def _run_codex(
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=_scrubbed_env(),
+        env=_codex_worker_env(),
     )
     try:
         pgid: int | None = os.getpgid(proc.pid)
@@ -1984,7 +2015,14 @@ class Preflight:
 async def _preflight(cfg: LauncherConfig) -> Preflight:
     """Resolve the claude binary and probe its version. A missing binary is treated as
     disabled-with-error: do NOT poll (a claim we can't run is lost work) — log and idle.
+
+    FMC-19: skipped entirely when "claude" is not in cfg.engines_enabled — a launcher
+    configured for the Codex engine only must never fail to arm over a claude binary
+    it will never use (mirrors _resolve_config's symmetric handling of a missing codex
+    binary, which drops "codex" from the set rather than idling the whole launcher).
     """
+    if "claude" not in cfg.engines_enabled:
+        return Preflight(ok=True, bin_path=None, version=None)
     bin_path = shutil.which(cfg.claude_bin)
     if not bin_path:
         return Preflight(ok=False, reason=f"claude binary {cfg.claude_bin!r} not found on PATH")
@@ -2437,7 +2475,15 @@ async def _serve(cfg: LauncherConfig) -> None:
     # And prove the --settings PreToolUse hook actually FIRES before trusting it (claude
     # silently ignores a --settings object that fails validation — a green exit with NO
     # gate). Fail-closed: idle if it can't be proven.
-    if cfg.approval_hook_enabled and cfg.approval_hook_selftest:
+    # FMC-19: this whole gate is Claude-engine-specific (it arms claude's own --settings
+    # PreToolUse hook; there is no Codex equivalent yet). Skipped when "claude" isn't in
+    # engines_enabled -- otherwise a Codex-only instance would idle forever self-testing
+    # a claude binary it will never spawn.
+    if (
+        cfg.approval_hook_enabled
+        and cfg.approval_hook_selftest
+        and "claude" in cfg.engines_enabled
+    ):
         selftest = await _selftest_approval_hook(cfg, pf.bin_path or cfg.claude_bin)
         if not selftest.armed:
             # Fail-closed either way, but say WHICH failure it is: "the CLI could not run" and

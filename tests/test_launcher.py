@@ -1843,7 +1843,9 @@ def test_build_codex_cmd_shape():
     argv = L._build_codex_cmd(env, cfg)
     assert argv[0] == "codex"
     assert argv[1] == "exec"
-    assert argv[2] == "do x"
+    # task is LAST, after "--" (argv-injection guard — see
+    # test_build_codex_cmd_places_task_last_after_separator).
+    assert argv[-2:] == ["--", "do x"]
     assert "--json" in argv
     assert _flag_value(argv, "--sandbox") == "workspace-write"
     assert _flag_value(argv, "-C") == "/tmp/repo"
@@ -2184,6 +2186,124 @@ async def test_run_codex_passes_devnull_stdin_kwarg(monkeypatch, tmp_path):
     run = await L._run_codex(env, cfg, live)
     assert captured.get("stdin") == L.asyncio.subprocess.DEVNULL
     assert run.exit_code == 0
+    # FMC-19 review fix: the env passed to codex must carry the launcher-controlled
+    # empty ZDOTDIR (not just the bare _scrubbed_env()), closing the login-shell
+    # dotfile-resourcing leak.
+    assert captured["env"]["ZDOTDIR"] == L._CODEX_EMPTY_ZDOTDIR
+
+
+def test_codex_worker_env_adds_empty_zdotdir_and_still_scrubs_bearer(monkeypatch, tmp_path):
+    """_codex_worker_env must be _scrubbed_env() (bearer/CRM_* absent) PLUS ZDOTDIR
+    pointed at an empty, launcher-owned directory — verified live (see launcher.py's
+    docstring) that this closes codex exec's login-shell dotfile-resourcing leak,
+    which _scrubbed_env() alone cannot."""
+    zdotdir = tmp_path / "empty-zdotdir"
+    monkeypatch.setattr(L, "_CODEX_EMPTY_ZDOTDIR", str(zdotdir))
+    monkeypatch.setenv("MCP_API_KEY", "should-not-appear")
+    monkeypatch.setenv("CRM_IDENTITY", "should-not-appear-either")
+    env = L._codex_worker_env()
+    assert env["ZDOTDIR"] == str(zdotdir)
+    assert zdotdir.is_dir()  # created on demand
+    assert "MCP_API_KEY" not in env
+    assert "CRM_IDENTITY" not in env
+
+
+def test_build_codex_cmd_places_task_last_after_separator():
+    """REGRESSION (adversarial review finding, verified live): codex exec's clap
+    parser matches a `--`-shaped `task` string against known flags BEFORE ever
+    assigning the PROMPT positional if task is interspersed among other flags
+    (verified: `codex exec "--help" --json ...` printed codex's own help instead of
+    treating "--help" as the prompt). Placing task LAST after a literal `--` forces
+    every token after it to be positional, regardless of its shape."""
+    cfg = _cfg(engines_enabled=frozenset({"claude", "codex"}))
+    env = L.TaskEnvelope(
+        task="--dangerously-bypass-approvals-and-sandbox",
+        cwd="/tmp",
+        allowed_tools=[],
+        model=None,
+        timeout_s=60.0,
+        engine="codex",
+        codex_sandbox="read-only",
+    )
+    argv = L._build_codex_cmd(env, cfg)
+    assert argv[-2:] == ["--", "--dangerously-bypass-approvals-and-sandbox"]
+    # Every other flag must precede the "--" separator.
+    sep_index = argv.index("--")
+    assert "--sandbox" in argv[:sep_index]
+    assert "--json" in argv[:sep_index]
+
+
+def test_build_codex_cmd_task_last_even_with_model():
+    cfg = _cfg(engines_enabled=frozenset({"claude", "codex"}))
+    env = L.TaskEnvelope(
+        task="do x",
+        cwd="/tmp",
+        allowed_tools=[],
+        model="o3",
+        timeout_s=60.0,
+        engine="codex",
+        codex_sandbox="read-only",
+    )
+    argv = L._build_codex_cmd(env, cfg)
+    assert argv[-2:] == ["--", "do x"]
+    assert _flag_value(argv, "-m") == "o3"
+
+
+# ----------------------------------------------------- engine-gated preflight (review fix)
+
+
+async def test_preflight_skips_claude_probe_when_claude_not_enabled(tmp_path):
+    """REGRESSION (adversarial review finding): a launcher instance configured for
+    the Codex engine ONLY must never fail preflight over a claude binary it will
+    never spawn — mirrors _resolve_config's symmetric handling of a missing codex
+    binary."""
+    cfg = _cfg(
+        claude_bin=str(tmp_path / "nope" / "claude"),
+        engines_enabled=frozenset({"codex"}),
+    )
+    pf = await L._preflight(cfg)
+    assert pf.ok is True
+    assert pf.bin_path is None
+
+
+async def test_preflight_still_requires_claude_binary_when_claude_enabled(tmp_path):
+    cfg = _cfg(
+        claude_bin=str(tmp_path / "nope" / "claude"),
+        engines_enabled=frozenset({"claude"}),
+    )
+    pf = await L._preflight(cfg)
+    assert pf.ok is False
+
+
+async def test_serve_skips_approval_selftest_when_claude_not_enabled(monkeypatch):
+    """REGRESSION (adversarial review finding): the approval-hook self-test spawns a
+    throwaway CLAUDE binary — a Codex-only instance must not depend on/idle over it
+    when the Claude engine isn't even enabled (the gate it proves is Claude-only)."""
+    selftest_called = {"called": False}
+
+    async def fake_selftest(cfg, bin_path):
+        selftest_called["called"] = True
+        return L.SelftestResult(armed=False, cli_failed=True, detail="must not be called")
+
+    async def fake_bridge(cfg, relay_healthy=None):
+        await asyncio.sleep(999)
+
+    monkeypatch.setattr(L, "_selftest_approval_hook", fake_selftest)
+    monkeypatch.setattr(L, "_bridge", fake_bridge)
+    cfg = _cfg(
+        engines_enabled=frozenset({"codex"}),
+        approval_hook_enabled=True,
+        approval_hook_cmd="/abs/bin/fast-mcp-claude-hook",
+        approval_hook_selftest=True,
+    )
+    task = asyncio.ensure_future(L._serve(cfg))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert selftest_called["called"] is False
 
 
 # ------------------------------------------------------------- engines_enabled config

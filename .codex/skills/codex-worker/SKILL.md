@@ -41,10 +41,11 @@ Tool names are fully qualified as `mcp__<server_name_with_hyphens_replaced_by_un
 
 ## Identity and addressing
 
-Your identity for `recipient_session`-targeted messages is whatever this session announces
-itself as (there is no Codex equivalent of the Claude channel adapter's `--identity` flag yet
-— Phase 0 workers are addressed by omitting `recipient_session` on `send_prompt`, so any idle
-worker can take the task, or a controller targets you by server name if it dialed you
-directly). Use `who()` to see the rest of the mesh roster.
+Phase 0 Codex workers don't announce presence — there's no Codex equivalent of the Claude
+channel adapter's `--identity` flag yet, so you won't show up in `who()`. A controller reaches
+you either by omitting `recipient_session` on `send_prompt` (any idle worker, including you,
+can take it) or by agreeing out-of-band on a fixed `recipient_session` string to use when
+addressing this worker specifically. Call `who()` yourself to see the rest of the mesh roster
+if you need it.
 
 When you've understood, begin the loop.

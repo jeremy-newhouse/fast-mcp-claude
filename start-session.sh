@@ -26,10 +26,17 @@
 #       Bedrock and only POSTs). Proven live on CC 2.1.168. See CLAUDE.md's Channel push flow
 #       section (ADR-0012 in the evolv-coder-agent repo) for the full protocol detail.
 #
+# In BOTH modes, the session also gets one claude-peer-<name> MCP entry per row in the local
+# .env's PEERS array (see .mcp.json.example) -- controller-role tools (send_prompt,
+# wait_for_completion, who, ...) against each configured peer's server. Without this, a mesh
+# deployment (no shared hub) has no session anywhere able to address a session on a different
+# host: who()/send_prompt(recipient_session=...) only ever see the calling session's own local
+# server. This never adds claude-local in channel mode (invariant 9 is unaffected).
+#
 # Run this from inside the repo you want to work in:
 #     /path/to/fast-mcp-claude/start-session.sh
 # Optional overrides via env: PEER_NAME, MCP_API_KEY, MCP_PORT, MCP_LOCAL_URL, FLEET_IDENTITY,
-# CHANNEL_MODE, SESSION_NAME, SESSION_DESCRIPTION.
+# CHANNEL_MODE, SESSION_NAME, SESSION_DESCRIPTION, PEERS_JSON.
 # Any other CLI args are passed straight through to the final `exec claude ... "$@"`.
 set -euo pipefail
 
@@ -52,6 +59,9 @@ FMC_REPO="$SCRIPT_DIR"
 # absent from .env — notably CHANNEL_ENABLED (never a standard key), which would break the
 # DEFAULT notify+pull path for everyone. Swallow the no-match so a missing key just yields "".
 _envget() { grep -E "^$1=" "$FMC_REPO/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'" || true; }
+# Raw variant (no quote-stripping) for PEERS: it's a JSON array, and _envget's tr -d would
+# strip every structural double-quote from it, turning valid JSON into unparseable garbage.
+_envget_raw() { grep -E "^$1=" "$FMC_REPO/.env" 2>/dev/null | head -1 | cut -d= -f2- || true; }
 PEER_NAME="${PEER_NAME:-$(_envget PEER_NAME)}"; PEER_NAME="${PEER_NAME:-local}"
 # Mesh bearer is authoritative from THIS repo's .env (the local mesh is configured from it).
 # Prefer .env over any inherited MCP_API_KEY (e.g. a shared ~/.zshrc that exports ANOTHER
@@ -61,6 +71,12 @@ _ENV_MCP_KEY="$(_envget MCP_API_KEY)"
 MCP_API_KEY="${_ENV_MCP_KEY:-${MCP_API_KEY:-}}"
 MCP_PORT="${MCP_PORT:-$(_envget MCP_PORT)}"; MCP_PORT="${MCP_PORT:-5473}"
 MCP_LOCAL_URL="${MCP_LOCAL_URL:-http://127.0.0.1:${MCP_PORT}/mcp}"
+# One claude-peer-<name> MCP entry per configured PEERS row (see .mcp.json.example) so a
+# session can actually use the reachability its local server's PEERS config already grants —
+# without this, who()/send_prompt(recipient_session=...) only ever see the LOCAL server's own
+# store, and in a mesh (no shared hub) deployment no session anywhere could address a session
+# on a different host. PEERS_JSON env override mirrors the PEER_NAME/MCP_API_KEY pattern.
+PEERS_JSON="${PEERS_JSON:-$(_envget_raw PEERS)}"; PEERS_JSON="${PEERS_JSON:-[]}"
 
 # --- channel mode: auto-PUSH down-delivery (vs the default notify+pull) -------------------
 # When on, a fast-mcp-claude-channel sidecar (spawned by claude via .mcp.json + the
@@ -181,7 +197,10 @@ umask 077
 # own `reply` tool. The channel config (identity/url/bearer/status-file) rides in the .mcp.json
 # `env` block (passed to the subprocess env, NOT argv).
 # notify+pull mode: the agent gets claude-local so /fleet-inbox can wait_for_instruction+reply.
-MCP_API_KEY="${MCP_API_KEY:-}" python3 - \
+# claude-peer-<name> entries are added in BOTH modes — they carry controller-role tools
+# (send_prompt, wait_for_completion, who, ...) against OTHER peers' servers, never claude-local
+# on this session's own server, so invariant 9 (no claude-local in channel mode) is untouched.
+MCP_API_KEY="${MCP_API_KEY:-}" PEERS_JSON="$PEERS_JSON" python3 - \
   "$MCPCFG" "$MCP_LOCAL_URL" "$CHANNEL_MODE" "$BIN_CHANNEL" "$IDENTITY" "$STATUS_FILE" <<'PY'
 import json, os, sys
 path, url, channel_mode, channel_bin, identity, status_file = sys.argv[1:7]
@@ -201,6 +220,30 @@ else:
     if key:
         srv["headers"] = {"Authorization": f"Bearer {key}"}
     servers = {"claude-local": srv}
+
+# Peer api_key values travel via env (PEERS_JSON), never argv — argv is world-readable via
+# `ps`, same reasoning already applied to MCP_API_KEY above. Malformed/absent PEERS degrades
+# to zero peer entries rather than aborting the whole session launch.
+try:
+    peers = json.loads(os.environ.get("PEERS_JSON") or "[]")
+except json.JSONDecodeError as e:
+    print(f"WARNING: PEERS is not valid JSON, skipping peer MCP entries: {e}", file=sys.stderr)
+    peers = []
+for peer in peers if isinstance(peers, list) else []:
+    if not isinstance(peer, dict):
+        print(f"WARNING: skipping malformed PEERS entry (expected an object): {peer!r}", file=sys.stderr)
+        continue
+    name, peer_url, peer_key = peer.get("name"), peer.get("url"), peer.get("api_key")
+    if not (name and peer_url and peer_key):
+        print(f"WARNING: skipping malformed PEERS entry (needs name/url/api_key): {peer}", file=sys.stderr)
+        continue
+    servers[f"claude-peer-{name}"] = {
+        "type": "http",
+        "url": peer_url,
+        "headers": {"Authorization": f"Bearer {peer_key}"},
+        "alwaysLoad": True,
+    }
+
 json.dump({"mcpServers": servers}, open(path, "w"))
 PY
 

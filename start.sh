@@ -12,6 +12,7 @@ pm2 start "uv run fast-mcp-claude" \
   --log "$SCRIPT_DIR/logs/mcp-server.log" \
   --time \
   --merge-logs
+pm2 save
 
 echo "Started $APP_NAME with PM2"
 echo "  pm2 logs $APP_NAME    # view logs"

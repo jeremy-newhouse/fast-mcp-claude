@@ -16,6 +16,7 @@ pm2 start "uv run fast-mcp-claude-launcher" \
   --log "$SCRIPT_DIR/logs/launcher.log" \
   --time \
   --merge-logs
+pm2 save
 
 echo "Started $APP_NAME with PM2"
 echo "  pm2 logs $APP_NAME    # view logs"

@@ -265,6 +265,25 @@ json.dump({"hooks": {"SessionStart": entry, "UserPromptSubmit": entry, "Stop": e
           open(path, "w"))
 PY
 
+# --- preflight: warn if the local mesh server is unreachable (ECA-161) -------------------
+# A dead CRM_LOCAL_URL breaks every relay/session tool (list_sessions, send_to_session,
+# send_teams, /fleet-inbox) silently until the FIRST call fails deep into a turn — e.g.
+# "could not list sessions: Client failed to connect: All connection attempts failed", which
+# is how the mbam5 outage (ECA-161) was actually discovered, 3 days after the server died.
+# Best-effort only: never blocks the session from starting, since local coding work doesn't
+# need the fleet endpoint, and a slow/loaded box shouldn't fail a session launch over a
+# 2-second probe. `-o /dev/null` discards the body; a reachable server returns SOME HTTP
+# response (even 401/404) and curl exits 0 regardless of status code — only "can't connect
+# at all" (refused/timeout) exits non-zero, which is exactly what we want to detect here.
+if ! curl -s -o /dev/null -m 2 "$MCP_LOCAL_URL" 2>/dev/null; then
+  echo "" >&2
+  echo "WARNING: local fast-mcp-claude ($MCP_LOCAL_URL) is unreachable." >&2
+  echo "         Fleet/session-relay tools (list_sessions, send_to_session, send_teams," >&2
+  echo "         /fleet-inbox) will fail until it's back up. This session will still start" >&2
+  echo "         for local work. From $FMC_REPO: pm2 list; ./start.sh && ./start-launcher.sh" >&2
+  echo "" >&2
+fi
+
 echo "eCA live session: identity=$IDENTITY  repo=$REPO_BASE@$BRANCH  peer=$PEER_NAME" >&2
 
 # --- become claude, with the right down-delivery mechanism -------------------------------
